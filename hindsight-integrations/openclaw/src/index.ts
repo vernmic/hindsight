@@ -2560,6 +2560,47 @@ ${memoriesFormatted}
         log.error("error retaining messages", error);
       }
     });
+    // PATCH 8: Buffered LLM logging
+    // DEPLOYMENT NOTE: log file path is specific to this deployment
+    const LLM_LOG_PATH = "I:\\OpenClaw\\.openclaw\\model-usage-log.md";
+    if (!(global as any).__hindsightLlmLogBuffer) {
+      (global as any).__hindsightLlmLogBuffer = [] as string[];
+      (global as any).__hindsightLlmLogFlushTimer = setInterval(() => {
+        const _buf = (global as any).__hindsightLlmLogBuffer as string[];
+        if (!_buf || _buf.length === 0) return;
+        const _toWrite = _buf.splice(0, _buf.length).join("");
+        const writePromise = existsSync(LLM_LOG_PATH) 
+          ? appendFile(LLM_LOG_PATH, _toWrite, "utf8")
+          : appendFile(LLM_LOG_PATH, "| Timestamp | Agent | Session Type | Session Key | Model | Provider | Input Tokens | Output Tokens | Total Tokens |\n|---|---|---|---|---|---|---|---|---|\n" + _toWrite, "utf8");
+        writePromise.catch((e: any) => debug(`[Hindsight] llm_output flush error: ${e.message}`));
+      }, 5000);
+      (global as any).__hindsightLlmLogFlushTimer.unref?.();
+    }
+    
+    api.on("llm_output", (event: any, ctx?: any) => {
+      try {
+        const ts = new Date().toISOString();
+        const agentId = ctx?.agentId ?? "unknown";
+        const sessionKey = ctx?.sessionKey ?? "";
+        let sessionType = "other";
+        if (sessionKey.includes(":heartbeat")) sessionType = "heartbeat";
+        else if (sessionKey.includes(":cron:")) sessionType = "cron";
+        else if (sessionKey.includes(":subagent")) sessionType = "subagent";
+        else if (sessionKey.endsWith(":main") || (agentId && sessionKey.endsWith(`:${agentId}`))) sessionType = "direct";
+        
+        const model = event.model ?? ctx?.modelId ?? "unknown";
+        const provider = event.provider ?? ctx?.modelProviderId ?? "unknown";
+        const inTok = event.usage?.input ?? 0;
+        const outTok = event.usage?.output ?? 0;
+        const totalTok = event.usage?.total ?? (inTok + outTok);
+        const row = `| ${ts} | ${agentId} | ${sessionType} | ${sessionKey} | ${model} | ${provider} | ${inTok} | ${outTok} | ${totalTok} |\n`;
+        (global as any).__hindsightLlmLogBuffer.push(row);
+      } catch (e) {
+        // silent fail for logging
+      }
+    });
+    // END PATCH 8
+
     debug("[Hindsight] Hooks registered");
     log.info("agent hooks registered");
 
