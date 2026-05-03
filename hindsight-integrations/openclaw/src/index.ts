@@ -2294,6 +2294,10 @@ export default function (api: MoltbotPluginAPI) {
                 // END PATCH 3
 
                 // Recall with deduplication: reuse in-flight request for same bank
+                // PATCH 19: recall timing instrumentation
+                const _recallStart = Date.now();
+                let _recallSource = "fresh";
+                // END PATCH 19 (start)
                 const normalizedPrompt = prompt.trim().toLowerCase().replace(/\s+/g, " ");
                 const queryHash = createHash("sha256").update(normalizedPrompt).digest("hex").slice(0, 16);
                 const recallKey = `${bankId}::${queryHash}`;
@@ -2302,6 +2306,9 @@ export default function (api: MoltbotPluginAPI) {
                 if (existing) {
                   debug(`[Hindsight] Reusing in-flight recall for bank ${bankId}`);
                   recallPromise = existing;
+                  // PATCH 19: track inflight reuse
+                  _recallSource = "inflight_reuse";
+                  // END PATCH 19 (source)
                 } else {
                   const recallTimeoutMs = pluginConfig.recallTimeoutMs ?? DEFAULT_RECALL_TIMEOUT_MS;
                   recallPromise = client.recall(
@@ -2318,6 +2325,10 @@ export default function (api: MoltbotPluginAPI) {
                 }
 
                 const response = await recallPromise;
+
+                // PATCH 19: recall timing (success)
+                try { (global as any).__perfLog?.(sessionKeyForCache || "unknown", "recall_main", { ms: Date.now() - _recallStart, bank: bankId, source: _recallSource, results: response.results?.length ?? 0, query_chars: prompt.length }); } catch (_) {}
+                // END PATCH 19 (success)
 
                 if (response.results && response.results.length > 0) {
                   debug(
