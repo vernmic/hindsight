@@ -2164,6 +2164,27 @@ export default function (api: MoltbotPluginAPI) {
           skipHindsightTurnBySession.delete(sessionKeyForCache);
         }
 
+        // PATCH 2: startup grounding mandate
+        // Injects a grounding context on the first turn of new sessions to orient the agent.
+        if (!_skipRecall && sessionKeyForCache && !startupMandatedSessions.has(sessionKeyForCache)) {
+          try {
+            startupMandatedSessions.add(sessionKeyForCache);
+            const _mandateLines: string[] = [
+              "<startup_mandate>",
+              "Grounding context for this session:",
+              "1. Read todos.md, NEXT_SESSION.md, and gateway.md before responding.",
+              "2. These files are the canonical handoff between sessions.",
+              "3. Verify everything. LLMs hallucinate directories, files, tool availability.",
+              "</startup_mandate>",
+            ];
+            _patchSystemPrepend.push(_mandateLines.join("\n"));
+            debug(`[Hindsight] Patch 2: injecting startup mandate for session ${sessionKeyForCache}`);
+          } catch (_m2e) {
+            debug(`[Hindsight] Patch 2 (startup mandate) failed: ${_m2e}`);
+          }
+        }
+        // END PATCH 2
+
         // --- Main recall flow (only if not skipped) ---
         if (!_skipRecall && resolvedCtxForRecall) {
           const bankId = deriveBankId(resolvedCtxForRecall, pluginConfig);
