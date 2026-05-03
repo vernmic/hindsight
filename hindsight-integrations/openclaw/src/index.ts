@@ -1476,11 +1476,23 @@ export default function (api: MoltbotPluginAPI) {
   try {
     // PATCH 12: API-instance guard -- skip if this exact api object is already registered
     if (_registeredApis.has(api)) {
+      // PATCH 19b: count invocation (skip path)
+      if (!(global as any).__hindsightPluginEntryCount) (global as any).__hindsightPluginEntryCount = 0;
+      (global as any).__hindsightPluginEntryCount++;
+      const _pluginEntryNSkip = (global as any).__hindsightPluginEntryCount as number;
+      try { (global as any).__perfLog?.("process", "plugin_entry_invoked", { n: _pluginEntryNSkip, guard: "skipped_duplicate" }); } catch (_) {}
       debug("[Hindsight] Plugin entry skipped (this api instance already registered)");
       return;
     }
     _registeredApis.add(api);
     // END PATCH 12 (guard)
+
+    // PATCH 19b: plugin entry invocation tracking
+    if (!(global as any).__hindsightPluginEntryCount) (global as any).__hindsightPluginEntryCount = 0;
+    (global as any).__hindsightPluginEntryCount++;
+    const _pluginEntryN = (global as any).__hindsightPluginEntryCount as number;
+    try { (global as any).__perfLog?.("process", "plugin_entry_invoked", { n: _pluginEntryN, guard: "passed_new_api" }); } catch (_) {}
+    // END PATCH 19b
 
     log.info("plugin entry invoked");
     debug("[Hindsight] Plugin loading...");
