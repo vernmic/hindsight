@@ -2432,6 +2432,27 @@ ${memoriesFormatted}
           return;
         }
 
+        // PATCH 6: Quality gate
+        if ((pluginConfig as any).retainQualityGate) {
+          try {
+            const { activity, topics } = classifyTurn(transcript);
+            let skipReason = "";
+            if (activity === "chitchat" && topics.length === 0 && transcript.length < 200) skipReason = "short chitchat";
+            else if (activity === "memory-meta" && topics.length === 0) skipReason = "memory-meta noise";
+            else if (/^(Assistant|User) (changed|requested|planned|explained)/i.test(transcript) && !/\b(decided|insight|important)\b/i.test(transcript) && transcript.length < 500) skipReason = "procedural noise";
+            else if (/^(Assistant planned to|The assistant explained)/i.test(transcript) && topics.length === 0) skipReason = "narrative noise";
+            else if (/^\[role: tool\][\s\S]*\[role: assistant\][\s\S]*$/.test(transcript) && !transcript.includes("[role: user]")) skipReason = "pure tool calls";
+
+            if (skipReason) {
+              debug(`[Hindsight] Skipping retain - quality gate: ${skipReason}`);
+              return;
+            }
+          } catch (e) {
+            debug(`[Hindsight] Quality gate error: ${e}`);
+          }
+        }
+        // END PATCH 6
+
         // Wait for client to be ready
         const clientGlobal = (global as any).__hindsightClient;
         if (!clientGlobal) {
