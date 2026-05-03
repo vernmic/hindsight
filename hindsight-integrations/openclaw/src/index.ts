@@ -1425,6 +1425,45 @@ function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
 // __hindsightLlmLogBuffer: string[]                -- PATCH 8
 // __hindsightLlmLogFlushTimer: NodeJS.Timeout      -- PATCH 8
 
+// PATCH 18: structured turn-perf JSONL instrumentation with buffered async flush
+// DEPLOYMENT NOTE: log file path is specific to this OpenClaw deployment
+const _TURN_PERF_LOG = "I:\\OpenClaw\\.openclaw\\logs\\turn-perf.jsonl";
+
+if (!(global as any).__hindsightTurnPerfBuffer) {
+  (global as any).__hindsightTurnPerfBuffer = [] as string[];
+  (global as any).__hindsightTurnPerfFlushTimer = setInterval(() => {
+    const _buf = (global as any).__hindsightTurnPerfBuffer as string[];
+    if (!_buf || _buf.length === 0) return;
+    const _toWrite = _buf.splice(0, _buf.length).join("");
+    appendFile(_TURN_PERF_LOG, _toWrite, "utf8").catch((e: any) => {
+      if (e.code === "ENOENT") {
+        mkdir("I:\\OpenClaw\\.openclaw\\logs", { recursive: true })
+          .then(() => appendFile(_TURN_PERF_LOG, _toWrite, "utf8"))
+          .catch(() => {});
+      }
+    });
+  }, 5000);
+  (global as any).__hindsightTurnPerfFlushTimer.unref?.();
+}
+
+function _logTurnPerf(sessionKey: string, step: string, extras?: Record<string, unknown>): void {
+  try {
+    (global as any).__hindsightTurnPerfBuffer.push(
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        session: sessionKey || "unknown",
+        step,
+        ...(extras || {}),
+      }) + "\n"
+    );
+  } catch (_pfe) { /* never throw from instrumentation */ }
+}
+
+if (!(global as any).__perfLog) {
+  (global as any).__perfLog = _logTurnPerf;
+}
+// END PATCH 18
+
 export default function (api: MoltbotPluginAPI) {
   try {
     log.info("plugin entry invoked");
