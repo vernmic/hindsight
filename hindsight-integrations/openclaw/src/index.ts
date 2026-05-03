@@ -1464,8 +1464,24 @@ if (!(global as any).__perfLog) {
 }
 // END PATCH 18
 
+// PATCH 12: API-instance-keyed registration guard
+// WeakSet keyed by api instance: skip if we have ALREADY registered on THIS api,
+// but allow fresh registration on a NEW api object (= new registry after migration).
+// Does not reintroduce the #1029 bug because WeakSet.has() checks object identity,
+// not a module-level boolean -- a new api object passes through unconditionally.
+const _registeredApis = new WeakSet<MoltbotPluginAPI>();
+// END PATCH 12 (declaration)
+
 export default function (api: MoltbotPluginAPI) {
   try {
+    // PATCH 12: API-instance guard -- skip if this exact api object is already registered
+    if (_registeredApis.has(api)) {
+      debug("[Hindsight] Plugin entry skipped (this api instance already registered)");
+      return;
+    }
+    _registeredApis.add(api);
+    // END PATCH 12 (guard)
+
     log.info("plugin entry invoked");
     debug("[Hindsight] Plugin loading...");
 
