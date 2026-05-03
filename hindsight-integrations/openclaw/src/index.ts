@@ -2246,6 +2246,53 @@ export default function (api: MoltbotPluginAPI) {
               } else {
                 debug(`[Hindsight] Auto-recall for bank ${bankId}, full query:\n---\n${prompt}\n---`);
 
+                // PATCH 3: wisdom sidecar with strict timeout + cache
+                const _p3Start = Date.now();
+                try {
+                  const _wisdomBankId = "openclaw";
+                  const _CACHE_TTL_MS = 30 * 60 * 1000; // 30 min
+                  const _HARD_TIMEOUT_MS = 500;
+                  const _now = Date.now();
+                  const _cacheKey = extracted.substring(0, 200);
+                  if (!(global as any).__hindsightWisdomCache) (global as any).__hindsightWisdomCache = new Map();
+                  const _cached = ((global as any).__hindsightWisdomCache as Map<string, any>).get(_cacheKey);
+                  let _wisdomResults: any[] | null = null;
+                  if (_cached && _now - _cached.timestamp < _CACHE_TTL_MS) {
+                    _wisdomResults = _cached.results;
+                    debug(`[Hindsight] wisdom: cache hit (${_wisdomResults?.length ?? 0} results)`);
+                  } else {
+                    try {
+                      const _wc = scopeClient(client, _wisdomBankId);
+                      const _wisdomResp = await Promise.race([
+                        _wc.recall({ query: _cacheKey.substring(0, 400), maxTokens: 512 }, _HARD_TIMEOUT_MS),
+                        new Promise<never>((_, rej) =>
+                          setTimeout(() => rej(new Error("wisdom timeout 500ms")), _HARD_TIMEOUT_MS)
+                        ),
+                      ]);
+                      _wisdomResults = ((_wisdomResp?.results) ?? [])
+                        .filter(
+                          (r: any) =>
+                            r.tags?.some((t: string) => t === "type:derived_principles") ||
+                            r.context === "derived_learnings"
+                        )
+                        .slice(0, 5);
+                      ((global as any).__hindsightWisdomCache as Map<string, any>).set(_cacheKey, {
+                        results: _wisdomResults,
+                        timestamp: _now,
+                      });
+                    } catch (_wte) {
+                      debug(`[Hindsight] wisdom: query failed or timed out: ${_wte}`);
+                      _wisdomResults = [];
+                    }
+                  }
+                  if (_wisdomResults && _wisdomResults.length > 0) {
+                    const _wisdomLines = _wisdomResults.map((r: any) => `- ${r.text ?? r.content ?? JSON.stringify(r).substring(0, 200)}`).join("\n");
+                    _patchSystemPrepend.push(`<guidance>\nBased on relevant principles from past experience:\n${_wisdomLines}\nConsider whether any of these apply before proceeding.\n</guidance>`);
+                    debug(`[Hindsight] wisdom sidecar: injecting ${_wisdomResults.length} principles`);
+                  }
+                } catch (_we) { /* sidecar is best-effort */ }
+                // END PATCH 3
+
                 // Recall with deduplication: reuse in-flight request for same bank
                 const normalizedPrompt = prompt.trim().toLowerCase().replace(/\s+/g, " ");
                 const queryHash = createHash("sha256").update(normalizedPrompt).digest("hex").slice(0, 16);
