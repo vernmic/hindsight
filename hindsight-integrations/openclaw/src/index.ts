@@ -1472,6 +1472,50 @@ if (!(global as any).__perfLog) {
 const _registeredApis = new WeakSet<MoltbotPluginAPI>();
 // END PATCH 12 (declaration)
 
+// PATCH 6: classifyTurn helper -- lightweight regex-based turn classifier for quality gate
+// Returns activity type and detected topics. Runs in <1ms, no LLM call.
+function classifyTurn(transcript: string): { activity: string; topics: string[] } {
+  const sample = transcript.substring(0, 2000).toLowerCase();
+  // Activity classification
+  let activity = "general";
+  if (
+    /\b(hello|hi|hey|thanks|thank you|good morning|good evening|good night|bye|g'night|gn)\b/.test(
+      sample
+    ) &&
+    transcript.length < 500
+  ) {
+    activity = "chitchat";
+  } else if (
+    /\b(remember|recall|forget|memory|memories|hindsight|retain|purge)\b/.test(sample)
+  ) {
+    activity = "memory-meta";
+  } else if (
+    /\b(edit|update|change|add|set|configure|patch|tweak)\b[\s\S]{0,40}\b(file|config|setting|variable)\b/.test(
+      sample
+    )
+  ) {
+    activity = "config-edit";
+  } else if (/\b(fix|bug|error|issue|broken|crash|fail)\b/.test(sample)) {
+    activity = "debugging";
+  } else if (/\b(build|deploy|test|run|install|compile)\b/.test(sample)) {
+    activity = "development";
+  } else if (/\b(analyze|research|search|find|lookup|investigate)\b/.test(sample)) {
+    activity = "research";
+  }
+  // Topic extraction
+  const topics: string[] = [];
+  if (/\b(openclaw|hindsight|plugin|hook|patch)\b/.test(sample)) topics.push("openclaw");
+  if (/\b(agent|subagent|session|spawn)\b/.test(sample)) topics.push("agents");
+  if (/\b(skill|workflow|automation)\b/.test(sample)) topics.push("skills");
+  if (/\b(model|llm|gpt|claude|grok|qwen)\b/.test(sample)) topics.push("models");
+  if (/\b(gateway|config|restart|service)\b/.test(sample)) topics.push("infrastructure");
+  if (/\b(task|todo|plan|priority)\b/.test(sample)) topics.push("planning");
+  if (/\b(code|file|function|class|module)\b/.test(sample)) topics.push("code");
+  if (/\b(vern|user|telegram|channel)\b/.test(sample)) topics.push("user-context");
+  return { activity, topics };
+}
+// END PATCH 6 (classifyTurn helper)
+
 export default function (api: MoltbotPluginAPI) {
   try {
     // PATCH 12: API-instance guard -- skip if this exact api object is already registered
