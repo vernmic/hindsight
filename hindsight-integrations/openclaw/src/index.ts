@@ -2517,6 +2517,45 @@ ${memoriesFormatted}
             }
           });
         // END PATCH B4
+
+        // PATCH 7: Astinus enrichment with PID lock
+        // DEPLOYMENT NOTE: lock path and script path are specific to this OpenClaw deployment
+        if ((pluginConfig as any).retainQualityGate) {
+          try {
+            const { activity } = classifyTurn(transcript);
+            if (activity !== "chitchat" && activity !== "memory-meta" && activity !== "procedural" && activity !== "narrative") {
+              const lockfilePath = "I:\\OpenClaw\\.openclaw\\workspace\\inject\\.astinus.lock";
+              const now = Date.now();
+              let lockValid = false;
+              try {
+                const stat = statSync(lockfilePath);
+                if (now - stat.mtimeMs < 90000) lockValid = true;
+              } catch (_) {}
+
+              if (!lockValid) {
+                writeFileSync(lockfilePath, process.pid.toString());
+                const _astinusStart = Date.now();
+                const _proc = spawn("python", ["I:\\OpenClaw\\.openclaw\\workspace\\scripts\\astinus_enrich.py"], {
+                  detached: true,
+                  stdio: ["pipe", "ignore", "ignore"],
+                  windowsHide: true,
+                });
+                _proc.on("error", (err) => debug(`[Hindsight] Astinus spawn error: ${err.message}`));
+                _proc.unref();
+                if (_proc.stdin) {
+                  _proc.stdin.end();
+                  _proc.stdin.destroy();
+                }
+                try { (global as any).__perfLog?.(effectiveCtx?.sessionKey || "unknown", "astinus_spawned", { ms: Date.now() - _astinusStart }); } catch (_) {}
+              } else {
+                try { (global as any).__perfLog?.(effectiveCtx?.sessionKey || "unknown", "astinus_skipped", { reason: "lock_active" }); } catch (_) {}
+              }
+            }
+          } catch (e) {
+            // best effort, fail silently
+          }
+        }
+        // END PATCH 7
       } catch (error) {
         log.error("error retaining messages", error);
       }
