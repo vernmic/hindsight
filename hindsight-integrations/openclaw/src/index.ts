@@ -2023,6 +2023,41 @@ export default function (api: MoltbotPluginAPI) {
         const _patchSystemAppend: string[] = [];
         const _patchUserPrepend: string[] = [];
 
+        // PATCH 1: async inject folder drain
+        // DEPLOYMENT NOTE: inject dir path is specific to this OpenClaw deployment
+        const _p1SessionKey = ctx?.sessionKey || (typeof event?.sessionKey === "string" ? event.sessionKey : "unknown");
+        try {
+          const _injectDir = "I:\\OpenClaw\\.openclaw\\workspace\\inject";
+          const _injectExists = await access(_injectDir).then(() => true).catch(() => false);
+          if (_injectExists) {
+            const _files = (await readdir(_injectDir)).filter((f: string) => !f.startsWith("."));
+            if (_files.length > 0) {
+              const _drained = await Promise.all(
+                _files.map(async (_f: string) => {
+                  const _fp = join(_injectDir, _f);
+                  try {
+                    const _content = await readFile(_fp, "utf8");
+                    await unlink(_fp);
+                    return { name: _f, content: _content };
+                  } catch (__e) {
+                    debug(`[Hindsight] Patch 1: failed to drain ${_f}: ${__e}`);
+                    return null;
+                  }
+                })
+              );
+              for (const _d of _drained) {
+                if (_d) {
+                  _patchUserPrepend.push(`<injected file="${_d.name}">\n${_d.content}\n</injected file="${_d.name}">`);
+                }
+              }
+              debug(`[Hindsight] Patch 1: drained ${_drained.filter(Boolean).length} files from inject/`);
+            }
+          }
+        } catch (_p1e) {
+          debug(`[Hindsight] Patch 1 (inject drain) failed: ${_p1e}`);
+        }
+        // END PATCH 1
+
         // --- Skip conditions (debug/logSkipOnce preserved) ---
         let _skipRecall = false;
 
