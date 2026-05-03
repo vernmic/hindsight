@@ -250,6 +250,10 @@ const sessionIdentityBySession = new Map<string, SessionIdentityRecord>();
 const skipHindsightTurnBySession = new Map<string, IdentitySkipReason>();
 const documentSequenceBySession = new Map<string, number>();
 
+// PATCH 2: startup mandate state -- tracks sessions that have already received the mandate
+const startupMandatedSessions = new Set<string>();
+// END PATCH 2 (state)
+
 // Cooldown + guard to prevent concurrent reinit attempts
 let lastReinitAttempt = 0;
 let isReinitInProgress = false;
