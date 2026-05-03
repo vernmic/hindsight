@@ -1535,7 +1535,7 @@ export default function (api: MoltbotPluginAPI) {
   }
   _registeredApis.add(api);
   try {
-    log.info("plugin entry invoked");
+// PATCH 19b: plugin entry invocation tracking`n    if (!(global as any).__hindsightPluginEntryCount) (global as any).__hindsightPluginEntryCount = 0;`n    (global as any).__hindsightPluginEntryCount++;`n    // END PATCH 19b`n`n    log.info("plugin entry invoked");
     debug("[Hindsight] Plugin loading...");
 
     // Get plugin config first (needed for debug flag and service registration)
