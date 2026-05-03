@@ -2058,6 +2058,24 @@ export default function (api: MoltbotPluginAPI) {
         }
         // END PATCH 1
 
+        // PATCH 11: conditional heartbeat injection
+        // DEPLOYMENT NOTE: heartbeat file path is specific to this OpenClaw deployment
+        if (_p1SessionKey.includes(":heartbeat")) {
+          try {
+            const _hbfPath = "I:\\OpenClaw\\.openclaw\\workspace\\heartbeat-full.md";
+            if (existsSync(_hbfPath)) {
+              const _hbContent = await readFile(_hbfPath, "utf8");
+              if (_hbContent.trim()) {
+                _patchUserPrepend.push(`<injected file="heartbeat-full.md">\n${_hbContent}\n</injected file="heartbeat-full.md">`);
+                debug(`[Hindsight] Patch 11: injected heartbeat-full.md for heartbeat session`);
+              }
+            }
+          } catch (_hbe) {
+            debug(`[Hindsight] Patch 11 (heartbeat inject) failed: ${_hbe}`);
+          }
+        }
+        // END PATCH 11
+
         // --- Skip conditions (debug/logSkipOnce preserved) ---
         let _skipRecall = false;
 
