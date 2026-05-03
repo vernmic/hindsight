@@ -2375,6 +2375,34 @@ ${memoriesFormatted}
           }
         }
 
+        // PATCH 5: async interrupt check
+        // DEPLOYMENT NOTE: script path is specific to this OpenClaw deployment
+        try {
+          const _interruptScript = "I:\\OpenClaw\\.openclaw\\workspace\\skills\\subagent-interrupt\\interrupt_check.py";
+          if (existsSync(_interruptScript)) {
+            const _p5Start = Date.now();
+            const _interruptProc = spawn("python", [_interruptScript, sessionKeyForCache || "unknown"], {
+              stdio: ["ignore", "pipe", "ignore"],
+              windowsHide: true,
+            });
+            let _interruptOutput = "";
+            _interruptProc.stdout?.on("data", (d: Buffer) => { _interruptOutput += d.toString(); });
+            await new Promise<void>((resolve) => {
+              _interruptProc.on("close", () => resolve());
+              _interruptProc.on("error", () => resolve());
+            });
+            const _interruptMsg = _interruptOutput.trim();
+            if (_interruptMsg) {
+              _patchUserPrepend.push(`<system_interrupt>\n${_interruptMsg}\n</system_interrupt>`);
+              debug(`[Hindsight] Patch 5: interrupt check returned: ${_interruptMsg.substring(0, 200)}`);
+            }
+            try { (global as any).__perfLog?.(sessionKeyForCache || "unknown", "patch5_interrupt", { ms: Date.now() - _p5Start, had_message: !!_interruptMsg }); } catch (_) {}
+          }
+        } catch (_p5e) {
+          debug(`[Hindsight] Patch 5 (interrupt check) failed: ${_p5e}`);
+        }
+        // END PATCH 5
+
         // --- Final assembly ---
         if (_patchSystemPrepend.length === 0 && _patchSystemAppend.length === 0 && _patchUserPrepend.length === 0) return;
         const _finalResult: any = {};
