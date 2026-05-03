@@ -1414,6 +1414,17 @@ function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
   };
 }
 
+// Patch globals -- owned by specific patches, accessed via (global as any)
+// __hindsightTurnPerfBuffer: string[]              -- PATCH 18
+// __hindsightTurnPerfFlushTimer: NodeJS.Timeout    -- PATCH 18
+// __perfLog: (session: string, step: string, extras?: Record<string, unknown>) => void -- PATCH 18
+// __hindsightPluginEntryCount: number              -- PATCH 19b
+// __hindsightWisdomCache: Map<string, { results: any[]; timestamp: number }> -- PATCH 3
+// __hindsightInterruptCache: Record<string, { message: string; consumed: boolean; timestamp: number }> -- PATCH 5
+// __hindsightInterruptInflight: Record<string, boolean> -- PATCH 5
+// __hindsightLlmLogBuffer: string[]                -- PATCH 8
+// __hindsightLlmLogFlushTimer: NodeJS.Timeout      -- PATCH 8
+
 export default function (api: MoltbotPluginAPI) {
   try {
     log.info("plugin entry invoked");
