@@ -1509,11 +1509,24 @@ export function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
   };
 }
 
+
 // Registration guard: WeakSet keyed by api instance to prevent double-registration
 // on the same api object while allowing fresh registration on new api objects.
 // Does not reintroduce issue #1029 because WeakSet.has() checks object identity,
 // not a module-level boolean.
 const _registeredApis = new WeakSet<MoltbotPluginAPI>();
+
+// Patch globals -- owned by specific patches, accessed via (global as any)
+// __hindsightTurnPerfBuffer: string[]              -- PATCH 18
+// __hindsightTurnPerfFlushTimer: NodeJS.Timeout    -- PATCH 18
+// __perfLog: (session: string, step: string, extras?: Record<string, unknown>) => void -- PATCH 18
+// __hindsightPluginEntryCount: number              -- PATCH 19b
+// __hindsightWisdomCache: Map<string, { results: any[]; timestamp: number }> -- PATCH 3
+// __hindsightInterruptCache: Record<string, { message: string; consumed: boolean; timestamp: number }> -- PATCH 5
+// __hindsightInterruptInflight: Record<string, boolean> -- PATCH 5
+// __hindsightLlmLogBuffer: string[]                -- PATCH 8
+// __hindsightLlmLogFlushTimer: NodeJS.Timeout      -- PATCH 8
+
 
 export default function (api: MoltbotPluginAPI) {
   if (_registeredApis.has(api)) {
