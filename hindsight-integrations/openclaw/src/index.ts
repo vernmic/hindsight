@@ -2286,6 +2286,21 @@ ${memoriesFormatted}
             );
             return;
           }
+
+          // PATCH 10: Session pattern filter
+          // DEPLOYMENT NOTE: Hardcoded defense-in-depth gate for operational sessions
+          if (
+            agentEndSessionKey.includes(":heartbeat") ||
+            agentEndSessionKey.includes(":cron:") ||
+            agentEndSessionKey.includes(":subagent") ||
+            agentEndSessionKey.includes(":autonomic:")
+          ) {
+            debug(
+              `[Hindsight] Skipping retain - operational session pattern matched: ${agentEndSessionKey}`
+            );
+            return;
+          }
+          // END PATCH 10
         }
 
         const sessionKeyForLookup = effectiveCtx?.sessionKey;
