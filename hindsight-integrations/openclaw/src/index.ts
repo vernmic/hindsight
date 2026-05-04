@@ -1413,6 +1413,8 @@ function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
 }
 
 export default function (api: MoltbotPluginAPI) {
+  const _entryTime = Date.now();
+  debug(`[Hindsight] Plugin entry at ${_entryTime}`);
   try {
     log.info("plugin entry invoked");
     debug("[Hindsight] Plugin loading...");
@@ -2026,6 +2028,8 @@ export default function (api: MoltbotPluginAPI) {
         debug(`[Hindsight] Auto-recall for bank ${bankId}, full query:\n---\n${prompt}\n---`);
 
         // Recall with deduplication: reuse in-flight request for same bank
+        const _recallStart = Date.now();
+        let _recallSource = "fresh";
         const normalizedPrompt = prompt.trim().toLowerCase().replace(/\s+/g, " ");
         const queryHash = createHash("sha256").update(normalizedPrompt).digest("hex").slice(0, 16);
         const recallKey = `${bankId}::${queryHash}`;
@@ -2034,6 +2038,7 @@ export default function (api: MoltbotPluginAPI) {
         if (existing) {
           debug(`[Hindsight] Reusing in-flight recall for bank ${bankId}`);
           recallPromise = existing;
+          _recallSource = "inflight_reuse";
         } else {
           const recallTimeoutMs = pluginConfig.recallTimeoutMs ?? DEFAULT_RECALL_TIMEOUT_MS;
           recallPromise = client.recall(
@@ -2050,6 +2055,10 @@ export default function (api: MoltbotPluginAPI) {
         }
 
         const response = await recallPromise;
+        const _recallMs = Date.now() - _recallStart;
+        debug(
+          `[Hindsight] Recall completed in ${_recallMs}ms (bank: ${bankId}, source: ${_recallSource}, results: ${response.results?.length ?? 0}, query_chars: ${prompt.length})`
+        );
 
         if (!response.results || response.results.length === 0) {
           debug("[Hindsight] No memories found for auto-recall");
