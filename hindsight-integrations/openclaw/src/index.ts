@@ -2327,29 +2327,31 @@ ${memoriesFormatted}
           `[Hindsight] Retaining to bank ${bankId}, document: ${retainRequest.documentId}, chars: ${transcript.length}\n---\n${transcript.substring(0, 500)}${transcript.length > 500 ? "\n...(truncated)" : ""}\n---`
         );
 
-        try {
-          await client.retain(retainRequest);
-          log.trackRetain(bankId, messageCount);
-          debug(
-            `[Hindsight] Retained ${messageCount} messages to bank ${bankId} for session ${retainRequest.documentId}`
-          );
-
-          // After a successful retain, try flushing any queued items
-          if (retainQueue && retainQueue.size() > 0) {
-            flushRetainQueue().catch(() => {});
-          }
-        } catch (retainError) {
-          // Queue the failed retain for later delivery (external API mode only)
-          if (retainQueue) {
-            retainQueue.enqueue(bankId, retainRequest, retainRequest.metadata);
-            const pending = retainQueue.size();
-            log.warn(
-              `API unreachable — retain queued (${pending} pending, bank: ${bankId}): ${retainError instanceof Error ? retainError.message : retainError}`
+        // Fire-and-forget retain: unblock agent_end return without waiting for API
+        client.retain(retainRequest)
+          .then(() => {
+            log.trackRetain(bankId, messageCount);
+            debug(
+              `[Hindsight] Retained ${messageCount} messages to bank ${bankId} for session ${retainRequest.documentId}`
             );
-          } else {
-            log.error("error retaining messages", retainError);
-          }
-        }
+
+            // After a successful retain, try flushing any queued items
+            if (retainQueue && retainQueue.size() > 0) {
+              flushRetainQueue().catch(() => {});
+            }
+          })
+          .catch((retainError: any) => {
+            // Queue the failed retain for later delivery (external API mode only)
+            if (retainQueue) {
+              retainQueue.enqueue(bankId, retainRequest, retainRequest.metadata);
+              const pending = retainQueue.size();
+              log.warn(
+                `API unreachable — retain queued (${pending} pending, bank: ${bankId}): ${retainError instanceof Error ? retainError.message : retainError}`
+              );
+            } else {
+              log.error("error retaining messages", retainError);
+            }
+          });
       } catch (error) {
         log.error("error retaining messages", error);
       }
