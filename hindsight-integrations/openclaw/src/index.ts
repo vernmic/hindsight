@@ -1523,13 +1523,18 @@ const _registeredApis = new WeakSet<MoltbotPluginAPI>();
 // Patch globals -- owned by specific patches, accessed via (global as any)
 // __hindsightTurnPerfBuffer: string[]              -- PATCH 18
 // __hindsightTurnPerfFlushTimer: NodeJS.Timeout    -- PATCH 18
-// __perfLog: (session: string, step: string, extras?: Record<string, unknown>) => void -- PATCH 18
+// __perfLog: (session: string, step: string, extras?: Record<string, unknown>) => void -- PATCH 18 (superseded by upstream debugPerfTiming)
 // __hindsightPluginEntryCount: number              -- PATCH 19b
 // __hindsightWisdomCache: Map<string, { results: any[]; timestamp: number }> -- PATCH 3
 // __hindsightInterruptCache: Record<string, { message: string; consumed: boolean; timestamp: number }> -- PATCH 5
 // __hindsightInterruptInflight: Record<string, boolean> -- PATCH 5
 // __hindsightLlmLogBuffer: string[]                -- PATCH 8
 // __hindsightLlmLogFlushTimer: NodeJS.Timeout      -- PATCH 8
+
+// PATCH 21: turn-start relay — captures embedded run start time for end-to-end latency
+let _turnStartMs = 0;
+let _turnStartChannel = "unknown";
+// END PATCH 21
 
 
 export default function (api: MoltbotPluginAPI) {
@@ -2044,8 +2049,8 @@ export default function (api: MoltbotPluginAPI) {
             await unlink(_tsPath);
             const _tsData = JSON.parse(_tsRaw);
             if (typeof _tsData.ts === "number") {
-              (global as any).__hindsightTurnStartMs = _tsData.ts;
-              (global as any).__hindsightTurnStartChannel = typeof _tsData.channel === "string" ? _tsData.channel : "unknown";
+              _turnStartMs = _tsData.ts;
+              _turnStartChannel = typeof _tsData.channel === "string" ? _tsData.channel : "unknown";
             }
           } catch (_) { /* no file or parse error */ }
           // END PATCH 21
@@ -2229,6 +2234,61 @@ export default function (api: MoltbotPluginAPI) {
 
         debug(`[Hindsight] Auto-recall for bank ${bankId}, full query:\n---\n${prompt}\n---`);
 
+        // PATCH 3: wisdom sidecar — recall against shared "openclaw" bank
+        // for derived principles/knowledge, with 500ms timeout and 30-min cache.
+        let _wisdomPromise: Promise<{ content: string; results: any[] } | null> = Promise.resolve(null);
+        try {
+          const _wisdomBankId = "openclaw";
+          const _CACHE_TTL_MS = 30 * 60 * 1000;
+          const _HARD_TIMEOUT_MS = 500;
+          const _now = Date.now();
+          const _cacheKey = prompt.substring(0, 200);
+          if (!(global as any).__hindsightWisdomCache)
+            (global as any).__hindsightWisdomCache = new Map();
+          const _cached = (global as any).__hindsightWisdomCache.get(_cacheKey);
+          if (_cached && _now - _cached.timestamp < _CACHE_TTL_MS) {
+            const _wr = _cached.results;
+            if (_wr && _wr.length > 0) {
+              _wisdomPromise = Promise.resolve({
+                content: `Derived principles (${_wr.length}):\n${_wr.map((r: any) => `- ${r.content ?? r.text ?? r}`).join("\n")}`,
+                results: _wr,
+              });
+            }
+            debug(`[Hindsight] wisdom: cache hit (${_wr?.length ?? 0} results)`);
+          } else {
+            _wisdomPromise = (async () => {
+              try {
+                const _wc = scopeClient(client, _wisdomBankId);
+                const _wisdomResp = await Promise.race([
+                  _wc.recall({ query: _cacheKey.substring(0, 400), maxTokens: 512 }, _HARD_TIMEOUT_MS),
+                  new Promise<never>((_, rej) => setTimeout(() => rej(new Error("wisdom timeout 500ms")), _HARD_TIMEOUT_MS)),
+                ]);
+                const _wr = ((_wisdomResp?.results) ?? [])
+                  .filter(
+                    (r: any) =>
+                      r.tags?.some((t: string) => t === "type:derived_principles") ||
+                      r.context === "derived_learnings"
+                  )
+                  .slice(0, 5);
+                (global as any).__hindsightWisdomCache.set(_cacheKey, { results: _wr, timestamp: _now });
+                if (_wr.length > 0) {
+                  return {
+                    content: `Derived principles (${_wr.length}):\n${_wr.map((r: any) => `- ${r.content ?? r.text ?? r}`).join("\n")}`,
+                    results: _wr,
+                  };
+                }
+                return null;
+              } catch (_wte) {
+                debug(`[Hindsight] wisdom: query failed or timed out: ${_wte}`);
+                return null;
+              }
+            })();
+          }
+        } catch (_p3e) {
+          debug(`[Hindsight] Patch 3 (wisdom sidecar) setup failed: ${_p3e}`);
+        }
+        // END PATCH 3
+
         // Recall with deduplication: reuse in-flight request for same bank
         const normalizedPrompt = prompt.trim().toLowerCase().replace(/\s+/g, " ");
         const queryHash = createHash("sha256").update(normalizedPrompt).digest("hex").slice(0, 16);
@@ -2285,6 +2345,14 @@ export default function (api: MoltbotPluginAPI) {
 
         // Format memories as JSON with all fields from recall
         const memoriesFormatted = formatMemories(results);
+
+        // PATCH 3: resolve wisdom sidecar and inject results
+        const _wisdomResult = await _wisdomPromise;
+        if (_wisdomResult?.content) {
+          _patchUserPrepend.push(`<wisdom_context>\n${_wisdomResult.content}\n</wisdom_context>`);
+          debug(`[Hindsight] Patch 3: wisdom context injected (${_wisdomResult.results.length} principles)`);
+        }
+        // END PATCH 3
 
         const contextMessage = `<hindsight_memories>
 ${pluginConfig.recallPromptPreamble || DEFAULT_RECALL_PROMPT_PREAMBLE}
@@ -2632,6 +2700,16 @@ ${memoriesFormatted}
             })
           );
         }
+
+        // PATCH 21: end-to-end turn latency from OpenClaw embedded run start
+        if (_turnStartMs > 0) {
+          const _sessionKey = effectiveCtx?.sessionKey || "unknown";
+          debug(
+            `[Hindsight] Patch 21: telegram_turn_ms=${Date.now() - _turnStartMs} channel=${_turnStartChannel} session=${_sessionKey}`
+          );
+          _turnStartMs = 0;
+        }
+        // END PATCH 21
       } catch (error) {
         log.error("error retaining messages", error);
       }
