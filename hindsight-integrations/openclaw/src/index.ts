@@ -2004,6 +2004,74 @@ export default function (api: MoltbotPluginAPI) {
       // recall calls — perf lines are only emitted on the recall path.
       const perfHookStart = pluginConfig.debugPerfTiming ? Date.now() : 0;
       try {
+        // Context assembly arrays — patches collect content here. Final assembly at handler end.
+        const _patchSystemPrepend: string[] = [];
+        const _patchSystemAppend: string[] = [];
+        const _patchUserPrepend: string[] = [];
+
+        // PATCH 1: async inject folder drain + turn-start relay (Patch 21)
+        // DEPLOYMENT NOTE: inject dir path is specific to this OpenClaw deployment
+        const _p1SessionKey = ctx?.sessionKey || (typeof event?.sessionKey === "string" ? event.sessionKey : "unknown");
+        try {
+          const _injectDir = "I:\\OpenClaw\\.openclaw\\workspace\\inject";
+          const _injectExists = await access(_injectDir).then(() => true).catch(() => false);
+          if (_injectExists) {
+            const _files = (await readdir(_injectDir)).filter((f: string) => !f.startsWith("."));
+            if (_files.length > 0) {
+              const _drained = await Promise.all(_files.map(async (_f: string) => {
+                const _fp = join(_injectDir, _f);
+                try {
+                  const _content = await readFile(_fp, "utf8");
+                  await unlink(_fp);
+                  return { name: _f, content: _content };
+                } catch (__e) {
+                  debug(`[Hindsight] Patch 1: failed to drain ${_f}: ${__e}`);
+                  return null;
+                }
+              }));
+              for (const _d of _drained) {
+                if (_d) {
+                  _patchUserPrepend.push(`<injected file="${_d.name}">\n${_d.content}\n</injected file="${_d.name}">`);
+                }
+              }
+              debug(`[Hindsight] Patch 1: drained ${_drained.filter(Boolean).length} files from inject/`);
+            }
+          }
+          // PATCH 21: read .turn-start.json (dotfile, consumed here for telegram_turn_ms)
+          try {
+            const _tsPath = join(_injectDir, ".turn-start.json");
+            const _tsRaw = await readFile(_tsPath, "utf8");
+            await unlink(_tsPath);
+            const _tsData = JSON.parse(_tsRaw);
+            if (typeof _tsData.ts === "number") {
+              (global as any).__hindsightTurnStartMs = _tsData.ts;
+              (global as any).__hindsightTurnStartChannel = typeof _tsData.channel === "string" ? _tsData.channel : "unknown";
+            }
+          } catch (_) { /* no file or parse error */ }
+          // END PATCH 21
+        } catch (_p1e) {
+          debug(`[Hindsight] Patch 1 (inject drain) failed: ${_p1e}`);
+        }
+        // END PATCH 1
+
+        // PATCH 11: conditional heartbeat injection
+        // DEPLOYMENT NOTE: heartbeat file path is specific to this OpenClaw deployment
+        if (_p1SessionKey.includes(":heartbeat")) {
+          try {
+            const _hbfPath = "I:\\OpenClaw\\.openclaw\\workspace\\heartbeat-full.md";
+            if (existsSync(_hbfPath)) {
+              const _hbContent = await readFile(_hbfPath, "utf8");
+              if (_hbContent.trim()) {
+                _patchUserPrepend.push(`<injected file="heartbeat-full.md">\n${_hbContent}\n</injected file="heartbeat-full.md">`);
+                debug(`[Hindsight] Patch 11: injected heartbeat-full.md for heartbeat session`);
+              }
+            }
+          } catch (_hbe) {
+            debug(`[Hindsight] Patch 11 (heartbeat inject) failed: ${_hbe}`);
+          }
+        }
+        // END PATCH 11
+
         // Check if this provider is excluded
         if (ctx?.messageProvider && pluginConfig.excludeProviders?.includes(ctx.messageProvider)) {
           debug(`[Hindsight] Skipping recall for excluded provider: ${ctx.messageProvider}`);
@@ -2045,6 +2113,27 @@ export default function (api: MoltbotPluginAPI) {
 
         const sessionKeyForCache =
           ctx?.sessionKey ?? (typeof event?.sessionKey === "string" ? event.sessionKey : undefined);
+
+        // PATCH 2: startup grounding mandate — injects on first turn of each new session
+        if (sessionKeyForCache && !startupMandatedSessions.has(sessionKeyForCache)) {
+          try {
+            startupMandatedSessions.add(sessionKeyForCache);
+            const _mandateLines = [
+              "<startup_mandate>",
+              "Grounding context for this session:",
+              "1. Read todos.md, NEXT_SESSION.md, and gateway.md before responding.",
+              "2. These files are the canonical handoff between sessions.",
+              "3. Verify everything. LLMs hallucinate directories, files, tool availability.",
+              "</startup_mandate>",
+            ];
+            _patchSystemPrepend.push(_mandateLines.join("\n"));
+            debug(`[Hindsight] Patch 2: injecting startup mandate for session ${sessionKeyForCache}`);
+          } catch (_m2e) {
+            debug(`[Hindsight] Patch 2 (startup mandate) failed: ${_m2e}`);
+          }
+        }
+        // END PATCH 2
+
         const skipTurnReason = sessionKeyForCache
           ? skipHindsightTurnBySession.get(sessionKeyForCache)
           : undefined;
@@ -2218,18 +2307,54 @@ ${memoriesFormatted}
           );
         }
 
-        // Inject recalled memories. Position is configurable to preserve prompt caching
-        // when agents have large static system prompts.
+        // Collect recalled memories into assembly arrays based on injection position.
         const position = pluginConfig.recallInjectionPosition || "prepend";
         switch (position) {
           case "append":
-            return { appendSystemContext: contextMessage };
+            _patchSystemAppend.push(contextMessage);
+            break;
           case "user":
-            return { prependContext: contextMessage };
+            _patchUserPrepend.push(contextMessage);
+            break;
           case "prepend":
           default:
-            return { prependSystemContext: contextMessage };
+            _patchSystemPrepend.push(contextMessage);
+            break;
         }
+
+        // PATCH 5: async interrupt check
+        // DEPLOYMENT NOTE: script path is specific to this OpenClaw deployment
+        try {
+          const _interruptScript = "I:\\OpenClaw\\.openclaw\\workspace\\skills\\subagent-interrupt\\interrupt_check.py";
+          if (existsSync(_interruptScript)) {
+            const _interruptProc = spawn("python", [_interruptScript, sessionKeyForCache || "unknown"], {
+              stdio: ["ignore", "pipe", "ignore"],
+              windowsHide: true,
+            });
+            let _interruptOutput = "";
+            _interruptProc.stdout?.on("data", (d: Buffer) => { _interruptOutput += d.toString(); });
+            await new Promise<void>((resolve) => {
+              _interruptProc.on("close", () => resolve());
+              _interruptProc.on("error", () => resolve());
+            });
+            const _interruptMsg = _interruptOutput.trim();
+            if (_interruptMsg) {
+              _patchUserPrepend.push(`<system_interrupt>\n${_interruptMsg}\n</system_interrupt>`);
+              debug(`[Hindsight] Patch 5: interrupt check returned: ${_interruptMsg.substring(0, 200)}`);
+            }
+          }
+        } catch (_p5e) {
+          debug(`[Hindsight] Patch 5 (interrupt check) failed: ${_p5e}`);
+        }
+        // END PATCH 5
+
+        // --- Final assembly ---
+        if (_patchSystemPrepend.length === 0 && _patchSystemAppend.length === 0 && _patchUserPrepend.length === 0) return;
+        const _finalResult: any = {};
+        if (_patchSystemPrepend.length > 0) _finalResult.prependSystemContext = _patchSystemPrepend.join("\n\n");
+        if (_patchSystemAppend.length > 0) _finalResult.appendSystemContext = _patchSystemAppend.join("\n\n");
+        if (_patchUserPrepend.length > 0) _finalResult.prependContext = _patchUserPrepend.join("\n\n");
+        return _finalResult;
       } catch (error) {
         if (error instanceof DOMException && error.name === "TimeoutError") {
           log.warn(
