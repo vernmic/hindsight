@@ -2054,7 +2054,7 @@ export function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
     skipRetainSessionPatterns: (() => {
       const raw = Array.isArray(config.skipRetainSessionPatterns)
         ? config.skipRetainSessionPatterns
-        : ["heartbeat", "cron", "subagent"];
+        : [];
       // Convert bare tokens to glob patterns: "heartbeat" -> "**:heartbeat**"
       // Pass through patterns that already contain glob wildcards
       return raw.map((p: string) => (p.includes("*") ? p : `**:${p}**`));

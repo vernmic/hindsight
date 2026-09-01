@@ -348,8 +348,8 @@
       "skipRetainSessionPatterns": {
         "type": "array",
         "items": { "type": "string" },
-        "description": "Bare tokens (e.g. \"heartbeat\") auto-wrap as glob patterns \"**:token**\". Use glob syntax for custom patterns. Defaults: [\"heartbeat\", \"cron\", \"subagent\"]. Sessions matching these patterns skip retain but still allow recall.",
-        "default": ["heartbeat", "cron", "subagent"]
+        "description": "Bare tokens (e.g. \"heartbeat\") auto-wrap as glob patterns \"**:token**\". Use glob syntax for custom patterns. Defaults: [] (disabled). Sessions matching these patterns skip retain but still allow recall.",
+        "default": []
       },
       "skipStatelessSessions": {
         "type": "boolean",
