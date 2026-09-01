@@ -350,6 +350,11 @@
         "description": "When true (default), sessions matching statelessSessionPatterns also skip recall. When false, they can recall but never retain.",
         "default": true
       },
+      "retainQualityGate": {
+        "type": "boolean",
+        "description": "When true, skip retain for low-signal turns (chitchat, memory-meta, procedural/narrative noise, pure tool calls) via a lightweight regex classifier. Default: false (disabled).",
+        "default": false
+      },
       "enableKnowledgeTools": {
         "type": "boolean",
         "description": "Register agent_knowledge_* tools for explicit lookup, reflection, ingest, and knowledge-page management. Set automatically by the self-driving-agents CLI.",
@@ -598,6 +603,10 @@
     "skipStatelessSessions": {
       "label": "Skip Stateless Sessions",
       "placeholder": "true (default)"
+    },
+    "retainQualityGate": {
+      "label": "Retain Quality Gate",
+      "placeholder": "false (default)"
     },
     "senderPrefixPattern": {
       "label": "Sender Prefix Pattern",
