@@ -2066,6 +2066,7 @@ export function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
       typeof config.retainQueueFlushIntervalMs === "number" && config.retainQueueFlushIntervalMs > 0
         ? config.retainQueueFlushIntervalMs
         : undefined,
+    retainNonBlocking: config.retainNonBlocking === true,
     enableKnowledgeTools: config.enableKnowledgeTools === true,
     senderPrefixPattern,
   };
@@ -3045,54 +3046,71 @@ ${memoriesFormatted}
         );
 
         const retainStart = pluginConfig.debugPerfTiming ? Date.now() : 0;
-        let retainElapsedMs = 0;
-        let retainOutcome: "ok" | "queued" | "error" = "error";
-        try {
-          // An unknown capability does not hold up the first send: there is
-          // nothing on the server yet for it to duplicate, so omitting the wire
-          // field is exactly today's behaviour. The id is still allocated and
-          // persisted with the request, so a *replay* can be idempotent once the
-          // capability is known — that is where duplicates actually come from.
-          await client.retain(retainRequest, retainOperationIdCapability, retainSignal);
+
+        const onRetainSettled = (outcome: "ok" | "queued" | "error") => {
+          if (pluginConfig.debugPerfTiming) {
+            log.info(
+              formatHookPerf(hookName, Date.now() - perfHookStart, {
+                retain: `${pluginConfig.debugPerfTiming ? Date.now() - retainStart : 0}ms`,
+                outcome,
+                bank: bankId,
+                messages: messageCount,
+              })
+            );
+          }
+        };
+        const onRetainOk = () => {
           if (!retainLifecycleIsCurrent()) return;
-          retainElapsedMs = pluginConfig.debugPerfTiming ? Date.now() - retainStart : 0;
-          retainOutcome = "ok";
           log.trackRetain(bankId, messageCount);
           debug(
             `[Hindsight] Retained ${messageCount} messages to bank ${bankId} for session ${retainRequest.documentId}`
           );
-
           // After a successful retain, try flushing any queued items
           if (retainQueue) {
             flushRetainQueue(undefined, undefined, undefined, retainGeneration, retainSignal).catch(
               () => {}
             );
           }
-        } catch (retainError) {
+          onRetainSettled("ok");
+        };
+        const onRetainError = (retainError: unknown) => {
           if (!retainLifecycleIsCurrent()) return;
-          retainElapsedMs = pluginConfig.debugPerfTiming ? Date.now() - retainStart : 0;
           // Queue the failed retain for later delivery
           if (retainQueue) {
             retainQueue.enqueue(bankId, retainRequest, retainRequest.metadata);
-            retainOutcome = "queued";
             const pending = retainQueue.size();
             log.warn(
               `API unreachable — retain queued (${pending} pending, bank: ${bankId}): ${retainError instanceof Error ? retainError.message : retainError}`
             );
+            onRetainSettled("queued");
           } else {
             log.error("error retaining messages", retainError);
+            onRetainSettled("error");
           }
-        }
+        };
 
-        if (pluginConfig.debugPerfTiming) {
-          log.info(
-            formatHookPerf(hookName, Date.now() - perfHookStart, {
-              retain: `${retainElapsedMs}ms`,
-              outcome: retainOutcome,
-              bank: bankId,
-              messages: messageCount,
-            })
-          );
+        // An unknown capability does not hold up the first send: there is
+        // nothing on the server yet for it to duplicate, so omitting the wire
+        // field is exactly today's behaviour. The id is still allocated and
+        // persisted with the request, so a *replay* can be idempotent once the
+        // capability is known — that is where duplicates actually come from.
+        //
+        // retainNonBlocking (opt-in) skips the await on agent_end only, so a
+        // slow retain RPC doesn't hold up the hook return on every turn.
+        // session_end always awaits: it is the last chance to flush a short
+        // conversation before the process may exit (#1726), and an abandoned
+        // fire-and-forget promise there would silently drop it.
+        if (pluginConfig.retainNonBlocking && hookName === "agent_end") {
+          client
+            .retain(retainRequest, retainOperationIdCapability, retainSignal)
+            .then(onRetainOk, onRetainError);
+        } else {
+          try {
+            await client.retain(retainRequest, retainOperationIdCapability, retainSignal);
+            onRetainOk();
+          } catch (retainError) {
+            onRetainError(retainError);
+          }
         }
       } catch (error) {
         log.error("error retaining messages", error);
