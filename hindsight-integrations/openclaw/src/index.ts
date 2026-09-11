@@ -3315,11 +3315,58 @@ ${memoriesFormatted}
         if (!sessionKey.endsWith(":main") && !sessionKey.includes(":main:")) return;
         const now = Date.now();
         if (now - astinusLastSpawnMs < 90_000) return;
-        const enrichScript = `${WORKSPACE_ROOT}\\workspace\\astinus\\enrich.py`;
+        const enrichScript = `${WORKSPACE_ROOT}\\workspace\\skills\\astinus\\enrich.py`;
         if (!existsSync(enrichScript)) return;
         astinusLastSpawnMs = now;
+        // Build the JSON payload enrich.py reads on stdin (topics + last turn text).
+        let astinusPayload = "{}";
+        try {
+          const msgs: any[] =
+            (event as any)?.context?.sessionEntry?.messages ?? (event as any)?.messages ?? [];
+          const textOf = (m: any): string => {
+            const c = m?.content;
+            if (typeof c === "string") return c.trim();
+            if (Array.isArray(c)) {
+              return c
+                .map((p: any) => (typeof p === "string" ? p : typeof p?.text === "string" ? p.text : ""))
+                .join("\n")
+                .trim();
+            }
+            return "";
+          };
+          let lastUser = "";
+          let lastAssistant = "";
+          for (let i = msgs.length - 1; i >= 0; i--) {
+            const m = msgs[i];
+            if (!m) continue;
+            if (m.role === "user" && !lastUser) lastUser = textOf(m);
+            if (m.role === "assistant" && !lastAssistant) lastAssistant = textOf(m);
+            if (lastUser && lastAssistant) break;
+          }
+          let topics: string[] = [];
+          try {
+            const cls: any = classifyTurn(`${lastUser}\n${lastAssistant}`.slice(0, 2000));
+            if (cls && Array.isArray(cls.topics)) topics = cls.topics.slice(0, 6);
+          } catch (_) {}
+          if (!topics.length) {
+            const stop = new Set(["this", "that", "with", "from", "have", "will", "your", "what", "when", "were", "they", "them", "then", "than", "been", "into", "over", "just", "some", "more", "about", "these", "those", "which", "there", "their", "would", "could", "should", "please", "make", "sure", "like", "also", "only", "very", "much", "need"]);
+            topics = Array.from(
+              new Set(
+                (lastUser.toLowerCase().match(/[a-z0-9][a-z0-9_.-]{3,}/g) || []).filter((w: string) => !stop.has(w))
+              )
+            ).slice(0, 5);
+          }
+          astinusPayload = JSON.stringify({
+            topics,
+            last_user_message: lastUser.slice(0, 800),
+            conversation_summary: `${lastUser.slice(0, 300)}\n---\n${lastAssistant.slice(0, 500)}`.trim(),
+            active_tasks: [],
+          });
+        } catch (e) {
+          debug(`[Hindsight customizations] Astinus payload build failed: ${e}`);
+        }
         const child = spawn("python", [enrichScript], {
-          stdio: "ignore",
+          stdio: ["pipe", "ignore", "ignore"],
           windowsHide: true,
           detached: true,
         });
@@ -3327,6 +3374,12 @@ ${memoriesFormatted}
           debug(`[Hindsight customizations] Astinus spawn error: ${err.message}`);
         });
         child.unref();
+        try {
+          if (child.stdin) {
+            child.stdin.write(astinusPayload);
+            child.stdin.end();
+          }
+        } catch (_) {}
       } catch (e) {
         debug(`[Hindsight customizations] Astinus trigger failed: ${e}`);
       }
