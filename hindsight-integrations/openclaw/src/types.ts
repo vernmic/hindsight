@@ -142,7 +142,8 @@ export interface PluginConfig {
   ignoreSessionPatterns?: string[]; // Session key glob patterns to skip entirely (no recall, no retain). E.g. ["agent:main:**", "agent:*:cron:**"]
   statelessSessionPatterns?: string[]; // Session key glob patterns for read-only sessions (recall allowed, retain skipped). E.g. ["agent:*:subagent:**"]
   skipStatelessSessions?: boolean; // When true (default), stateless sessions also skip recall. When false, they recall but never retain.
-  skipRetainSessionPatterns?: string[]; // Bare tokens (e.g. "heartbeat") auto-wrapped as glob patterns "**:token**". Use glob syntax for custom patterns. Defaults: ["heartbeat", "cron", "subagent"]. Sessions matching these patterns skip retain but still allow recall.
+  skipRetainSessionPatterns?: string[]; // Bare tokens (e.g. "heartbeat") auto-wrapped as glob patterns "**:token**". Use glob syntax for custom patterns. Default: [] (no retain skipping unless configured). Sessions matching these patterns skip retain but still allow recall.
+  retainQualityGate?: boolean; // When true, skip retain for low-signal turns (chitchat, memory-meta, procedural/narrative noise, pure tool calls) via a lightweight regex classifier. Default: false (disabled).
   debug?: boolean; // Enable debug logging (default: false)
   logLevel?: "off" | "error" | "warning" | "info" | "debug"; // Console log verbosity (default: 'info').
   logSummaryIntervalMs?: number; // Batch retain/recall log summaries over this interval in ms. 0 = log every event. Default: 300000 (5 min).
