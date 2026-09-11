@@ -331,6 +331,11 @@
         "description": "How often to attempt flushing queued retains in ms. Default: 60000 (1 min).",
         "default": 60000
       },
+      "retainNonBlocking": {
+        "type": "boolean",
+        "description": "When true, agent_end does not await the retain RPC (fire-and-forget with the same success/failure/queue handling, just off the hot path). session_end always awaits regardless, since it is the last chance to flush before the process may exit. Default: false.",
+        "default": false
+      },
       "ignoreSessionPatterns": {
         "type": "array",
         "items": {
@@ -597,6 +602,10 @@
     "retainQueueFlushIntervalMs": {
       "label": "Retain Queue Flush Interval (ms)",
       "placeholder": "60000"
+    },
+    "retainNonBlocking": {
+      "label": "Retain Non-Blocking",
+      "placeholder": "false (default)"
     },
     "ignoreSessionPatterns": {
       "label": "Ignore Session Patterns",
