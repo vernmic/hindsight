@@ -2060,6 +2060,7 @@ export function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
       return raw.map((p: string) => (p.includes("*") ? p : `**:${p}**`));
     })(),
     skipStatelessSessions: config.skipStatelessSessions !== false,
+    retainQualityGate: config.retainQualityGate === true,
     debug: config.debug ?? false,
     debugPerfTiming: config.debugPerfTiming === true,
     // Retain queue: kept off the strict whitelist before — user values were
@@ -2077,6 +2078,48 @@ export function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
     enableKnowledgeTools: config.enableKnowledgeTools === true,
     senderPrefixPattern,
   };
+}
+
+// classifyTurn: lightweight regex-based turn classifier for the retention quality gate.
+// Returns activity type and detected topics. Runs in <1ms, no LLM call.
+export function classifyTurn(transcript: string): { activity: string; topics: string[] } {
+  const sample = transcript.substring(0, 2000).toLowerCase();
+  // Activity classification
+  let activity = "general";
+  if (
+    /\b(hello|hi|hey|thanks|thank you|good morning|good evening|good night|bye)\b/.test(
+      sample
+    ) &&
+    transcript.length < 500
+  ) {
+    activity = "chitchat";
+  } else if (
+    /\b(remember|recall|forget|memory|memories|retain|purge)\b/.test(sample)
+  ) {
+    activity = "memory-meta";
+  } else if (
+    /\b(edit|update|change|add|set|configure|patch|tweak)\b[\s\S]{0,40}\b(file|config|setting|variable)\b/.test(
+      sample
+    )
+  ) {
+    activity = "config-edit";
+  } else if (/\b(fix|bug|error|issue|broken|crash|fail)\b/.test(sample)) {
+    activity = "debugging";
+  } else if (/\b(build|deploy|test|run|install|compile)\b/.test(sample)) {
+    activity = "development";
+  } else if (/\b(analyze|research|search|find|lookup|investigate)\b/.test(sample)) {
+    activity = "research";
+  }
+  // Topic extraction — generic categories only; deployment-specific vocabulary
+  // belongs in a downstream classifier, not this upstream-facing helper.
+  const topics: string[] = [];
+  if (/\b(agent|subagent|session|spawn)\b/.test(sample)) topics.push("agents");
+  if (/\b(skill|workflow|automation)\b/.test(sample)) topics.push("skills");
+  if (/\b(model|llm|gpt|claude)\b/.test(sample)) topics.push("models");
+  if (/\b(gateway|config|restart|service)\b/.test(sample)) topics.push("infrastructure");
+  if (/\b(task|todo|plan|priority)\b/.test(sample)) topics.push("planning");
+  if (/\b(code|file|function|class|module)\b/.test(sample)) topics.push("code");
+  return { activity, topics };
 }
 
 // Registration guard: WeakSet keyed by api instance to prevent double-registration
@@ -3012,6 +3055,25 @@ ${memoriesFormatted}
         if (isEphemeralOperationalText(transcript)) {
           debug("[Hindsight Hook] Transcript is operational/ephemeral noise, skipping retention");
           return;
+        }
+
+        if (pluginConfig.retainQualityGate) {
+          try {
+            const { activity, topics } = classifyTurn(transcript);
+            let skipReason = "";
+            if (activity === "chitchat" && topics.length === 0 && transcript.length < 200) skipReason = "short chitchat";
+            else if (activity === "memory-meta" && topics.length === 0) skipReason = "memory-meta noise";
+            else if (/^(Assistant|User) (changed|requested|planned|explained)/i.test(transcript) && !/\b(decided|insight|important)\b/i.test(transcript) && transcript.length < 500) skipReason = "procedural noise";
+            else if (/^(Assistant planned to|The assistant explained)/i.test(transcript) && topics.length === 0) skipReason = "narrative noise";
+            else if (/^\[role: tool\][\s\S]*\[role: assistant\][\s\S]*$/.test(transcript) && !transcript.includes("[role: user]")) skipReason = "pure tool calls";
+
+            if (skipReason) {
+              debug(`[Hindsight] Skipping retain - quality gate: ${skipReason}`);
+              return;
+            }
+          } catch (e) {
+            debug(`[Hindsight] Quality gate error: ${e}`);
+          }
         }
 
         // Wait for client to be ready
