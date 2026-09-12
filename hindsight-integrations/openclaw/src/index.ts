@@ -18,7 +18,9 @@ import { createHash, randomUUID } from "crypto";
 import { dirname, join } from "path";
 import * as log from "./logger.js";
 import { configureLogger, setApiLogger, stopLogger } from "./logger.js";
-import { mkdirSync } from "fs";
+import { existsSync, mkdirSync } from "fs";
+import { access, readFile, readdir, unlink } from "fs/promises";
+import { spawn } from "child_process";
 import { createRequire } from "module";
 import { homedir } from "os";
 import { createKnowledgeTools, TOOL_NAMES } from "@vectorize-io/hindsight-agent-sdk";
@@ -3202,6 +3204,7 @@ ${memoriesFormatted}
     // Hook signature: (event, ctx) where event has {messages, success, error?, durationMs?}
     api.on("agent_end", async (event: any, ctx?: PluginHookAgentContext) => {
       await runRetain(event, ctx, { hookName: "agent_end" });
+      runAstinusTrigger(event, ctx);
     });
 
     // session_end fires once per OpenClaw session close. We force-flush so
@@ -3210,6 +3213,278 @@ ${memoriesFormatted}
     api.on("session_end", async (event: any, ctx?: PluginHookAgentContext) => {
       await runRetain(event, ctx, { hookName: "session_end", force: true });
     });
+    // ============================================================
+    // Deployment customizations for this OpenClaw workspace. Registered as
+    // independent hook handlers so they never touch Hindsight's own hook
+    // logic above — OpenClaw runs multiple handlers per hook sequentially
+    // and merges their results (prependContext/prependSystemContext/etc.
+    // are concatenated, see mergeBeforePromptBuild in openclaw's hooks.ts),
+    // so this is safe to run alongside the native recall/retain handlers
+    // and never conflicts with them on rebase.
+    // ============================================================
+    const startupMandatedSessions = new Set<string>();
+    const WORKSPACE_ROOT = "I:\\OpenClaw\\.openclaw";
+    let astinusLastSpawnMs = 0;
+
+    api.on("before_prompt_build", async (event: any, ctx?: PluginHookAgentContext) => {
+      const prependParts: string[] = [];
+
+      try {
+        // Inject folder drain: reads workspace/inject/, injects as <injected file>,
+        // deletes consumed files.
+        const injectDir = `${WORKSPACE_ROOT}\\workspace\\inject`;
+        const injectExists = await access(injectDir).then(() => true).catch(() => false);
+        if (injectExists) {
+          const files = (await readdir(injectDir)).filter((f) => !f.startsWith("."));
+          if (files.length > 0) {
+            const drained = await Promise.all(
+              files.map(async (f) => {
+                const fp = join(injectDir, f);
+                try {
+                  const content = await readFile(fp, "utf8");
+                  await unlink(fp);
+                  return { name: f, content };
+                } catch (e) {
+                  debug(`[Hindsight customizations] failed to drain ${f}: ${e}`);
+                  return null;
+                }
+              })
+            );
+            for (const d of drained) {
+              if (d)
+                prependParts.push(
+                  `<injected file="${d.name}">\n${d.content}\n</injected file="${d.name}">`
+                );
+            }
+          }
+        }
+      } catch (e) {
+        debug(`[Hindsight customizations] inject drain failed: ${e}`);
+      }
+
+      try {
+        // Heartbeat injection: for heartbeat sessions, inject heartbeat-full.md.
+        const sessionKey =
+          ctx?.sessionKey || (typeof event?.sessionKey === "string" ? event.sessionKey : "");
+        if (sessionKey.includes(":heartbeat")) {
+          const hbPath = `${WORKSPACE_ROOT}\\workspace\\heartbeat-full.md`;
+          if (existsSync(hbPath)) {
+            const hbContent = await readFile(hbPath, "utf8");
+            if (hbContent.trim()) {
+              prependParts.push(
+                `<injected file="heartbeat-full.md">\n${hbContent}\n</injected file="heartbeat-full.md">`
+              );
+            }
+          }
+        }
+      } catch (e) {
+        debug(`[Hindsight customizations] heartbeat inject failed: ${e}`);
+      }
+
+      try {
+        // Startup mandate: on first turn of a new session, inject grounding instructions.
+        const sessionKey =
+          ctx?.sessionKey || (typeof event?.sessionKey === "string" ? event.sessionKey : undefined);
+        if (sessionKey && !startupMandatedSessions.has(sessionKey)) {
+          startupMandatedSessions.add(sessionKey);
+          prependParts.push(
+            [
+              "<startup_mandate>",
+              "Grounding context for this session:",
+              "1. Read todos.md, NEXT_SESSION.md, and gateway.md before responding.",
+              "2. These files are the canonical handoff between sessions.",
+              "3. Verify everything. LLMs hallucinate directories, files, tool availability.",
+              "</startup_mandate>",
+            ].join("\n")
+          );
+        }
+      } catch (e) {
+        debug(`[Hindsight customizations] startup mandate failed: ${e}`);
+      }
+
+      try {
+        // Wisdom sidecar: recall from the shared "openclaw" bank for derived
+        // principles, 500ms hard timeout + 30-min cache.
+        const clientGlobal = (global as any).__hindsightClient;
+        const prompt = typeof event?.prompt === "string" ? event.prompt : "";
+        if (clientGlobal && prompt) {
+          const CACHE_TTL_MS = 30 * 60 * 1000;
+          const HARD_TIMEOUT_MS = 500;
+          const now = Date.now();
+          const cacheKey = prompt.substring(0, 200);
+          if (!(global as any).__hindsightWisdomCache)
+            (global as any).__hindsightWisdomCache = new Map();
+          const cache = (global as any).__hindsightWisdomCache as Map<
+            string,
+            { results: any[]; timestamp: number }
+          >;
+          const cached = cache.get(cacheKey);
+          let wisdomResults: any[] | undefined;
+          if (cached && now - cached.timestamp < CACHE_TTL_MS) {
+            wisdomResults = cached.results;
+          } else {
+            try {
+              await clientGlobal.waitForReady();
+              const client = await clientGlobal.getClientForContext(ctx);
+              if (client) {
+                const wc = scopeClient(client, "openclaw");
+                const resp = await Promise.race([
+                  wc.recall({ query: cacheKey.substring(0, 400), maxTokens: 512 }),
+                  new Promise<never>((_, rej) =>
+                    setTimeout(() => rej(new Error("wisdom timeout 500ms")), HARD_TIMEOUT_MS)
+                  ),
+                ]);
+                wisdomResults = ((resp as any)?.results ?? [])
+                  .filter(
+                    (r: any) =>
+                      r.tags?.some((t: string) => t === "type:derived_principles") ||
+                      r.context === "derived_learnings"
+                  )
+                  .slice(0, 5);
+                cache.set(cacheKey, { results: wisdomResults ?? [], timestamp: now });
+              }
+            } catch (wte) {
+              debug(`[Hindsight customizations] wisdom query failed or timed out: ${wte}`);
+            }
+          }
+          if (wisdomResults && wisdomResults.length > 0) {
+            prependParts.push(
+              `<wisdom_context>\nDerived principles (${wisdomResults.length}):\n${wisdomResults
+                .map((r: any) => `- ${r.content ?? r.text ?? r}`)
+                .join("\n")}\n</wisdom_context>`
+            );
+          }
+        }
+      } catch (e) {
+        debug(`[Hindsight customizations] wisdom sidecar failed: ${e}`);
+      }
+
+      try {
+        // Interrupt check: spawns a deployment-specific Python script, 5s hard
+        // kill cap so a hung/slow script never blocks the hook indefinitely.
+        const sessionKey =
+          ctx?.sessionKey || (typeof event?.sessionKey === "string" ? event.sessionKey : "unknown");
+        const interruptScript = `${WORKSPACE_ROOT}\\workspace\\skills\\subagent-interrupt\\interrupt_check.py`;
+        if (existsSync(interruptScript)) {
+          const proc = spawn("python", [interruptScript, sessionKey], {
+            stdio: ["ignore", "pipe", "ignore"],
+            windowsHide: true,
+          });
+          let output = "";
+          proc.stdout?.on("data", (d: Buffer) => {
+            output += d.toString();
+          });
+          await new Promise<void>((resolve) => {
+            const killTimer = setTimeout(() => {
+              proc.kill();
+              resolve();
+            }, 5000);
+            proc.on("close", () => {
+              clearTimeout(killTimer);
+              resolve();
+            });
+            proc.on("error", () => {
+              clearTimeout(killTimer);
+              resolve();
+            });
+          });
+          const msg = output.trim();
+          if (msg) {
+            prependParts.push(`<system_interrupt>\n${msg}\n</system_interrupt>`);
+          }
+        }
+      } catch (e) {
+        debug(`[Hindsight customizations] interrupt check failed: ${e}`);
+      }
+
+      if (prependParts.length === 0) return;
+      return { prependContext: prependParts.join("\n\n") };
+    });
+
+    // Astinus enrichment trigger: after a turn completes, spawn the enrichment
+    // script (async, detached). PID-lockfile-style cooldown (90s) guards
+    // against overlapping runs racing on the same output file. Called from
+    // the native agent_end handler below (not a second api.on("agent_end", ...)
+    // registration) — some hosts/test harnesses only keep the last handler
+    // registered per event, so composing into the existing one is more robust
+    // than relying on multi-handler merge support.
+    const runAstinusTrigger = (event: any, ctx?: PluginHookAgentContext) => {
+      try {
+        const sessionKey =
+          ctx?.sessionKey || (typeof event?.sessionKey === "string" ? event.sessionKey : "");
+        if (!sessionKey.endsWith(":main") && !sessionKey.includes(":main:")) return;
+        const now = Date.now();
+        if (now - astinusLastSpawnMs < 90_000) return;
+        const enrichScript = `${WORKSPACE_ROOT}\\workspace\\skills\\astinus\\enrich.py`;
+        if (!existsSync(enrichScript)) return;
+        astinusLastSpawnMs = now;
+        // Build the JSON payload enrich.py reads on stdin (topics + last turn text).
+        let astinusPayload = "{}";
+        try {
+          const msgs: any[] =
+            (event as any)?.context?.sessionEntry?.messages ?? (event as any)?.messages ?? [];
+          const textOf = (m: any): string => {
+            const c = m?.content;
+            if (typeof c === "string") return c.trim();
+            if (Array.isArray(c)) {
+              return c
+                .map((p: any) => (typeof p === "string" ? p : typeof p?.text === "string" ? p.text : ""))
+                .join("\n")
+                .trim();
+            }
+            return "";
+          };
+          let lastUser = "";
+          let lastAssistant = "";
+          for (let i = msgs.length - 1; i >= 0; i--) {
+            const m = msgs[i];
+            if (!m) continue;
+            if (m.role === "user" && !lastUser) lastUser = textOf(m);
+            if (m.role === "assistant" && !lastAssistant) lastAssistant = textOf(m);
+            if (lastUser && lastAssistant) break;
+          }
+          let topics: string[] = [];
+          try {
+            const cls: any = classifyTurn(`${lastUser}\n${lastAssistant}`.slice(0, 2000));
+            if (cls && Array.isArray(cls.topics)) topics = cls.topics.slice(0, 6);
+          } catch (_) {}
+          if (!topics.length) {
+            const stop = new Set(["this", "that", "with", "from", "have", "will", "your", "what", "when", "were", "they", "them", "then", "than", "been", "into", "over", "just", "some", "more", "about", "these", "those", "which", "there", "their", "would", "could", "should", "please", "make", "sure", "like", "also", "only", "very", "much", "need"]);
+            topics = Array.from(
+              new Set(
+                (lastUser.toLowerCase().match(/[a-z0-9][a-z0-9_.-]{3,}/g) || []).filter((w: string) => !stop.has(w))
+              )
+            ).slice(0, 5);
+          }
+          astinusPayload = JSON.stringify({
+            topics,
+            last_user_message: lastUser.slice(0, 800),
+            conversation_summary: `${lastUser.slice(0, 300)}\n---\n${lastAssistant.slice(0, 500)}`.trim(),
+            active_tasks: [],
+          });
+        } catch (e) {
+          debug(`[Hindsight customizations] Astinus payload build failed: ${e}`);
+        }
+        const child = spawn("python", [enrichScript], {
+          stdio: ["pipe", "ignore", "ignore"],
+          windowsHide: true,
+          detached: true,
+        });
+        child.on("error", (err: any) => {
+          debug(`[Hindsight customizations] Astinus spawn error: ${err.message}`);
+        });
+        child.unref();
+        try {
+          if (child.stdin) {
+            child.stdin.write(astinusPayload);
+            child.stdin.end();
+          }
+        } catch (_) {}
+      } catch (e) {
+        debug(`[Hindsight customizations] Astinus trigger failed: ${e}`);
+      }
+    };
+
     debug("[Hindsight] Hooks registered");
     log.info("agent hooks registered");
 
