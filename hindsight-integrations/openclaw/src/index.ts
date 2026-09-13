@@ -4116,6 +4116,13 @@ ${memoriesFormatted}
               }
               continue; // never readFile a directory entry directly
             }
+            // Double-delivery fix (2026-09-13): astinus-context.md is the
+            // FALLBACK for sessions without a session key. A keyed session gets
+            // its own file under astinus/, so delivering the flat one too would
+            // inject the same content twice (double tokens every turn).
+            if (entry.name === "astinus-context.md" && ctx?.sessionKey) {
+              continue;
+            }
             drained.push(await drainOne(entry.name));
           }
           for (const d of drained) {
