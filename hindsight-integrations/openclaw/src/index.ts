@@ -18,7 +18,7 @@ import { createHash, randomUUID } from "crypto";
 import { dirname, join } from "path";
 import * as log from "./logger.js";
 import { configureLogger, setApiLogger, stopLogger } from "./logger.js";
-import { existsSync, mkdirSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "fs";
 import { access, readFile, readdir, stat, unlink, writeFile } from "fs/promises";
 import { spawn } from "child_process";
 import { createRequire } from "module";
@@ -114,7 +114,15 @@ const banksWithDefaultsApplied = new Set<string>();
 
 // In-flight recall deduplication: concurrent recalls for the same bank reuse one promise
 import type { RecallResponse } from "./types.js";
-const inflightRecalls = new Map<string, Promise<RecallResponse>>();
+
+// A recall resolution remembers WHICH path served it — the topic-filtered
+// query or the unfiltered fallback — so the hook can log the serving path even
+// when the result came from a reused in-flight promise (plan v4 item 3).
+export type RecallResolution = {
+  response: RecallResponse;
+  via: "topic" | "unfiltered" | "topic+unfiltered";
+};
+const inflightRecalls = new Map<string, Promise<RecallResolution>>();
 
 // Lightweight bank-scoped facade over HindsightClient. Created per-request via
 // getClientForContext() so hook bodies can keep their bankId-implicit style
@@ -136,6 +144,14 @@ export interface BankScopedClient {
       types?: Array<"world" | "experience" | "observation">;
       preferObservations?: boolean;
       minScores?: MinScores;
+      /**
+       * Server-side tag filter (plan v4 item 3). The recall QUERY stays
+       * substance-first; the topic ledger only narrows the bank scan via
+       * `topic:<slug>` tags. The generated client maps these fields
+       * explicitly (tags/tags_match), so unknown keys would be dropped.
+       */
+      tags?: string[];
+      tagsMatch?: "any" | "all" | "any_strict" | "all_strict" | "exact";
     },
     timeoutMs?: number
   ): Promise<RecallResponse>;
@@ -170,6 +186,8 @@ export function scopeClient(c: HindsightClient, bankId: string): BankScopedClien
         types: req.types,
         preferObservations: req.preferObservations,
         minScores: req.minScores,
+        tags: req.tags,
+        tagsMatch: req.tagsMatch,
       });
       if (!timeoutMs) return call;
       // The generated client doesn't accept a per-call AbortSignal, so we race
@@ -256,6 +274,144 @@ function toStringMetadata(
 }
 const turnCountBySession = new Map<string, number>();
 const MAX_TRACKED_SESSIONS = 10_000;
+
+// ---------------------------------------------------------------------------
+// Astinus retain marker (plan v4): durable per-session retention position.
+// The POSITION is the transcript sequence (lastRetainedSeq). The watermark's
+// generation is the rewrite INVALIDATION token — a differing value means a
+// rewrite happened and seq positions must be re-anchored before they are
+// trusted (v0 records it; the invalidation trigger lands with the DB-access
+// step). Written after every successful retain; read at flush time and by the
+// pruner's retention check.
+// ---------------------------------------------------------------------------
+// Canonical workspace root for this deployment. Single module-scope literal;
+// the marker module and the deployment customizations both reference it.
+const WORKSPACE_ROOT = "I:\\OpenClaw\\.openclaw";
+const RETAIN_MARKER_MAX_HASHES = 500;
+const ASTINUS_MAX_COMMITTED_KEYS = 2000;
+
+/**
+ * One durable per-session state document (plan v4). It hosts all three pieces
+ * so the retain loop (agent_end) and the context engine (commitTurn) share one
+ * file: the retain marker, the durable statement<->topic mapping, and the
+ * commit idempotency keys. Writes are load-modify-write + atomic (tmp+rename),
+ * so the two writers never clobber each other's fields.
+ */
+type AstinusSessionState = {
+  // --- retain marker (advanced only after a successful retain) ---
+  lastRetainedSeq: number;
+  lastGenerationSeen: string | null;
+  lastRetainedAt: number;
+  /**
+   * Per-message content hashes recorded at retain time. AUDIT ONLY - not yet
+   * consulted for idempotency. The seq marker already gives exactly-once on the
+   * normal path, and content-hash filtering would drop legitimate turns that
+   * repeat identical text (two "ok" turns hash the same). Capped as a size
+   * bound on the audit trail.
+   */
+  chunkHashes: string[];
+  // --- durable statement<->topic mapping (context engine) ---
+  topics: Record<string, { firstSeenAt: number; lastSeenAt: number; statements: number }>;
+  // --- durable-turn commit state (context engine) ---
+  committedKeys: string[];
+  /** Terminal anchor rawSeq of the last committed turn (durable seq source). */
+  lastCommittedSeq: number;
+  /** Inclusive [admission.rawSeq, terminal.rawSeq] of the last committed turn. */
+  lastCommittedRange: { start: number; end: number } | null;
+  lastCommittedAt: number;
+};
+function retainMarkerDir(): string {
+  return `${WORKSPACE_ROOT}\\workspace\\state\\astinus`;
+}
+function retainMarkerPath(sessionKey: string): string {
+  const safe = String(sessionKey).replace(/[^a-zA-Z0-9_.-]/g, "_").slice(0, 120);
+  return `${retainMarkerDir()}\\${safe}.json`;
+}
+function defaultSessionState(): AstinusSessionState {
+  return {
+    lastRetainedSeq: 0,
+    lastGenerationSeen: null,
+    lastRetainedAt: 0,
+    chunkHashes: [],
+    topics: {},
+    committedKeys: [],
+    lastCommittedSeq: 0,
+    lastCommittedRange: null,
+    lastCommittedAt: 0,
+  };
+}
+function loadSessionState(sessionKey: string): AstinusSessionState {
+  const base = defaultSessionState();
+  try {
+    const p = JSON.parse(readFileSync(retainMarkerPath(sessionKey), "utf8"));
+    return {
+      ...base,
+      lastRetainedSeq:
+        typeof p?.lastRetainedSeq === "number" ? p.lastRetainedSeq : base.lastRetainedSeq,
+      lastGenerationSeen:
+        typeof p?.lastGenerationSeen === "string" ? p.lastGenerationSeen : base.lastGenerationSeen,
+      lastRetainedAt: typeof p?.lastRetainedAt === "number" ? p.lastRetainedAt : base.lastRetainedAt,
+      chunkHashes: Array.isArray(p?.chunkHashes)
+        ? p.chunkHashes.filter((h: any) => typeof h === "string")
+        : [],
+      topics:
+        p?.topics && typeof p.topics === "object" && !Array.isArray(p.topics) ? p.topics : {},
+      committedKeys: Array.isArray(p?.committedKeys)
+        ? p.committedKeys.filter((k: any) => typeof k === "string")
+        : [],
+      lastCommittedSeq:
+        typeof p?.lastCommittedSeq === "number" ? p.lastCommittedSeq : 0,
+      lastCommittedRange:
+        p?.lastCommittedRange &&
+        typeof p.lastCommittedRange.start === "number" &&
+        typeof p.lastCommittedRange.end === "number"
+          ? { start: p.lastCommittedRange.start, end: p.lastCommittedRange.end }
+          : null,
+      lastCommittedAt: typeof p?.lastCommittedAt === "number" ? p.lastCommittedAt : 0,
+    };
+  } catch {
+    return base;
+  }
+}
+/**
+ * Load-modify-write the durable state atomically (tmp + rename).
+ * THROWS on mutate or persist failure: a caller that must be durable (the
+ * engine's commitTurn) needs the failure, never a silent no-op.
+ */
+function updateSessionState(
+  sessionKey: string,
+  mutate: (state: AstinusSessionState) => AstinusSessionState
+): AstinusSessionState {
+  const current = loadSessionState(sessionKey);
+  const next = mutate(current);
+  mkdirSync(retainMarkerDir(), { recursive: true });
+  const capped: AstinusSessionState = {
+    ...next,
+    chunkHashes: next.chunkHashes.slice(-RETAIN_MARKER_MAX_HASHES),
+    committedKeys: next.committedKeys.slice(-ASTINUS_MAX_COMMITTED_KEYS),
+  };
+  const target = retainMarkerPath(sessionKey);
+  // Unique tmp name: two processes must never interleave on one tmp path
+  // (review 2026-09-13, Q2).
+  const tmp = `${target}.${process.pid}.${randomUUID()}.tmp`;
+  writeFileSync(tmp, JSON.stringify(capped, null, 2), "utf8");
+  renameSync(tmp, target);
+  return capped;
+}
+/**
+ * Best-effort variant for the retain loop: a failed marker write must not abort
+ * the retain hook (the next turn re-offers the same delta).
+ */
+function tryUpdateSessionState(
+  sessionKey: string,
+  mutate: (state: AstinusSessionState) => AstinusSessionState
+): void {
+  try {
+    updateSessionState(sessionKey, mutate);
+  } catch (e) {
+    debug(`[Hindsight Hook] session state write failed: ${e}`);
+  }
+}
 const DEFAULT_RECALL_TIMEOUT_MS = 10_000;
 
 type SessionIdentityRecord = Pick<
@@ -1538,15 +1694,24 @@ function formatOccurredWindow(
   return "";
 }
 
-export function formatMemories(results: MemoryResult[]): string {
+export function formatMemories(
+  results: MemoryResult[],
+  opts?: { markAsEarlierRecords?: boolean }
+): string {
   if (!results || results.length === 0) return "";
+  const earlierRecord = opts?.markAsEarlierRecords === true;
   return results
     .map((r) => {
       const type = r.type ? ` [${r.type}]` : "";
       const date = r.mentioned_at ? ` (${r.mentioned_at})` : "";
       const occurred = formatOccurredWindow(r.occurred_start, r.occurred_end);
       const doc = r.document_id ? ` [doc:${r.document_id}]` : "";
-      return `- ${r.text}${type}${date}${occurred}${doc}`;
+      // Injected-recall marking (plan v4 hard rule): a recalled item is a record
+      // of something said EARLIER, never the current state of the thing. The
+      // label rides the existing per-item date; only callers rendering into a
+      // live prompt opt in, so other consumers keep the plain format.
+      const staleness = earlierRecord ? " [earlier record — not current state; verify before acting]" : "";
+      return `- ${r.text}${type}${date}${occurred}${doc}${staleness}`;
     })
     .join("\n\n");
 }
@@ -2025,6 +2190,7 @@ export function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
         ? config.retainOverlapTurns
         : 0,
     recallTopK: typeof config.recallTopK === "number" ? config.recallTopK : undefined,
+    recallTopicFilter: config.recallTopicFilter === true,
     recallContextTurns:
       typeof config.recallContextTurns === "number" && config.recallContextTurns >= 1
         ? config.recallContextTurns
@@ -2125,10 +2291,257 @@ export function classifyTurn(transcript: string): { activity: string; topics: st
   return { activity, topics };
 }
 
+/**
+ * Normalize a classifyTurn topic label into a stable bank tag (plan v4 item 3).
+ * Lowercase, collapse non-alphanumerics to single dashes, trim the edges.
+ * Returns null for an empty result so callers can drop it instead of emitting
+ * a bare `topic:` tag.
+ */
+export function topicTag(label: string): string | null {
+  const slug = String(label)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return slug ? `topic:${slug}` : null;
+}
+
+/** Map a classifyTurn topics[] to a de-duplicated `topic:<slug>` tag list. */
+export function topicTags(labels: unknown): string[] {
+  if (!Array.isArray(labels)) return [];
+  const out = new Set<string>();
+  for (const label of labels) {
+    if (typeof label !== "string") continue;
+    const tag = topicTag(label);
+    if (tag) out.add(tag);
+  }
+  return [...out];
+}
+
 // Registration guard: WeakSet keyed by api instance to prevent double-registration
 // on the same api object while allowing fresh registration on new api objects.
 // Does not reintroduce issue #1029 because WeakSet.has() checks object identity,
 // not a module-level boolean.
+// ---------------------------------------------------------------------------
+// Astinus context engine (skeleton - plan build step 2, review Gate 2)
+//
+// Registers the `astinus` context engine with the host. This skeleton is
+// DELIBERATELY inert: it does NOT declare the durable-turn semantics
+// (transcriptSemantics + commitTurn), so the host keeps using the legacy
+// context path for real turns until that contract lands. Nothing here changes
+// model context or the transcript, and the slot stays on legacy by default.
+//
+// What it proves now: registration works and the interface compiles.
+// What it does once the slot is switched on AND commitTurn lands:
+// `ingest` builds the per-session statement<->topic mapping, and `assemble`
+// logs the prune plan it would apply - the dry-run inside the real surface.
+// Kill switch: plugins.slots.contextEngine = "legacy".
+// ---------------------------------------------------------------------------
+
+type AstinusTopicEntry = {
+  topics: Set<string>;
+  statements: number;
+  lastMessageAt: number;
+};
+
+const astinusSessionMapping = new Map<string, AstinusTopicEntry>();
+const ASTINUS_MAPPING_MAX_SESSIONS = 2000;
+
+function astinusMessageText(message: unknown): string {
+  const content = (message as { content?: unknown } | null | undefined)?.content;
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part) =>
+        part && typeof part === "object" && typeof (part as { text?: unknown }).text === "string"
+          ? ((part as { text: string }).text)
+          : ""
+      )
+      .filter(Boolean)
+      .join("\n");
+  }
+  return "";
+}
+
+function astinusEstimateTokens(messages: unknown[]): number {
+  // Rough char/4 heuristic. A stand-in until the engine owns real accounting.
+  let chars = 0;
+  for (const m of messages) chars += astinusMessageText(m).length + 16;
+  return Math.ceil(chars / 4);
+}
+
+function registerAstinusContextEngine(api: MoltbotPluginAPI): void {
+  const register = (api as { registerContextEngine?: (id: string, factory: () => unknown) => void })
+    .registerContextEngine;
+  if (typeof register !== "function") {
+    log.info("[astinus-engine] host does not expose registerContextEngine; skipping");
+    return;
+  }
+  try {
+    register("astinus", () => ({
+      info: {
+        id: "astinus",
+        name: "Astinus Context Engine",
+        version: "0.2.0-durable-turn",
+        // ownsCompaction false: compaction stays with the runtime.
+        ownsCompaction: false,
+        // Durable-turn contract (Gate 2 decision, 2026-09-12). Declaring the
+        // fence + idempotency lets the host hand the engine the accepted turn
+        // and lets commitTurn own the durable statement<->topic mapping.
+        transcriptSemantics: {
+          currentTurnFence: "before-current-turn-entry-v1",
+          turnAdvancementIdempotency: "atomic-idempotent-v1",
+        },
+        // acceptedHostParams intentionally OMITTED until the host's field names
+        // are read from src/context-engine/ - a wrong name silently drops a
+        // field (review 2026-09-12, Gate 2).
+      },
+      async ingest(params: {
+        sessionKey?: string;
+        sessionId?: string;
+        message?: unknown;
+        isHeartbeat?: boolean;
+      }): Promise<{ ingested: boolean }> {
+        if (params.isHeartbeat) return { ingested: false };
+        const key = params.sessionKey ?? params.sessionId;
+        // No key -> skip: a shared "unknown" bucket would merge every session
+        // into one mapping (review 2026-09-12, Gate 2 minor).
+        if (!key) return { ingested: false };
+        const text = astinusMessageText(params.message);
+        if (!text) return { ingested: false };
+        const entry =
+          astinusSessionMapping.get(key) ??
+          ({ topics: new Set<string>(), statements: 0, lastMessageAt: 0 } as AstinusTopicEntry);
+        for (const tag of topicTags(classifyTurn(text).topics)) entry.topics.add(tag);
+        entry.statements += 1;
+        entry.lastMessageAt = Date.now();
+        astinusSessionMapping.set(key, entry);
+        if (astinusSessionMapping.size > ASTINUS_MAPPING_MAX_SESSIONS) {
+          const oldest = astinusSessionMapping.keys().next().value;
+          if (oldest !== undefined) astinusSessionMapping.delete(oldest);
+        }
+        return { ingested: true };
+      },
+      async assemble(params: {
+        messages?: unknown[];
+        tokenBudget?: number;
+        sessionKey?: string;
+        sessionId?: string;
+      }): Promise<{
+        messages: unknown[];
+        estimatedTokens: number;
+        promptAuthority: "preassembly_may_overflow";
+      }> {
+        const list = Array.isArray(params.messages) ? params.messages : [];
+        const estimatedTokens = astinusEstimateTokens(list);
+        const key = params.sessionKey ?? params.sessionId;
+        // The durable state file is the SOURCE for the mapping; the in-memory
+        // Map is only a cache (empty after a restart until ingest refills it) -
+        // review 2026-09-13, Q5.5.
+        const state = key ? loadSessionState(key) : null;
+        const topics = state ? Object.keys(state.topics) : [];
+        const statements = state
+          ? Object.values(state.topics).reduce((n, t) => n + (t?.statements ?? 0), 0)
+          : 0;
+        // Dry-run: report the plan. Pass-through - the view is unchanged.
+        // debug (not info): this fires every turn of every session (Q5.3).
+        debug(
+          `[astinus-engine] assemble dry-run: ${list.length} msgs, ~${estimatedTokens} tok` +
+            (params.tokenBudget ? ` / budget ${params.tokenBudget}` : "") +
+            `, topics=[${topics.join(", ")}], statements=${statements}` +
+            ` - pass-through (no selection applied)`
+        );
+        // A pass-through that trims nothing must report preassembly_may_overflow,
+        // not "assembled", so the host keeps its pre-prompt overflow safeguard
+        // when the slot goes live (review 2026-09-12, Gate 2). The char/4
+        // estimate only feeds the host's compaction threshold, and the host's own
+        // precheck still runs, so an under-estimate is safe.
+        return { messages: list, estimatedTokens, promptAuthority: "preassembly_may_overflow" };
+      },
+      async compact(): Promise<{ ok: boolean; compacted: boolean; reason: string }> {
+        return {
+          ok: true,
+          compacted: false,
+          reason: "astinus skeleton: compaction delegated to the runtime (ownsCompaction=false)",
+        };
+      },
+      // Durable-turn commit (Gate 2 decision): ONE atomic, idempotent write keyed
+      // by advancementKey. Persists the turn's statement<->topic mapping into the
+      // shared per-session state document and records the terminal anchor's
+      // rawSeq + generation and the admission..terminal range - the durable seq
+      // source the retain marker needs. THROWS on any failure so the host retries
+      // the same key; it must never report "committed" for a turn it did not
+      // persist (review 2026-09-13, Q1.2/Q1.3).
+      async commitTurn(params: {
+        advancementKey?: string;
+        messages?: unknown[];
+        sessionKey?: string;
+        sessionId?: string;
+        admission?: { rawSeq?: number };
+        terminal?: { rawSeq?: number; generation?: string };
+        isHeartbeat?: boolean;
+      }): Promise<{ status: "committed" | "duplicate" }> {
+        const key = params.sessionKey ?? params.sessionId;
+        const advancementKey =
+          typeof params.advancementKey === "string" ? params.advancementKey : "";
+        if (!key || !advancementKey) {
+          // The host contract requires both; a compliant host cannot reach here.
+          throw new Error("astinus commitTurn: missing session key or advancementKey");
+        }
+        if (loadSessionState(key).committedKeys.includes(advancementKey)) {
+          return { status: "duplicate" };
+        }
+        const messages = Array.isArray(params.messages) ? params.messages : [];
+        const heartbeat = params.isHeartbeat === true;
+        const startSeq =
+          typeof params.admission?.rawSeq === "number" ? params.admission.rawSeq : null;
+        const endSeq = typeof params.terminal?.rawSeq === "number" ? params.terminal.rawSeq : null;
+        const generation =
+          typeof params.terminal?.generation === "string" ? params.terminal.generation : null;
+        const now = Date.now();
+        updateSessionState(key, (s) => {
+          const topics = heartbeat ? s.topics : { ...s.topics };
+          if (!heartbeat) {
+            // Only conversational roles feed the mapping - tool output is noise
+            // (review 2026-09-13, Q1.7).
+            for (const m of messages) {
+              const role = (m as { role?: string } | null | undefined)?.role;
+              if (role !== "user" && role !== "assistant") continue;
+              const text = astinusMessageText(m);
+              if (!text) continue;
+              for (const tag of topicTags(classifyTurn(text).topics)) {
+                const slug = tag.startsWith("topic:") ? tag.slice(6) : tag;
+                const entry =
+                  topics[slug] ?? { firstSeenAt: now, lastSeenAt: now, statements: 0 };
+                entry.statements += 1;
+                entry.lastSeenAt = now;
+                topics[slug] = entry;
+              }
+            }
+          }
+          return {
+            ...s,
+            topics,
+            committedKeys: [...s.committedKeys, advancementKey],
+            lastCommittedSeq: endSeq ?? s.lastCommittedSeq,
+            lastCommittedRange:
+              startSeq !== null && endSeq !== null
+                ? { start: startSeq, end: endSeq }
+                : s.lastCommittedRange,
+            lastGenerationSeen: generation ?? s.lastGenerationSeen,
+            lastCommittedAt: now,
+          };
+        });
+        return { status: "committed" };
+      },
+    }));
+    log.info(
+      "[astinus-engine] context engine registered (id: astinus; inert until the slot + durable-turn contract land)"
+    );
+  } catch (e) {
+    log.warn(`[astinus-engine] registration failed: ${(e as Error).message}`);
+  }
+}
+
 const _registeredApis = new WeakSet<MoltbotPluginAPI>();
 
 export default function (api: MoltbotPluginAPI) {
@@ -2155,6 +2568,10 @@ export default function (api: MoltbotPluginAPI) {
 
     // Store config globally for bank ID derivation in hooks
     currentPluginConfig = pluginConfig;
+
+    // Register the (inert) Astinus context engine. Safe no-op until the host
+    // slot is switched on and the durable-turn contract lands.
+    registerAstinusContextEngine(api);
 
     debug("[Hindsight] Plugin loaded successfully (deferred heavy init to gateway start)");
 
@@ -2698,35 +3115,114 @@ export default function (api: MoltbotPluginAPI) {
 
         debug(`[Hindsight] Auto-recall for bank ${bankId}, full query:\n---\n${prompt}\n---`);
 
+        // Topic filter (plan v4 item 3): the ledger feeds a SERVER-SIDE tag
+        // filter; the query itself stays substance-first (composeRecallQuery
+        // above). One classification, the same helper the retain side uses.
+        // Topic filter is OFF by default (review 2026-09-12, Gate 1 BLOCK):
+        // Hindsight's tags_match "any" includes UNTAGGED memories but excludes
+        // memories tagged with any other vocabulary, so a hard topic filter
+        // would drop the retain:*/tier:* protected corpus and silently restrict
+        // recall to the untagged minority. Gated behind
+        // pluginConfig.recallTopicFilter (default false).
+        const recallTopicTags = (() => {
+          if (pluginConfig.recallTopicFilter !== true) return [] as string[];
+          try {
+            return topicTags(classifyTurn(prompt).topics);
+          } catch {
+            return [] as string[];
+          }
+        })();
+        const recallTimeoutMs = pluginConfig.recallTimeoutMs ?? DEFAULT_RECALL_TIMEOUT_MS;
+        const recallOnce = (opts: {
+          via: "topic" | "unfiltered";
+          tags?: string[];
+          tagsMatch?: "any" | "all" | "any_strict" | "all_strict" | "exact";
+        }): Promise<RecallResolution> =>
+          client
+            .recall(
+              {
+                query: prompt,
+                maxTokens: pluginConfig.recallMaxTokens || 1024,
+                budget: pluginConfig.recallBudget,
+                types: pluginConfig.recallTypes,
+                preferObservations: pluginConfig.preferObservations,
+                minScores: pluginConfig.recallMinScores,
+                ...(opts.tags ? { tags: opts.tags, tagsMatch: opts.tagsMatch } : {}),
+              },
+              recallTimeoutMs
+            )
+            .then((response: RecallResponse) => ({ response, via: opts.via }));
+
+        // Merge the topic-filtered hits AHEAD of the unfiltered set (filtered
+        // promoted, de-duplicated by result id). Never a hard filter.
+        const mergeRecall = (
+          unfiltered: RecallResolution,
+          filtered: RecallResolution
+        ): RecallResolution => {
+          const seen = new Set<string>();
+          const merged: RecallResponse["results"] = [];
+          for (const r of filtered.response.results ?? []) {
+            const id = (r as { id?: string }).id;
+            if (id && seen.has(id)) continue;
+            if (id) seen.add(id);
+            merged.push(r);
+          }
+          for (const r of unfiltered.response.results ?? []) {
+            const id = (r as { id?: string }).id;
+            if (id && seen.has(id)) continue;
+            if (id) seen.add(id);
+            merged.push(r);
+          }
+          return {
+            response: { ...unfiltered.response, results: merged },
+            via: "topic+unfiltered",
+          };
+        };
+
+        const resolveRecall = async (): Promise<RecallResolution> => {
+          // Flag off (default): plain substance recall, unchanged behaviour.
+          if (recallTopicTags.length === 0) {
+            return recallOnce({ via: "unfiltered" });
+          }
+          const unfiltered = await recallOnce({ via: "unfiltered" });
+          const filtered = await recallOnce({
+            via: "topic",
+            tags: recallTopicTags,
+            tagsMatch: "any",
+          });
+          if (!filtered.response.results || filtered.response.results.length === 0) {
+            debug(
+              `[Hindsight] topic-filtered recall returned 0 results (${recallTopicTags.join(", ")}) - using unfiltered results`
+            );
+            return unfiltered;
+          }
+          return mergeRecall(unfiltered, filtered);
+        };
+
         // Recall with deduplication: reuse in-flight request for same bank
         const normalizedPrompt = prompt.trim().toLowerCase().replace(/\s+/g, " ");
         const queryHash = createHash("sha256").update(normalizedPrompt).digest("hex").slice(0, 16);
         const recallKey = `${bankId}::${queryHash}`;
         const existing = inflightRecalls.get(recallKey);
-        let recallPromise: Promise<RecallResponse>;
+        let recallPromise: Promise<RecallResolution>;
         if (existing) {
           debug(`[Hindsight] Reusing in-flight recall for bank ${bankId}`);
           recallPromise = existing;
         } else {
-          const recallTimeoutMs = pluginConfig.recallTimeoutMs ?? DEFAULT_RECALL_TIMEOUT_MS;
-          recallPromise = client.recall(
-            {
-              query: prompt,
-              maxTokens: pluginConfig.recallMaxTokens || 1024,
-              budget: pluginConfig.recallBudget,
-              types: pluginConfig.recallTypes,
-              preferObservations: pluginConfig.preferObservations,
-              minScores: pluginConfig.recallMinScores,
-            },
-            recallTimeoutMs
-          );
+          recallPromise = resolveRecall();
           inflightRecalls.set(recallKey, recallPromise);
           void recallPromise.catch(() => {}).finally(() => inflightRecalls.delete(recallKey));
         }
 
         const recallStart = pluginConfig.debugPerfTiming ? Date.now() : 0;
-        const response = await recallPromise;
+        const resolution = await recallPromise;
+        const response = resolution.response;
         const recallElapsedMs = pluginConfig.debugPerfTiming ? Date.now() - recallStart : 0;
+        debug(
+          `[Hindsight] Recall served via ${resolution.via} path (topic filter: ${
+            recallTopicTags.length > 0 ? recallTopicTags.join(", ") : "none"
+          })`
+        );
 
         if (!response.results || response.results.length === 0) {
           if (pluginConfig.debugPerfTiming) {
@@ -2734,6 +3230,7 @@ export default function (api: MoltbotPluginAPI) {
               formatHookPerf("before_prompt_build", Date.now() - perfHookStart, {
                 recall_main: `${recallElapsedMs}ms`,
                 source: existing ? "reused" : "fresh",
+                via: resolution.via,
                 results: 0,
               })
             );
@@ -2756,7 +3253,7 @@ export default function (api: MoltbotPluginAPI) {
 
         // Format memories as a bullet list (text + type + date + occurred window +
         // [doc:<document_id>], each part present only when the memory carries it)
-        const memoriesFormatted = formatMemories(results);
+        const memoriesFormatted = formatMemories(results, { markAsEarlierRecords: true });
 
         const contextMessage = `<hindsight_memories>
 ${pluginConfig.recallPromptPreamble || DEFAULT_RECALL_PROMPT_PREAMBLE}
@@ -2774,6 +3271,7 @@ ${memoriesFormatted}
             formatHookPerf("before_prompt_build", Date.now() - perfHookStart, {
               recall_main: `${recallElapsedMs}ms`,
               source: existing ? "reused" : "fresh",
+              via: resolution.via,
               results: results.length,
             })
           );
@@ -2961,7 +3459,68 @@ ${memoriesFormatted}
         let messagesToRetain = allMessages;
         let retainFullWindow = false;
 
-        if (retainEveryN > 1) {
+        // Marker-first (plan v4): position-based delta selection. The durable
+        // per-session marker holds the last retained transcript SEQUENCE; the
+        // delta since it is exactly what is un-retained. No windows, no
+        // overlap, no duplicates, restart-safe. retainEveryNTurns is only a
+        // cost gate (how often to commit); correctness lives in the marker.
+        // The legacy cadence below remains the fallback when the host payload
+        // carries no usable seqs.
+        const seqOfMsg = (m: any): number | null => {
+          const s = m?.__openclaw?.seq ?? m?.seq;
+          return typeof s === "number" && Number.isFinite(s) ? s : null;
+        };
+        const allSeqs: (number | null)[] = allMessages.map(seqOfMsg);
+        const seqsUsable = allSeqs.some((s) => s !== null);
+        let markerAdvance: { sessionKey: string; seq: number; hashes: string[] } | null = null;
+
+        const markerSessionKey = effectiveCtx?.sessionKey;
+        if (seqsUsable && markerSessionKey) {
+          // Marker path requires a real session key: a missing key would share
+          // one marker file across every session and corrupt the position
+          // (review 2026-09-12, Gate 0 must-fix A). Fall through to the legacy
+          // cadence when absent.
+          const markerKey = markerSessionKey;
+          const marker = loadSessionState(markerKey);
+          const deltaMsgs = allMessages.filter((_m: any, i: number) => {
+            const s = allSeqs[i];
+            return s !== null && s > marker.lastRetainedSeq;
+          });
+          const deltaTurns = deltaMsgs.filter((m: any) => m?.role === "user").length;
+
+          if (deltaMsgs.length === 0) {
+            debug(
+              `[Hindsight Hook] marker: nothing new since seq ${marker.lastRetainedSeq}, skipping retain`
+            );
+            return;
+          }
+          if (!force && deltaTurns < retainEveryN) {
+            debug(
+              `[Hindsight Hook] marker: ${deltaTurns}/${retainEveryN} un-retained turns - holding (${deltaMsgs.length} msgs since seq ${marker.lastRetainedSeq})`
+            );
+            return;
+          }
+
+          messagesToRetain = deltaMsgs;
+          retainFullWindow = true;
+          const deltaSeqs = allSeqs.filter(
+            (s): s is number => s !== null && s > marker.lastRetainedSeq
+          );
+          markerAdvance = {
+            sessionKey: markerKey,
+            seq: Math.max(...deltaSeqs),
+            hashes: deltaMsgs.map((m: any) =>
+              createHash("sha256")
+                .update(
+                  typeof m?.content === "string" ? m.content : JSON.stringify(m?.content ?? "")
+                )
+                .digest("hex")
+            ),
+          };
+          debug(
+            `[Hindsight Hook] marker: retaining delta - ${deltaMsgs.length} msgs / ${deltaTurns} turns since seq ${marker.lastRetainedSeq}`
+          );
+        } else if (retainEveryN > 1) {
           const sessionTrackingKey = `${bankId}:${effectiveCtx?.sessionKey || "session"}`;
           // session_end is a flush, not a turn — don't increment the counter.
           const turnCount = force
@@ -3060,9 +3619,24 @@ ${memoriesFormatted}
           return;
         }
 
+        // ONE classification per retain (plan v4 item 3): the quality gate and
+        // the topic tags read the same result — classifyTurn is a cheap regex
+        // pass, but there is no reason to run it twice.
+        let turnClassification: { activity: string; topics: string[] } | null = null;
+        const getTurnClassification = (): { activity: string; topics: string[] } => {
+          if (!turnClassification) {
+            try {
+              turnClassification = classifyTurn(transcript);
+            } catch {
+              turnClassification = { activity: "general", topics: [] };
+            }
+          }
+          return turnClassification;
+        };
+
         if (pluginConfig.retainQualityGate) {
           try {
-            const { activity, topics } = classifyTurn(transcript);
+            const { activity, topics } = getTurnClassification();
             let skipReason = "";
             if (activity === "chitchat" && topics.length === 0 && transcript.length < 200) skipReason = "short chitchat";
             else if (activity === "memory-meta" && topics.length === 0) skipReason = "memory-meta noise";
@@ -3118,7 +3692,7 @@ ${memoriesFormatted}
             windowTurns: retainFullWindow
               ? (pluginConfig.retainEveryNTurns ?? 1) + (pluginConfig.retainOverlapTurns ?? 0)
               : undefined,
-            tags: inlineRetainTags,
+            tags: [...inlineRetainTags, ...topicTags(getTurnClassification().topics)],
             appendSupported: supportsUpdateModeAppend,
             operationId: createAsyncRetainOperationId(),
           }
@@ -3149,6 +3723,24 @@ ${memoriesFormatted}
           debug(
             `[Hindsight] Retained ${messageCount} messages to bank ${bankId} for session ${retainRequest.documentId}`
           );
+
+          // Advance the durable marker (plan v4): the position moves only after
+          // a successful retain, so a crash or a failed send re-offers the same
+          // delta next turn — no duplicates, no gaps.
+          if (markerAdvance) {
+            const advance = markerAdvance;
+            // Advance the durable marker (merge-safe + best-effort). The commit
+            // path owns lastGenerationSeen, so this write does not touch it.
+            tryUpdateSessionState(advance.sessionKey, (s) => ({
+              ...s,
+              lastRetainedSeq: advance.seq,
+              lastRetainedAt: Date.now(),
+              chunkHashes: [...s.chunkHashes, ...advance.hashes],
+            }));
+            debug(
+              `[Hindsight Hook] marker advanced to seq ${advance.seq} (+${advance.hashes.length} hashes)`
+            );
+          }
           // After a successful retain, try flushing any queued items
           if (retainQueue) {
             flushRetainQueue(undefined, undefined, undefined, retainGeneration, retainSignal).catch(
@@ -3223,7 +3815,6 @@ ${memoriesFormatted}
     // and never conflicts with them on rebase.
     // ============================================================
     const startupMandatedSessions = new Set<string>();
-    const WORKSPACE_ROOT = "I:\\OpenClaw\\.openclaw";
     // PER-SESSION ENRICH (edit 3/3, v4): module-scope Maps — survives entry-function
     // re-runs through jiti's module cache (the retain counter's pattern). The old
     // single variable was closure-scoped inside the register function and reset

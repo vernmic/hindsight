@@ -134,6 +134,7 @@ export interface PluginConfig {
   retainEveryNTurns?: number; // Retain every Nth turn (1 = every turn, default: 1). Values > 1 enable chunked retention.
   retainOverlapTurns?: number; // Extra prior turns included when chunked retention fires (default: 0). Window = retainEveryNTurns + retainOverlapTurns.
   recallTopK?: number; // Max number of memories to inject. Default: unlimited
+  recallTopicFilter?: boolean; // EXPERIMENTAL (default false): merge a topic-tagged recall ahead of unfiltered results. Never a hard filter - see openclaw.plugin.json.
   recallContextTurns?: number; // Number of user turns to include in recall query context. Default: 1 (latest only)
   recallTimeoutMs?: number; // Timeout for auto-recall in milliseconds. Default: 10000
   recallMaxQueryChars?: number; // Max chars for composed recall query. Default: 800

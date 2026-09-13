@@ -1,7 +1,7 @@
 {
   "id": "hindsight-openclaw",
   "name": "Hindsight Memory",
-  "kind": "memory",
+  "kind": ["memory", "context-engine"],
   "configContracts": {
     "secretInputs": {
       "paths": [
@@ -278,6 +278,11 @@
         "type": "integer",
         "minimum": 1,
         "description": "Maximum number of memories to inject per turn. Applied after API response as a hard cap."
+      },
+      "recallTopicFilter": {
+        "type": "boolean",
+        "description": "EXPERIMENTAL, default false. When true, recall also queries with a topic:<slug> tag filter and MERGES those hits ahead of the unfiltered results. Never a hard filter: Hindsight's tags_match 'any' includes untagged memories but excludes memories tagged with other vocabularies, so a hard filter would drop the protected retain:*/tier:* corpus. Leave off until the upstream namespace-aware match lands.",
+        "default": false
       },
       "recallPromptPreamble": {
         "type": "string",
@@ -560,6 +565,10 @@
     "recallTopK": {
       "label": "Recall Top K",
       "placeholder": "e.g. 5 (no limit by default)"
+    },
+    "recallTopicFilter": {
+      "label": "Recall Topic Filter (experimental)",
+      "placeholder": "false (default) — merge topic-tagged recall ahead of unfiltered results"
     },
     "recallPromptPreamble": {
       "label": "Recall Prompt Preamble",
