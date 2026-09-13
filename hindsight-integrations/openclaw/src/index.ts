@@ -289,6 +289,7 @@ const MAX_TRACKED_SESSIONS = 10_000;
 const WORKSPACE_ROOT = "I:\\OpenClaw\\.openclaw";
 const RETAIN_MARKER_MAX_HASHES = 500;
 const ASTINUS_MAX_COMMITTED_KEYS = 2000;
+const ASTINUS_MAX_PENDING_TURNS = 50;
 
 /**
  * One durable per-session state document (plan v4). It hosts all three pieces
@@ -319,6 +320,13 @@ type AstinusSessionState = {
   /** Inclusive [admission.rawSeq, terminal.rawSeq] of the last committed turn. */
   lastCommittedRange: { start: number; end: number } | null;
   lastCommittedAt: number;
+  // --- committed-unretained ranges (option a; slot-day) ---
+  /**
+   * Accepted turns the engine committed but the retain loop has not yet
+   * retained. The retain path drains these (the agent_end payload never carries
+   * seqs). Holds only conversational roles, capped at ASTINUS_MAX_PENDING_TURNS.
+   */
+  pendingRetain: Array<{ start: number; end: number; messages: unknown[] }>;
 };
 function retainMarkerDir(): string {
   return `${WORKSPACE_ROOT}\\workspace\\state\\astinus`;
@@ -338,6 +346,7 @@ function defaultSessionState(): AstinusSessionState {
     lastCommittedSeq: 0,
     lastCommittedRange: null,
     lastCommittedAt: 0,
+    pendingRetain: [],
   };
 }
 function loadSessionState(sessionKey: string): AstinusSessionState {
@@ -368,6 +377,15 @@ function loadSessionState(sessionKey: string): AstinusSessionState {
           ? { start: p.lastCommittedRange.start, end: p.lastCommittedRange.end }
           : null,
       lastCommittedAt: typeof p?.lastCommittedAt === "number" ? p.lastCommittedAt : 0,
+      pendingRetain: Array.isArray(p?.pendingRetain)
+        ? p.pendingRetain.filter(
+            (r: any) =>
+              r &&
+              typeof r.start === "number" &&
+              typeof r.end === "number" &&
+              Array.isArray(r.messages)
+          )
+        : [],
     };
   } catch {
     return base;
@@ -2498,14 +2516,16 @@ function registerAstinusContextEngine(api: MoltbotPluginAPI): void {
         const generation =
           typeof params.terminal?.generation === "string" ? params.terminal.generation : null;
         const now = Date.now();
+        // Only conversational roles feed the mapping and the pending-retain
+        // queue - tool output is noise and would bloat the state file (Q1.7).
+        const conversational = messages.filter((m) => {
+          const role = (m as { role?: string } | null | undefined)?.role;
+          return role === "user" || role === "assistant";
+        });
         updateSessionState(key, (s) => {
           const topics = heartbeat ? s.topics : { ...s.topics };
           if (!heartbeat) {
-            // Only conversational roles feed the mapping - tool output is noise
-            // (review 2026-09-13, Q1.7).
-            for (const m of messages) {
-              const role = (m as { role?: string } | null | undefined)?.role;
-              if (role !== "user" && role !== "assistant") continue;
+            for (const m of conversational) {
               const text = astinusMessageText(m);
               if (!text) continue;
               for (const tag of topicTags(classifyTurn(text).topics)) {
@@ -2529,6 +2549,15 @@ function registerAstinusContextEngine(api: MoltbotPluginAPI): void {
                 : s.lastCommittedRange,
             lastGenerationSeen: generation ?? s.lastGenerationSeen,
             lastCommittedAt: now,
+            // Option (a): record the accepted turn for the retain loop to drain.
+            // Cleared on a successful retain.
+            pendingRetain:
+              heartbeat || startSeq === null || endSeq === null
+                ? s.pendingRetain
+                : [
+                    ...s.pendingRetain,
+                    { start: startSeq, end: endSeq, messages: conversational },
+                  ].slice(-ASTINUS_MAX_PENDING_TURNS),
           };
         });
         return { status: "committed" };
@@ -3472,16 +3501,26 @@ ${memoriesFormatted}
         };
         const allSeqs: (number | null)[] = allMessages.map(seqOfMsg);
         const seqsUsable = allSeqs.some((s) => s !== null);
-        let markerAdvance: { sessionKey: string; seq: number; hashes: string[] } | null = null;
+        let markerAdvance: {
+          sessionKey: string;
+          seq: number;
+          hashes: string[];
+          clearPending?: boolean;
+        } | null = null;
 
         const markerSessionKey = effectiveCtx?.sessionKey;
-        if (seqsUsable && markerSessionKey) {
+        // One durable read serves both the marker path and the committed-range
+        // path (option a).
+        const sessionStateForRetain = markerSessionKey
+          ? loadSessionState(markerSessionKey)
+          : null;
+        if (seqsUsable && markerSessionKey && sessionStateForRetain) {
           // Marker path requires a real session key: a missing key would share
           // one marker file across every session and corrupt the position
           // (review 2026-09-12, Gate 0 must-fix A). Fall through to the legacy
           // cadence when absent.
           const markerKey = markerSessionKey;
-          const marker = loadSessionState(markerKey);
+          const marker = sessionStateForRetain;
           const deltaMsgs = allMessages.filter((_m: any, i: number) => {
             const s = allSeqs[i];
             return s !== null && s > marker.lastRetainedSeq;
@@ -3519,6 +3558,48 @@ ${memoriesFormatted}
           };
           debug(
             `[Hindsight Hook] marker: retaining delta - ${deltaMsgs.length} msgs / ${deltaTurns} turns since seq ${marker.lastRetainedSeq}`
+          );
+        } else if (
+          markerSessionKey &&
+          sessionStateForRetain &&
+          sessionStateForRetain.pendingRetain.length > 0
+        ) {
+          // Option (a): the agent_end payload never carries transcript seqs, so
+          // once the context engine is serving turns the durable commit ranges
+          // are the only precise source. Drain them on the same cadence and
+          // advance only on a successful retain (slot-day change).
+          const pendingRanges = sessionStateForRetain.pendingRetain;
+          const pendingMsgs = pendingRanges.flatMap((r) => r.messages);
+          if (pendingMsgs.length === 0) {
+            // Nothing conversational in the pending ranges: clear them without
+            // touching the marker.
+            tryUpdateSessionState(markerSessionKey, (s) => ({ ...s, pendingRetain: [] }));
+            return;
+          }
+          const pendingTurns = pendingMsgs.filter((m: any) => m?.role === "user").length;
+          const pendingEndSeq = Math.max(...pendingRanges.map((r) => r.end));
+          if (!force && pendingTurns < retainEveryN) {
+            debug(
+              `[Hindsight Hook] commit-range: ${pendingTurns}/${retainEveryN} un-retained turns - holding (${pendingMsgs.length} msgs, ${pendingRanges.length} ranges)`
+            );
+            return;
+          }
+          messagesToRetain = pendingMsgs;
+          retainFullWindow = true;
+          markerAdvance = {
+            sessionKey: markerSessionKey,
+            seq: pendingEndSeq,
+            hashes: pendingMsgs.map((m: any) =>
+              createHash("sha256")
+                .update(
+                  typeof m?.content === "string" ? m.content : JSON.stringify(m?.content ?? "")
+                )
+                .digest("hex")
+            ),
+            clearPending: true,
+          };
+          debug(
+            `[Hindsight Hook] commit-range: retaining ${pendingMsgs.length} msgs / ${pendingTurns} turns from ${pendingRanges.length} committed ranges (through seq ${pendingEndSeq})`
           );
         } else if (retainEveryN > 1) {
           const sessionTrackingKey = `${bankId}:${effectiveCtx?.sessionKey || "session"}`;
@@ -3736,6 +3817,7 @@ ${memoriesFormatted}
               lastRetainedSeq: advance.seq,
               lastRetainedAt: Date.now(),
               chunkHashes: [...s.chunkHashes, ...advance.hashes],
+              pendingRetain: advance.clearPending ? [] : s.pendingRetain,
             }));
             debug(
               `[Hindsight Hook] marker advanced to seq ${advance.seq} (+${advance.hashes.length} hashes)`
