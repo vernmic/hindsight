@@ -19,7 +19,7 @@ import { dirname, join } from "path";
 import * as log from "./logger.js";
 import { configureLogger, setApiLogger, stopLogger } from "./logger.js";
 import { existsSync, mkdirSync } from "fs";
-import { access, readFile, readdir, unlink } from "fs/promises";
+import { access, readFile, readdir, stat, unlink, writeFile } from "fs/promises";
 import { spawn } from "child_process";
 import { createRequire } from "module";
 import { homedir } from "os";
@@ -3224,7 +3224,176 @@ ${memoriesFormatted}
     // ============================================================
     const startupMandatedSessions = new Set<string>();
     const WORKSPACE_ROOT = "I:\\OpenClaw\\.openclaw";
-    let astinusLastSpawnMs = 0;
+    // PER-SESSION ENRICH (edit 3/3, v4): module-scope Maps — survives entry-function
+    // re-runs through jiti's module cache (the retain counter's pattern). The old
+    // single variable was closure-scoped inside the register function and reset
+    // to 0 on every invocation (Claude's re-review finding, 11:46).
+    const astinusLastSpawnBySession = new Map<string, number>();
+    const astinusActiveSpawns = new Map<number, number>(); // childPid -> startMs
+    const ASTINUS_DEBOUNCE_MS = 90_000;
+    const ASTINUS_SPAWN_CAP = 6;
+    const ASTINUS_SPAWN_GC_MS = 120_000;
+
+    // ============================================================
+    // SUIT ROUTER (build step 2, SUIT-ARCHITECTURE-PLAN v3):
+    // session-key -> suit via workspace/suits/registry.json.
+    //   before_prompt_build -> appendSystemContext (suit AGENTS.md/SOUL.md)
+    //                          + toolsAllow (suit tools.json, opt-in)
+    //   before_model_resolve -> modelOverride (suit MODEL.md `primary:`)
+    // Exact key wins; then most-specific wildcard (fewest *, longest); then "*".
+    // MAIN-AGENT ONLY (agent:main:*) — the fallback must not leak onto other
+    // agents' sessions. One log line per resolution; missing files = no-op.
+    // ============================================================
+    const SUITS_ROOT = `${WORKSPACE_ROOT}\\workspace\\suits`;
+    let suitRegistryCache: { mtimeMs: number; data: Record<string, string> } | null = null;
+
+    const loadSuitRegistry = async (): Promise<Record<string, string>> => {
+      const rp = join(SUITS_ROOT, "registry.json");
+      try {
+        const st = await stat(rp);
+        if (suitRegistryCache && suitRegistryCache.mtimeMs === st.mtimeMs)
+          return suitRegistryCache.data;
+        const raw = JSON.parse(await readFile(rp, "utf8"));
+        const data: Record<string, string> = {};
+        for (const [k, v] of Object.entries(raw)) {
+          if (k.startsWith("_") || typeof v !== "string") continue;
+          data[k] = v;
+        }
+        suitRegistryCache = { mtimeMs: st.mtimeMs, data };
+        return data;
+      } catch {
+        return {};
+      }
+    };
+
+    const globToRegExp = (pat: string): RegExp =>
+      new RegExp("^" + pat.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, "[^:]*") + "$");
+
+    const resolveSuit = (
+      registry: Record<string, string>,
+      sessionKey: string
+    ): { suit: string; pattern: string } | null => {
+      if (!sessionKey) return null;
+      if (registry[sessionKey]) return { suit: registry[sessionKey], pattern: sessionKey };
+      let best: { suit: string; pattern: string; score: number } | null = null;
+      for (const [pat, suit] of Object.entries(registry)) {
+        if (pat === "*" || !pat.includes("*")) continue;
+        if (!globToRegExp(pat).test(sessionKey)) continue;
+        const score = pat.length - (pat.match(/\*/g) || []).length * 2;
+        if (!best || score > best.score) best = { suit, pattern: pat, score };
+      }
+      if (best) return { suit: best.suit, pattern: best.pattern };
+      if (registry["*"]) return { suit: registry["*"], pattern: "*" };
+      return null;
+    };
+
+    const suitDirFor = (suit: string) =>
+      join(SUITS_ROOT, suit.replace(/^[\\/]?suits[\\/]/, "").replace(/\\/g, "/"));
+
+    // Error-to-inject (Vern 19:34): failures worth knowing immediately go to the
+    // inject mailbox; the drain delivers them next turn and deletes the file.
+    const writeInjectError = async (source: string, message: string): Promise<void> => {
+      try {
+        const dir = `${WORKSPACE_ROOT}\\workspace\\inject`;
+        try {
+          mkdirSync(dir, { recursive: true });
+        } catch {}
+        const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+        const safe = source.replace(/[^a-zA-Z0-9_-]/g, "-").slice(0, 40);
+        await writeFile(
+          join(dir, `err-${safe}-${stamp}-${Math.floor(Math.random() * 100000)}.md`),
+          `## Error: ${source}\n**When:** ${new Date().toISOString()}\n\n\`\`\`\n${String(
+            message
+          ).slice(0, 2000)}\n\`\`\`\n`,
+          "utf8"
+        );
+      } catch {}
+    };
+
+    api.on("before_prompt_build", async (event: any, ctx?: PluginHookAgentContext) => {
+      // CANARY (probe finding): zero router log lines at debug level — the handlers
+      // may never fire, or sessionKey may be unpopulated in this phase (it is OPTIONAL
+      // on the hook context). Unconditional warn line BEFORE any gate settles it.
+      log.warn(
+        `[suit-router] canary(prompt): ctx.sessionKey=${JSON.stringify((ctx as any)?.sessionKey ?? null)} eventKeys=${Object.keys(event ?? {}).join("|")}`
+      );
+      try {
+        const sessionKey =
+          ctx?.sessionKey || (typeof event?.sessionKey === "string" ? event.sessionKey : "");
+        if (!sessionKey || !sessionKey.startsWith("agent:main:")) return;
+        if (sessionKey.includes(":subagent:")) return; // delegates get the suit at spawn, or none (plan v3)
+        const registry = await loadSuitRegistry();
+        const resolved = resolveSuit(registry, sessionKey);
+        if (!resolved) return;
+        log.info(`[suit-router] ${sessionKey} -> ${resolved.suit} (match: ${resolved.pattern})`);
+        const dir = suitDirFor(resolved.suit);
+        const parts: string[] = [];
+        for (const f of ["AGENTS.md", "SOUL.md"]) {
+          const content = await readFile(join(dir, f), "utf8").catch(() => null);
+          if (content && content.trim())
+            parts.push(`<suit_file name="${f}">\n${content.trim()}\n</suit_file>`);
+        }
+        const result: any = {};
+        if (parts.length)
+          result.appendSystemContext = `<suit name="${resolved.suit}">\n${parts.join("\n")}\n</suit>`;
+        const toolsRaw = await readFile(join(dir, "tools.json"), "utf8").catch(() => null);
+        if (toolsRaw) {
+          try {
+            const t = JSON.parse(toolsRaw);
+            if (Array.isArray(t) && t.length > 0) result.toolsAllow = t;
+          } catch {}
+        }
+        return result;
+      } catch (e) {
+        log.warn(`[suit-router] before_prompt_build failed: ${e}`);
+        void writeInjectError("suit-router-prompt", String((e as any)?.stack || e));
+      }
+    });
+
+    api.on("before_model_resolve", async (event: any, ctx?: PluginHookAgentContext) => {
+      // CANARY (probe finding): see above. If this line never appears for a session
+      // while the prompt canary does, the blocker is modelSelectionLocked upstream
+      // (setup.ts returns before running this hook when model selection is locked).
+      log.warn(
+        `[suit-router] canary(model): ctx.sessionKey=${JSON.stringify((ctx as any)?.sessionKey ?? null)}`
+      );
+      try {
+        const sessionKey =
+          ctx?.sessionKey || (typeof event?.sessionKey === "string" ? event.sessionKey : "");
+        if (!sessionKey || !sessionKey.startsWith("agent:main:")) return;
+        if (sessionKey.includes(":subagent:")) return; // delegates get the suit at spawn, or none (plan v3)
+        const registry = await loadSuitRegistry();
+        const resolved = resolveSuit(registry, sessionKey);
+        if (!resolved) return;
+        const modelMd = await readFile(join(suitDirFor(resolved.suit), "MODEL.md"), "utf8").catch(
+          () => null
+        );
+        if (!modelMd) return;
+        const m = modelMd.match(/^primary:\s*(\S+)\s*$/m);
+        if (m) {
+          // The gateway applies modelOverride with the provider UNCHANGED unless
+          // providerOverride is set (fork: run/setup.ts resolveHookModelSelection).
+          // A bare "provider/model" string would ask the current provider (zai) for a
+          // google model and fall through — split the ref (review finding 1).
+          const ref = m[1];
+          const slash = ref.indexOf("/");
+          const provider = slash > 0 ? ref.slice(0, slash) : "";
+          const modelId = slash > 0 ? ref.slice(slash + 1) : ref;
+          const override: any = { modelOverride: modelId };
+          if (provider) override.providerOverride = provider;
+          log.info(
+            `[suit-router] ${sessionKey} model -> ${provider ? provider + "/" : ""}${modelId} (suit: ${resolved.suit})`
+          );
+          // plugin-sdk type lag: the gateway honors modelOverride/providerOverride on
+          // before_model_resolve (verified in the fork source) but the SDK .d.ts
+          // narrows the result type — cast through any; inert if unsupported.
+          return override;
+        }
+      } catch (e) {
+        log.warn(`[suit-router] before_model_resolve failed: ${e}`);
+        void writeInjectError("suit-router-model", String((e as any)?.stack || e));
+      }
+    });
 
     api.on("before_prompt_build", async (event: any, ctx?: PluginHookAgentContext) => {
       const prependParts: string[] = [];
@@ -3235,27 +3404,61 @@ ${memoriesFormatted}
         const injectDir = `${WORKSPACE_ROOT}\\workspace\\inject`;
         const injectExists = await access(injectDir).then(() => true).catch(() => false);
         if (injectExists) {
-          const files = (await readdir(injectDir)).filter((f) => !f.startsWith("."));
-          if (files.length > 0) {
-            const drained = await Promise.all(
-              files.map(async (f) => {
-                const fp = join(injectDir, f);
-                try {
-                  const content = await readFile(fp, "utf8");
-                  await unlink(fp);
-                  return { name: f, content };
-                } catch (e) {
-                  debug(`[Hindsight customizations] failed to drain ${f}: ${e}`);
-                  return null;
-                }
-              })
-            );
-            for (const d of drained) {
-              if (d)
-                prependParts.push(
-                  `<injected file="${d.name}">\n${d.content}\n</injected file="${d.name}">`
-                );
+          const files = (await readdir(injectDir, { withFileTypes: true })).filter(
+            (e) => !e.name.startsWith(".")
+          );
+          const drainOne = async (name: string): Promise<{ name: string; content: string } | null> => {
+            const fp = join(injectDir, name);
+            try {
+              const content = await readFile(fp, "utf8");
+              await unlink(fp);
+              return { name, content };
+            } catch (e) {
+              debug(`[Hindsight customizations] failed to drain ${name}: ${e}`);
+              return null;
             }
+          };
+          // PER-SESSION ENRICH (edit 3/3): handle the astinus/ subdirectory —
+          // keyed files deliver ONLY to their matching session, then delete.
+          // Other directories are skipped (never readFile a directory entry).
+          const drained: ({ name: string; content: string } | null)[] = [];
+          for (const entry of files) {
+            if (entry.isDirectory()) {
+              if (entry.name === "astinus") {
+                const sk = ctx?.sessionKey || "";
+                if (sk) {
+                  // IDENTICAL sanitizer to enrich.py: [^a-zA-Z0-9_.-], 120-char cap
+                  const safe = sk.replace(/[^a-zA-Z0-9_.-]/g, "_").slice(0, 120);
+                  const keyed = join(injectDir, "astinus", `${safe}.md`);
+                  try {
+                    const content = await readFile(keyed, "utf8");
+                    await unlink(keyed);
+                    drained.push({ name: `astinus/${safe}.md`, content });
+                  } catch (_) {
+                    // no file for this session — normal, not an error
+                  }
+                  // sweep: delete keyed files older than 6h (same cutoff as enrich.py)
+                  try {
+                    const astinusDir = join(injectDir, "astinus");
+                    const stale = (await readdir(astinusDir)).filter((f) => f.endsWith(".md"));
+                    const cutoff = Date.now() - 6 * 3600 * 1000;
+                    for (const f of stale) {
+                      const fp = join(astinusDir, f);
+                      const s = await stat(fp).catch(() => null);
+                      if (s && s.mtimeMs < cutoff) await unlink(fp).catch(() => {});
+                    }
+                  } catch (_) {}
+                }
+              }
+              continue; // never readFile a directory entry directly
+            }
+            drained.push(await drainOne(entry.name));
+          }
+          for (const d of drained) {
+            if (d)
+              prependParts.push(
+                `<injected file="${d.name}">\n${d.content}\n</injected file="${d.name}">`
+              );
           }
         }
       } catch (e) {
@@ -3412,12 +3615,28 @@ ${memoriesFormatted}
       try {
         const sessionKey =
           ctx?.sessionKey || (typeof event?.sessionKey === "string" ? event.sessionKey : "");
-        if (!sessionKey.endsWith(":main") && !sessionKey.includes(":main:")) return;
+        // PER-SESSION ENRICH (review finding 3): gate on the CHANNEL segment, not
+        // ':main:' — the old test matched the agent-id segment and admitted
+        // subagent/cron/heartbeat sessions too (live log counts confirmed).
+        // Desks = the main chat, telegram topics, and dashboard sessions.
+        const seg = sessionKey.split(":");
+        const isDeskSession =
+          sessionKey === "agent:main:main" ||
+          (seg[1] === "main" && (seg[2] === "telegram" || seg[2] === "dashboard"));
+        if (!isDeskSession) return;
         const now = Date.now();
-        if (now - astinusLastSpawnMs < 90_000) return;
+        // PER-SESSION ENRICH (edit 3/3, v4): per-session debounce + spawn cap.
+        // Module-scope Maps persist through jiti's cache (the retain counter's pattern).
+        const last = astinusLastSpawnBySession.get(sessionKey) ?? 0;
+        if (now - last < ASTINUS_DEBOUNCE_MS) return;
+        // GC dead spawns (killed/crashed enrich.py, >120s old)
+        for (const [pid, startMs] of astinusActiveSpawns) {
+          if (now - startMs > ASTINUS_SPAWN_GC_MS) astinusActiveSpawns.delete(pid);
+        }
+        if (astinusActiveSpawns.size >= ASTINUS_SPAWN_CAP) return;
         const enrichScript = `${WORKSPACE_ROOT}\\workspace\\skills\\astinus\\enrich.py`;
         if (!existsSync(enrichScript)) return;
-        astinusLastSpawnMs = now;
+        astinusLastSpawnBySession.set(sessionKey, now);
         // Build the JSON payload enrich.py reads on stdin (topics + last turn text).
         let astinusPayload = "{}";
         try {
@@ -3461,6 +3680,9 @@ ${memoriesFormatted}
             last_user_message: lastUser.slice(0, 800),
             conversation_summary: `${lastUser.slice(0, 300)}\n---\n${lastAssistant.slice(0, 500)}`.trim(),
             active_tasks: [],
+            // PER-SESSION ENRICH (edit 1/3): carry the session identity so enrich.py
+            // can key its output file. Agent id derives from the key (agent:<id>:...).
+            session_key: sessionKey,
           });
         } catch (e) {
           debug(`[Hindsight customizations] Astinus payload build failed: ${e}`);
@@ -3470,6 +3692,11 @@ ${memoriesFormatted}
           windowsHide: true,
           detached: true,
         });
+        // PER-SESSION ENRICH (edit 3/3): track the spawn for the concurrent cap
+        if (child.pid) {
+          astinusActiveSpawns.set(child.pid, now);
+          child.on("exit", () => astinusActiveSpawns.delete(child.pid!));
+        }
         child.on("error", (err: any) => {
           debug(`[Hindsight customizations] Astinus spawn error: ${err.message}`);
         });
@@ -3481,7 +3708,8 @@ ${memoriesFormatted}
           }
         } catch (_) {}
       } catch (e) {
-        debug(`[Hindsight customizations] Astinus trigger failed: ${e}`);
+        log.warn(`[Hindsight customizations] Astinus trigger failed: ${e}`);
+        void writeInjectError("astinus-trigger", String((e as any)?.stack || e));
       }
     };
 
