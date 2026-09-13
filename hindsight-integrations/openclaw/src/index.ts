@@ -289,7 +289,7 @@ const MAX_TRACKED_SESSIONS = 10_000;
 const WORKSPACE_ROOT = "I:\\OpenClaw\\.openclaw";
 const RETAIN_MARKER_MAX_HASHES = 500;
 const ASTINUS_MAX_COMMITTED_KEYS = 2000;
-const ASTINUS_MAX_PENDING_TURNS = 50;
+const ASTINUS_MAX_PENDING_TURNS = 500;
 
 /**
  * One durable per-session state document (plan v4). It hosts all three pieces
@@ -429,6 +429,22 @@ function tryUpdateSessionState(
   } catch (e) {
     debug(`[Hindsight Hook] session state write failed: ${e}`);
   }
+}
+/**
+ * Append a committed range, capping the queue. On overflow the OLDEST ranges are
+ * dropped, but never silently: the drop is logged at warn (review 2026-09-13, Q2).
+ */
+function appendPendingRange(
+  queue: AstinusSessionState["pendingRetain"],
+  range: AstinusSessionState["pendingRetain"][number]
+): AstinusSessionState["pendingRetain"] {
+  const next = [...queue, range];
+  if (next.length <= ASTINUS_MAX_PENDING_TURNS) return next;
+  const dropped = next.length - ASTINUS_MAX_PENDING_TURNS;
+  log.warn(
+    `[astinus-engine] pendingRetain overflow: dropping ${dropped} oldest committed range(s); retains are not draining`
+  );
+  return next.slice(-ASTINUS_MAX_PENDING_TURNS);
 }
 const DEFAULT_RECALL_TIMEOUT_MS = 10_000;
 
@@ -2518,10 +2534,16 @@ function registerAstinusContextEngine(api: MoltbotPluginAPI): void {
         const now = Date.now();
         // Only conversational roles feed the mapping and the pending-retain
         // queue - tool output is noise and would bloat the state file (Q1.7).
-        const conversational = messages.filter((m) => {
-          const role = (m as { role?: string } | null | undefined)?.role;
-          return role === "user" || role === "assistant";
-        });
+        const conversational = messages
+          .filter((m) => {
+            const role = (m as { role?: string } | null | undefined)?.role;
+            return role === "user" || role === "assistant";
+          })
+          .map((m) => ({
+            role: (m as { role: string }).role,
+            content: astinusMessageText(m),
+          }))
+          .filter((m) => m.content.length > 0);
         updateSessionState(key, (s) => {
           const topics = heartbeat ? s.topics : { ...s.topics };
           if (!heartbeat) {
@@ -2554,10 +2576,11 @@ function registerAstinusContextEngine(api: MoltbotPluginAPI): void {
             pendingRetain:
               heartbeat || startSeq === null || endSeq === null
                 ? s.pendingRetain
-                : [
-                    ...s.pendingRetain,
-                    { start: startSeq, end: endSeq, messages: conversational },
-                  ].slice(-ASTINUS_MAX_PENDING_TURNS),
+                : appendPendingRange(s.pendingRetain, {
+                    start: startSeq,
+                    end: endSeq,
+                    messages: conversational,
+                  }),
           };
         });
         return { status: "committed" };
@@ -3488,19 +3511,12 @@ ${memoriesFormatted}
         let messagesToRetain = allMessages;
         let retainFullWindow = false;
 
-        // Marker-first (plan v4): position-based delta selection. The durable
-        // per-session marker holds the last retained transcript SEQUENCE; the
-        // delta since it is exactly what is un-retained. No windows, no
-        // overlap, no duplicates, restart-safe. retainEveryNTurns is only a
-        // cost gate (how often to commit); correctness lives in the marker.
-        // The legacy cadence below remains the fallback when the host payload
-        // carries no usable seqs.
-        const seqOfMsg = (m: any): number | null => {
-          const s = m?.__openclaw?.seq ?? m?.seq;
-          return typeof s === "number" && Number.isFinite(s) ? s : null;
-        };
-        const allSeqs: (number | null)[] = allMessages.map(seqOfMsg);
-        const seqsUsable = allSeqs.some((s) => s !== null);
+        // Position-based delta selection (plan v4). The durable per-session
+        // state carries the retained position; the context engine's commit
+        // ranges are the delta (the agent_end payload never carries seqs). No
+        // windows, no overlap, no duplicates, restart-safe. retainEveryNTurns
+        // is only a cost gate (how often to commit); correctness lives in the
+        // durable state.
         let markerAdvance: {
           sessionKey: string;
           seq: number;
@@ -3514,52 +3530,15 @@ ${memoriesFormatted}
         const sessionStateForRetain = markerSessionKey
           ? loadSessionState(markerSessionKey)
           : null;
-        if (seqsUsable && markerSessionKey && sessionStateForRetain) {
-          // Marker path requires a real session key: a missing key would share
-          // one marker file across every session and corrupt the position
-          // (review 2026-09-12, Gate 0 must-fix A). Fall through to the legacy
-          // cadence when absent.
-          const markerKey = markerSessionKey;
-          const marker = sessionStateForRetain;
-          const deltaMsgs = allMessages.filter((_m: any, i: number) => {
-            const s = allSeqs[i];
-            return s !== null && s > marker.lastRetainedSeq;
-          });
-          const deltaTurns = deltaMsgs.filter((m: any) => m?.role === "user").length;
+        // The engine "serves" a session once it has committed a durable turn.
+        // While it serves, the legacy cadence must never run - it would re-retain
+        // turns the commit-range path already covers (review 2026-09-13, Q1 major).
+        const engineServing =
+          !!sessionStateForRetain &&
+          (sessionStateForRetain.lastCommittedAt > 0 ||
+            sessionStateForRetain.committedKeys.length > 0);
 
-          if (deltaMsgs.length === 0) {
-            debug(
-              `[Hindsight Hook] marker: nothing new since seq ${marker.lastRetainedSeq}, skipping retain`
-            );
-            return;
-          }
-          if (!force && deltaTurns < retainEveryN) {
-            debug(
-              `[Hindsight Hook] marker: ${deltaTurns}/${retainEveryN} un-retained turns - holding (${deltaMsgs.length} msgs since seq ${marker.lastRetainedSeq})`
-            );
-            return;
-          }
-
-          messagesToRetain = deltaMsgs;
-          retainFullWindow = true;
-          const deltaSeqs = allSeqs.filter(
-            (s): s is number => s !== null && s > marker.lastRetainedSeq
-          );
-          markerAdvance = {
-            sessionKey: markerKey,
-            seq: Math.max(...deltaSeqs),
-            hashes: deltaMsgs.map((m: any) =>
-              createHash("sha256")
-                .update(
-                  typeof m?.content === "string" ? m.content : JSON.stringify(m?.content ?? "")
-                )
-                .digest("hex")
-            ),
-          };
-          debug(
-            `[Hindsight Hook] marker: retaining delta - ${deltaMsgs.length} msgs / ${deltaTurns} turns since seq ${marker.lastRetainedSeq}`
-          );
-        } else if (
+        if (
           markerSessionKey &&
           sessionStateForRetain &&
           sessionStateForRetain.pendingRetain.length > 0
@@ -3598,9 +3577,17 @@ ${memoriesFormatted}
             ),
             clearPending: true,
           };
-          debug(
-            `[Hindsight Hook] commit-range: retaining ${pendingMsgs.length} msgs / ${pendingTurns} turns from ${pendingRanges.length} committed ranges (through seq ${pendingEndSeq})`
+          log.info(
+            `commit-range: retained ${pendingMsgs.length} msgs / ${pendingTurns} turns through seq ${pendingEndSeq}`
           );
+          debug(
+            `[Hindsight Hook] commit-range: draining ${pendingRanges.length} committed range(s)`
+          );
+        } else if (engineServing) {
+          debug(
+            `[Hindsight Hook] commit-range: engine serving, nothing committed-unretained - skipping retain`
+          );
+          return;
         } else if (retainEveryN > 1) {
           const sessionTrackingKey = `${bankId}:${effectiveCtx?.sessionKey || "session"}`;
           // session_end is a flush, not a turn — don't increment the counter.
@@ -3817,7 +3804,11 @@ ${memoriesFormatted}
               lastRetainedSeq: advance.seq,
               lastRetainedAt: Date.now(),
               chunkHashes: [...s.chunkHashes, ...advance.hashes],
-              pendingRetain: advance.clearPending ? [] : s.pendingRetain,
+              // Clear only the drained ranges (end <= the advanced seq); a turn
+              // committed during the retain RPC must survive (review 2026-09-13, Q1 blocker).
+              pendingRetain: advance.clearPending
+                ? s.pendingRetain.filter((r) => r.end > advance.seq)
+                : s.pendingRetain,
             }));
             debug(
               `[Hindsight Hook] marker advanced to seq ${advance.seq} (+${advance.hashes.length} hashes)`
