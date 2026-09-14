@@ -2369,6 +2369,13 @@ export function topicTags(labels: unknown): string[] {
 // `ingest` builds the per-session statement<->topic mapping, and `assemble`
 // logs the prune plan it would apply - the dry-run inside the real surface.
 // Kill switch: plugins.slots.contextEngine = "legacy".
+// ENGINE ID = PLUGIN ID ("hindsight-openclaw"), deliberately. The host reads
+// plugins.slots.contextEngine two ways: the plugin loader treats it as the owning
+// PLUGIN id (and `plugins enable` auto-writes the plugin id into the slot for any
+// kind: "context-engine" plugin), while resolveContextEngine looks the same string
+// up as a registered ENGINE id. A different engine id ("astinus", 2026-09-12/13)
+// therefore resolved as "not registered", was quarantined, and fell back to legacy
+// silently. Log prefix and inject dir keep the astinus name; the id must not.
 // ---------------------------------------------------------------------------
 
 type AstinusTopicEntry = {
@@ -2403,6 +2410,9 @@ function astinusEstimateTokens(messages: unknown[]): number {
   return Math.ceil(chars / 4);
 }
 
+/** The engine id; must equal the plugin id (see the note above the section). */
+const ASTINUS_ENGINE_ID = "hindsight-openclaw";
+
 function registerAstinusContextEngine(api: MoltbotPluginAPI): void {
   const register = (api as { registerContextEngine?: (id: string, factory: () => unknown) => void })
     .registerContextEngine;
@@ -2411,9 +2421,9 @@ function registerAstinusContextEngine(api: MoltbotPluginAPI): void {
     return;
   }
   try {
-    register("astinus", () => ({
+    register(ASTINUS_ENGINE_ID, () => ({
       info: {
-        id: "astinus",
+        id: ASTINUS_ENGINE_ID,
         name: "Astinus Context Engine",
         version: "0.2.0-durable-turn",
         // ownsCompaction false: compaction stays with the runtime.
@@ -2587,7 +2597,7 @@ function registerAstinusContextEngine(api: MoltbotPluginAPI): void {
       },
     }));
     log.info(
-      "[astinus-engine] context engine registered (id: astinus; inert until the slot + durable-turn contract land)"
+      `[astinus-engine] context engine registered (id: ${ASTINUS_ENGINE_ID}; inert until plugins.slots.contextEngine names it)`
     );
   } catch (e) {
     log.warn(`[astinus-engine] registration failed: ${(e as Error).message}`);
