@@ -13,6 +13,7 @@ import {
   type MinScores,
 } from "@vectorize-io/hindsight-client";
 import { RetainQueue } from "./retain-queue.js";
+import { configureSessionLedger, insertCommittedTurn } from "./session-ledger.js";
 import { compileSessionPatterns, matchesSessionPattern } from "./session-patterns.js";
 import { createHash, randomUUID } from "crypto";
 import { dirname, join } from "path";
@@ -320,6 +321,8 @@ type AstinusSessionState = {
   /** Inclusive [admission.rawSeq, terminal.rawSeq] of the last committed turn. */
   lastCommittedRange: { start: number; end: number } | null;
   lastCommittedAt: number;
+  /** True when the last commit's ledger write failed (best-effort store; R1). */
+  lastLedgerFailed: boolean;
   // --- committed-unretained ranges (option a; slot-day) ---
   /**
    * Accepted turns the engine committed but the retain loop has not yet
@@ -346,6 +349,7 @@ function defaultSessionState(): AstinusSessionState {
     lastCommittedSeq: 0,
     lastCommittedRange: null,
     lastCommittedAt: 0,
+    lastLedgerFailed: false,
     pendingRetain: [],
   };
 }
@@ -377,6 +381,7 @@ function loadSessionState(sessionKey: string): AstinusSessionState {
           ? { start: p.lastCommittedRange.start, end: p.lastCommittedRange.end }
           : null,
       lastCommittedAt: typeof p?.lastCommittedAt === "number" ? p.lastCommittedAt : 0,
+      lastLedgerFailed: p?.lastLedgerFailed === true,
       pendingRetain: Array.isArray(p?.pendingRetain)
         ? p.pendingRetain.filter(
             (r: any) =>
@@ -2520,7 +2525,7 @@ function registerAstinusContextEngine(api: MoltbotPluginAPI): void {
         messages?: unknown[];
         sessionKey?: string;
         sessionId?: string;
-        admission?: { rawSeq?: number };
+        admission?: { rawSeq?: number; agentId?: string; storePath?: string };
         terminal?: { rawSeq?: number; generation?: string };
         isHeartbeat?: boolean;
       }): Promise<{ status: "committed" | "duplicate" }> {
@@ -2541,6 +2546,24 @@ function registerAstinusContextEngine(api: MoltbotPluginAPI): void {
         const endSeq = typeof params.terminal?.rawSeq === "number" ? params.terminal.rawSeq : null;
         const generation =
           typeof params.terminal?.generation === "string" ? params.terminal.generation : null;
+        // 1. Ledger write FIRST - best-effort, never throws (R1). The state-document write
+        //    below remains the sole acknowledgement and the only thing that may throw.
+        const ledgerResult = insertCommittedTurn(
+          {
+            sessionKey: key,
+            agentId:
+              typeof params.admission?.agentId === "string" ? params.admission.agentId : "",
+            hostDbPath:
+              typeof params.admission?.storePath === "string" ? params.admission.storePath : "",
+            sessionId: typeof params.sessionId === "string" ? params.sessionId : key,
+            seqStart: startSeq ?? 0,
+            seqEnd: endSeq ?? 0,
+            generation: generation ?? "",
+            advancementKey,
+            heartbeat,
+          },
+          (m) => log.warn(m)
+        );
         const now = Date.now();
         // Only conversational roles feed the mapping and the pending-retain
         // queue - tool output is noise and would bloat the state file (Q1.7).
@@ -2581,6 +2604,7 @@ function registerAstinusContextEngine(api: MoltbotPluginAPI): void {
                 : s.lastCommittedRange,
             lastGenerationSeen: generation ?? s.lastGenerationSeen,
             lastCommittedAt: now,
+            lastLedgerFailed: !ledgerResult.ok,
             // Option (a): record the accepted turn for the retain loop to drain.
             // Cleared on a successful retain.
             pendingRetain:
@@ -2633,6 +2657,7 @@ export default function (api: MoltbotPluginAPI) {
 
     // Register the (inert) Astinus context engine. Safe no-op until the host
     // slot is switched on and the durable-turn contract lands.
+    configureSessionLedger(WORKSPACE_ROOT);
     registerAstinusContextEngine(api);
 
     debug("[Hindsight] Plugin loaded successfully (deferred heavy init to gateway start)");
