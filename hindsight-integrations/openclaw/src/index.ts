@@ -13,7 +13,12 @@ import {
   type MinScores,
 } from "@vectorize-io/hindsight-client";
 import { RetainQueue } from "./retain-queue.js";
-import { configureSessionLedger, insertCommittedTurn } from "./session-ledger.js";
+import {
+  configureSessionLedger,
+  insertCommittedTurn,
+  readMarksCached,
+  readMaxTurnSeq,
+} from "./session-ledger.js";
 import { compileSessionPatterns, matchesSessionPattern } from "./session-patterns.js";
 import { createHash, randomUUID } from "crypto";
 import { dirname, join } from "path";
@@ -2392,6 +2397,15 @@ type AstinusTopicEntry = {
 const astinusSessionMapping = new Map<string, AstinusTopicEntry>();
 const ASTINUS_MAPPING_MAX_SESSIONS = 2000;
 
+/**
+ * Marks index — the fallback assemble reads when the ledger cannot be opened
+ * (plan §6 failure policy: "on failure it uses the in-memory marks index from
+ * the last successful read, or no marks at all on a cold start"). Refilled by
+ * every successful ledger read.
+ */
+const astinusMarksIndex = new Map<string, unknown[]>();
+const ASTINUS_MARKS_INDEX_MAX_SESSIONS = 2000;
+
 function astinusMessageText(message: unknown): string {
   const content = (message as { content?: unknown } | null | undefined)?.content;
   if (typeof content === "string") return content;
@@ -2491,12 +2505,38 @@ function registerAstinusContextEngine(api: MoltbotPluginAPI): void {
         const statements = state
           ? Object.values(state.topics).reduce((n, t) => n + (t?.statements ?? 0), 0)
           : 0;
+        // Read the model's marks from the ledger (plan §8). Best-effort: on any
+        // failure fall back to the cached index, or to no marks on a cold start
+        // (§6 failure policy). Still a pass-through — application is the next
+        // step; this only surfaces what would be applied.
+        let marks: unknown[] = key ? astinusMarksIndex.get(key) ?? [] : [];
+        let marksSource = "cached";
+        if (key) {
+          const res = readMarksCached(key, (m) => log.warn(m));
+          if (res.ok) {
+            marks = res.marks;
+            astinusMarksIndex.set(key, marks);
+            if (astinusMarksIndex.size > ASTINUS_MARKS_INDEX_MAX_SESSIONS) {
+              const oldest = astinusMarksIndex.keys().next().value;
+              if (oldest !== undefined) astinusMarksIndex.delete(oldest);
+            }
+            marksSource = "ledger";
+          } else if (res.reason !== "not-open") {
+            log.warn(
+              `[astinus-engine] assemble: marks unavailable (${res.reason}); using cached index (${marks.length})`
+            );
+          }
+        }
+        const marksApplied = marks.filter(
+          (m) => (m as { applied_at?: unknown } | null)?.applied_at != null
+        ).length;
         // Dry-run: report the plan. Pass-through - the view is unchanged.
         // debug (not info): this fires every turn of every session (Q5.3).
         debug(
           `[astinus-engine] assemble dry-run: ${list.length} msgs, ~${estimatedTokens} tok` +
             (params.tokenBudget ? ` / budget ${params.tokenBudget}` : "") +
             `, topics=[${topics.join(", ")}], statements=${statements}` +
+            `, marks=${marks.length} (${marksApplied} applied, src=${marksSource})` +
             ` - pass-through (no selection applied)`
         );
         // A pass-through that trims nothing must report preassembly_may_overflow,
@@ -2642,6 +2682,26 @@ function registerAstinusContextEngine(api: MoltbotPluginAPI): void {
           } catch (e) {
             log.warn(`[astinus-pass] spawn failed: ${(e as Error).message}`);
           }
+        }
+
+        // In-process checks (§12.3): the engine-serving and ledger-writer signals
+        // only, as a warn line — so a regression is in the gateway log within one
+        // turn rather than two hours (the 05-06 -> 09-10 lesson).
+        try {
+          if (!ledgerResult.ok) {
+            log.warn(
+              `[astinus-engine] in-process check: ledger writer failed (${ledgerResult.reason ?? "unknown"}) for ${key}`
+            );
+          } else {
+            const ledgerSeq = readMaxTurnSeq(key);
+            if (endSeq !== null && !heartbeat && ledgerSeq !== null && ledgerSeq !== endSeq) {
+              log.warn(
+                `[astinus-engine] in-process check: engine-serving lag — state lastCommittedSeq=${endSeq}, ledger max seq_end=${ledgerSeq}`
+              );
+            }
+          }
+        } catch (e) {
+          log.warn(`[astinus-engine] in-process check failed: ${(e as Error).message}`);
         }
 
         return { status: "committed" };

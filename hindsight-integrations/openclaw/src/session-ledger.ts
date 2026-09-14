@@ -232,3 +232,53 @@ export function readMarks(
     return { ok: false, marks: [], reason };
   }
 }
+
+/**
+ * Read the session's marks from an ALREADY-OPEN ledger only (assemble's hot path,
+ * §6). assemble runs at turn start, before/without the meta insert a cold open
+ * would need, so it must never create a file: if the ledger is not cached (a
+ * cold start, or a key the router does not serve) this returns not-open and the
+ * caller falls back to its in-memory index — or to no marks at all on a cold
+ * start. Never throws.
+ */
+export function readMarksCached(
+  sessionKey: string,
+  warn: (msg: string) => void
+): { ok: boolean; marks: unknown[]; reason?: string } {
+  const known = disabled.get(sessionKey);
+  if (known) return { ok: false, marks: [], reason: known };
+  const db = cache.get(sessionKey);
+  if (!db) return { ok: false, marks: [], reason: "not-open" };
+  try {
+    const marks = db
+      .prepare(
+        `SELECT mark_id, session_id, seq_start, seq_end, kind, action, digest, reason,
+                applied_gen, applied_at
+           FROM marks ORDER BY seq_start`
+      )
+      .all();
+    return { ok: true, marks };
+  } catch (e) {
+    const reason = `marks-read-failed:${(e as Error)?.message ?? e}`;
+    warn(`[astinus-ledger] ${sessionKey}: ${reason}`);
+    return { ok: false, marks: [], reason };
+  }
+}
+
+/**
+ * The highest committed turn seq_end in an already-open ledger (in-process
+ * engine-serving check, §12.3). Returns null when the ledger is not open or has
+ * no turns yet. Never throws.
+ */
+export function readMaxTurnSeq(sessionKey: string): number | null {
+  const db = cache.get(sessionKey);
+  if (!db) return null;
+  try {
+    const row = db.prepare("SELECT MAX(seq_end) AS m FROM turns WHERE heartbeat = 0").get() as
+      | { m?: number | null }
+      | undefined;
+    return typeof row?.m === "number" ? row.m : null;
+  } catch {
+    return null;
+  }
+}
