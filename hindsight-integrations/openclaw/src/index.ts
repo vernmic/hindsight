@@ -2586,6 +2586,13 @@ function registerAstinusContextEngine(api: MoltbotPluginAPI): void {
         const endSeq = typeof params.terminal?.rawSeq === "number" ? params.terminal.rawSeq : null;
         const generation =
           typeof params.terminal?.generation === "string" ? params.terminal.generation : null;
+        // F13: capture the PREVIOUS turn's positions before this commit touches anything, so the
+        // in-process check below compares N-1 rather than the turn it just wrote (which could
+        // never lag by construction, and could only report the failure the first branch already
+        // reports).
+        const prevStateSeq = loadSessionState(key).lastCommittedSeq;
+        const prevLedgerSeq = readMaxTurnSeq(key);
+
         // 1. Ledger write FIRST - best-effort, never throws (R1). The state-document write
         //    below remains the sole acknowledgement and the only thing that may throw.
         const ledgerResult = insertCommittedTurn(
@@ -2660,7 +2667,7 @@ function registerAstinusContextEngine(api: MoltbotPluginAPI): void {
 
         // 3. Spawn the sidecar pass (detached, non-blocking) - only after a successful ledger
         //    insert, and only for router-served keys (plan v3 §5, R3).
-        if (ledgerResult.ok) {
+        if (ledgerResult.ok && !heartbeat) {
           try {
             const passScript = `${WORKSPACE_ROOT}\\workspace\\skills\\astinus\\astinus_pass.py`;
             if (existsSync(passScript)) {
@@ -2674,6 +2681,7 @@ function registerAstinusContextEngine(api: MoltbotPluginAPI): void {
               });
               const passChild = spawn("python", [passScript], {
                 detached: true,
+                windowsHide: true,
                 stdio: ["pipe", "ignore", "ignore"],
               });
               passChild.stdin?.end(passPayload);
@@ -2693,10 +2701,17 @@ function registerAstinusContextEngine(api: MoltbotPluginAPI): void {
               `[astinus-engine] in-process check: ledger writer failed (${ledgerResult.reason ?? "unknown"}) for ${key}`
             );
           } else {
-            const ledgerSeq = readMaxTurnSeq(key);
-            if (endSeq !== null && !heartbeat && ledgerSeq !== null && ledgerSeq !== endSeq) {
+            // F13: compare the PREVIOUS turn (captured before this commit). A ledger whose max
+            // seq_end sits behind the state document's lastCommittedSeq means the previous
+            // turn's ledger row was missed.
+            if (
+              !heartbeat &&
+              prevStateSeq > 0 &&
+              prevLedgerSeq !== null &&
+              prevLedgerSeq < prevStateSeq
+            ) {
               log.warn(
-                `[astinus-engine] in-process check: engine-serving lag — state lastCommittedSeq=${endSeq}, ledger max seq_end=${ledgerSeq}`
+                `[astinus-engine] in-process check: engine-serving lag - previous state lastCommittedSeq=${prevStateSeq}, ledger max seq_end=${prevLedgerSeq}`
               );
             }
           }

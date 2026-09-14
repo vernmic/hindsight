@@ -98,7 +98,11 @@ CREATE TABLE IF NOT EXISTS rebases (
 `;
 
 const cache = new Map<string, DatabaseSync>();
-const disabled = new Map<string, string>();
+// F10: a schema mismatch deserves to be sticky; a transient open failure (a momentary lock, a
+// full disk) must not disable a session's ledger for the process lifetime, or nothing ever
+// re-tries it. Transient entries carry a cooldown.
+const disabled = new Map<string, { reason: string; until: number }>();
+const OPEN_FAILED_COOLDOWN_MS = 5 * 60 * 1000;
 
 export type LedgerOpen =
   | { ok: true; db: DatabaseSync }
@@ -113,7 +117,10 @@ export function openSessionLedger(
 ): LedgerOpen {
   if (!ledgerEligible(sessionKey)) return { ok: false, reason: "ineligible-key" };
   const known = disabled.get(sessionKey);
-  if (known) return { ok: false, reason: known };
+  if (known) {
+    if (known.until > Date.now()) return { ok: false, reason: known.reason };
+    disabled.delete(sessionKey); // cooldown expired - try again
+  }
   const cached = cache.get(sessionKey);
   if (cached) return { ok: true, db: cached };
   if (!ledgerRoot) return { ok: false, reason: "not-configured" };
@@ -137,7 +144,7 @@ export function openSessionLedger(
     } else if (v !== LEDGER_SCHEMA_VERSION) {
       const reason = `schema-version-mismatch:${v}`;
       db.close();
-      disabled.set(sessionKey, reason);
+      disabled.set(sessionKey, { reason, until: Number.POSITIVE_INFINITY });
       warn(`[astinus-ledger] ${sessionKey}: ${reason}; ledger disabled for this session`);
       return { ok: false, reason };
     }
@@ -156,7 +163,7 @@ export function openSessionLedger(
     return { ok: true, db };
   } catch (e) {
     const reason = `open-failed:${(e as Error)?.message ?? e}`;
-    disabled.set(sessionKey, reason);
+    disabled.set(sessionKey, { reason, until: Date.now() + OPEN_FAILED_COOLDOWN_MS });
     warn(`[astinus-ledger] ${sessionKey}: ${reason}`);
     return { ok: false, reason };
   }
@@ -246,7 +253,9 @@ export function readMarksCached(
   warn: (msg: string) => void
 ): { ok: boolean; marks: unknown[]; reason?: string } {
   const known = disabled.get(sessionKey);
-  if (known) return { ok: false, marks: [], reason: known };
+  if (known && known.until > Date.now()) {
+    return { ok: false, marks: [], reason: known.reason };
+  }
   const db = cache.get(sessionKey);
   if (!db) return { ok: false, marks: [], reason: "not-open" };
   try {
