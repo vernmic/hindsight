@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import {
+  closeAllLedgers,
   configureSessionLedger,
   insertCommittedTurn,
   ledgerPath,
@@ -46,12 +47,14 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  // Release the cached handles first — on Windows an open handle blocks the unlink, so without
+  // this the temp root survives and the case looks like a failure (see
+  // research/ASTINUS-WINDOWS-FILE-LOCKING-2026-09-14.md).
+  closeAllLedgers();
   try {
     rmSync(root, { recursive: true, force: true });
   } catch {
-    // The module caches open ledger handles by design, and Windows refuses to unlink an open
-    // file — the temp root is left for the OS to reap rather than failing an otherwise-green
-    // case. (This is a harness limitation, not the ledger's contract.)
+    /* best effort; the OS reaps what it can */
   }
 });
 

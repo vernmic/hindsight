@@ -169,6 +169,38 @@ export function openSessionLedger(
   }
 }
 
+/**
+ * Close one session's cached ledger handle. Needed before the file can be archived or reset on
+ * Windows, where an open handle blocks the unlink (see
+ * research/ASTINUS-WINDOWS-FILE-LOCKING-2026-09-14.md). Never throws.
+ */
+export function closeSessionLedger(sessionKey: string): void {
+  const db = cache.get(sessionKey);
+  if (!db) return;
+  try {
+    db.close();
+  } catch {
+    /* ignore */
+  }
+  cache.delete(sessionKey);
+}
+
+/**
+ * Close every cached ledger handle — shutdown, or a test/archive pass that needs the files
+ * free. Never throws.
+ */
+export function closeAllLedgers(): void {
+  for (const key of [...cache.keys()]) {
+    const db = cache.get(key);
+    try {
+      db?.close();
+    } catch {
+      /* ignore */
+    }
+    cache.delete(key);
+  }
+}
+
 export type TurnInsert = {
   sessionKey: string;
   agentId: string;
