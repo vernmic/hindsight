@@ -2617,6 +2617,33 @@ function registerAstinusContextEngine(api: MoltbotPluginAPI): void {
                   }),
           };
         });
+
+        // 3. Spawn the sidecar pass (detached, non-blocking) - only after a successful ledger
+        //    insert, and only for router-served keys (plan v3 §5, R3).
+        if (ledgerResult.ok) {
+          try {
+            const passScript = `${WORKSPACE_ROOT}\\workspace\\skills\\astinus\\astinus_pass.py`;
+            if (existsSync(passScript)) {
+              const passPayload = JSON.stringify({
+                session_key: key,
+                session_id: typeof params.sessionId === "string" ? params.sessionId : key,
+                range: [startSeq ?? 0, endSeq ?? 0],
+                gen: generation ?? "",
+                view_tokens: null,
+                token_budget: null,
+              });
+              const passChild = spawn("python", [passScript], {
+                detached: true,
+                stdio: ["pipe", "ignore", "ignore"],
+              });
+              passChild.stdin?.end(passPayload);
+              passChild.unref();
+            }
+          } catch (e) {
+            log.warn(`[astinus-pass] spawn failed: ${(e as Error).message}`);
+          }
+        }
+
         return { status: "committed" };
       },
     }));
