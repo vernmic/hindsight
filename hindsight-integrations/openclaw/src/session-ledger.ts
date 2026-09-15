@@ -201,6 +201,26 @@ export function closeAllLedgers(): void {
   }
 }
 
+/** Stamp marks as applied (best-effort; never throws). Plan §8: applied_gen/applied_at + before/after. */
+export function markMarksApplied(
+  sessionKey: string,
+  markIds: Array<number | unknown>,
+  gen: string,
+  tokensBefore: number,
+  tokensAfter: number
+): void {
+  const db = cache.get(sessionKey);
+  if (!db || markIds.length === 0) return;
+  try {
+    const st = db.prepare(
+      "UPDATE marks SET applied_gen = ?, applied_at = ?, view_tokens_before = ?, view_tokens_after = ? WHERE mark_id = ?"
+    );
+    for (const id of markIds) st.run(gen, Date.now(), tokensBefore, tokensAfter, id);
+  } catch {
+    /* never throws */
+  }
+}
+
 export type TurnInsert = {
   sessionKey: string;
   agentId: string;

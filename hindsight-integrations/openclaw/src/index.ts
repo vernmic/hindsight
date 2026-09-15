@@ -16,9 +16,11 @@ import { RetainQueue } from "./retain-queue.js";
 import {
   configureSessionLedger,
   insertCommittedTurn,
+  markMarksApplied,
   readMarksCached,
   readMaxTurnSeq,
 } from "./session-ledger.js";
+import { applyMarks, type LedgerMark } from "./assemble-marks.js";
 import { compileSessionPatterns, matchesSessionPattern } from "./session-patterns.js";
 import { createHash, randomUUID } from "crypto";
 import { dirname, join } from "path";
@@ -2544,7 +2546,52 @@ function registerAstinusContextEngine(api: MoltbotPluginAPI): void {
         // when the slot goes live (review 2026-09-12, Gate 2). The char/4
         // estimate only feeds the host's compaction threshold, and the host's own
         // precheck still runs, so an under-estimate is safe.
-        return { messages: list, estimatedTokens, promptAuthority: "preassembly_may_overflow" };
+        // Apply the marks to the VIEW (plan §8 + the Sept-12 cache-hit ruling). Invariants are
+        // enforced in code inside applyMarks: never the first user message, tool pairs travel
+        // together, nothing in the preserved tail, the pressure floor, and the 10-turn debounce
+        // unless pressure is critical. Any failure degrades to "less pruned", never an error.
+        const agentId = key && key.startsWith("agent:") ? key.split(":")[1] : "";
+        const hostDbPath = agentId
+          ? `${WORKSPACE_ROOT}\\agents\\${agentId}\\agent\\openclaw-agent.sqlite`
+          : "";
+        const viewTokens = estimatedTokens;
+        let appliedCount = 0;
+        let appliedMarkIds: Array<number | unknown> = [];
+        let outList = list;
+        if (key && hostDbPath && Array.isArray(marks)) {
+          try {
+            const res = applyMarks(list, marks as LedgerMark[], {
+              sessionKey: key,
+              hostDbPath,
+              sessionId: key, // transcript rows are keyed by session id == the host sessionId via ledger meta
+              viewTokens,
+              tokenBudget: params.tokenBudget ?? 0,
+              turnCount: state ? state.committedKeys.length : 0,
+            });
+            outList = res.messages;
+            appliedCount = res.applied.length;
+            appliedMarkIds = res.applied.map((m) => m.mark_id);
+            if (res.changed) {
+              markMarksApplied(
+                key,
+                appliedMarkIds,
+                state?.lastGenerationSeen ?? "",
+                res.tokensBefore,
+                res.tokensAfter
+              );
+              log.info(
+                `astinus view: ${res.messages.length} msgs, ~${res.tokensAfter} tok (from ${res.tokensBefore}; ${appliedCount} marks applied)`
+              );
+            } else if (res.skipped.length > 0) {
+              debug(
+                `[astinus-engine] assemble: ${res.skipped.length} mark(s) held - ${res.skipped[0]}`
+              );
+            }
+          } catch (e) {
+            log.warn(`[astinus-engine] assemble: mark application failed: ${(e as Error).message}`);
+          }
+        }
+        return { messages: outList, estimatedTokens, promptAuthority: "preassembly_may_overflow" };
       },
       async compact(): Promise<{ ok: boolean; compacted: boolean; reason: string }> {
         return {
