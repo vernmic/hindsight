@@ -1,20 +1,10 @@
-// Astinus mark application (plan v3 §8 + the 2026-09-12 debounce ruling): turn the marks the
-// pass proposed into the view the model actually sees. The join is by IDENTITY, never position —
-// assemble's array has been through history limiting, tool-pair repair and custom-message
-// stripping, so positions drift exactly when precision matters (L0 review Q2/M1).
-//
-// Hard invariants, enforced here in code regardless of what the model proposed:
-//   * never touch the first user message or anything before it (bootstrap);
-//   * tool_use/tool_result travel together — a range that would split a pair is skipped whole;
-//   * nothing inside the last `preserveMessages` messages;
-//   * apply only when view pressure exceeds `minPressure`;
-//   * a session's view changes at most once per `debounceTurns` turns unless pressure is
-//     critical (the Sept 12 cache-hit ruling — pruning that reshapes the view every turn
-//     would tank cache hits; that is a hard constraint, not a preference);
-//   * any failure degrades to "less pruned", never to an error (§6 failure policy).
+// Astinus mark application (plan v3 §8 + v4.2 + the assemble-marks review B1-B4/M1-M5).
+// Identity join (never position); admission vs re-application split (B2); tool pairs by
+// role+toolCallId (B3); host-shaped estimator (B4); element replacement not mutation (M1);
+// parts-array digest (M2); 8-user-turn preserved tail (M3); (dbPath,sessionId) index key (M4);
+// one refresh per pass (M5). Any failure degrades to "less pruned", never an error.
 import { DatabaseSync } from "node:sqlite";
 import { existsSync } from "fs";
-import { join } from "path";
 
 export type LedgerMark = {
   mark_id?: number | unknown;
@@ -22,20 +12,19 @@ export type LedgerMark = {
   seq_start: number;
   seq_end: number;
   kind?: string;
-  action: string; // digest | drop | placeholder
+  action: string;
   digest?: string | null;
   reason?: string;
   applied_gen?: string | null;
   applied_at?: number | null;
 };
 
-const PRESERVE_MESSAGES = 6;
+const PRESERVE_USER_TURNS = 8;
 const MIN_PRESSURE = 0.4;
 const CRITICAL_PRESSURE = 0.65;
 const DEBOUNCE_TURNS = 10;
-const MAX_SEQ_ROWS_PER_LOAD = 5000;
+const LOAD_CHUNK = 5000;
 
-/** The identity of a message as it survives the host's transformations. */
 export function identityKeyOf(m: unknown): string {
   const msg = (m ?? {}) as Record<string, unknown>;
   if (typeof msg.idempotencyKey === "string" && msg.idempotencyKey) return "ik:" + msg.idempotencyKey;
@@ -49,30 +38,59 @@ export function identityKeyOf(m: unknown): string {
   return `rt:${role}:${ts}:${tc}`;
 }
 
-function eventIdentity(eventJson: string): { key: string; role: string } | null {
+function eventIdentity(eventJson: string): string | null {
   try {
     const ev = JSON.parse(eventJson) as Record<string, unknown>;
     const msg = (ev.message ?? ev) as Record<string, unknown>;
-    const role = typeof msg.role === "string" ? msg.role : "";
-    if (!role) return null;
-    return { key: identityKeyOf(msg), role };
+    if (typeof msg.role !== "string" || !msg.role) return null;
+    return identityKeyOf(msg);
   } catch {
     return null;
   }
 }
 
-/** Per-session identity→seq index over the host transcript, loaded read-only and incrementally. */
+/** Host-shaped token estimate (B4, after preemptive-compaction.ts:27-31): text/4, toolResult
+ *  chars/2, other JSON/3, +12/message +6/block, x1.2. */
+export function estimateTokensHost(list: unknown[]): number {
+  let total = 0;
+  for (const m of list) {
+    const msg = (m ?? {}) as Record<string, unknown>;
+    let blocks = 0;
+    let chars = 0;
+    const c = msg.content;
+    if (typeof c === "string") {
+      chars += c.length;
+      blocks += 1;
+    } else if (Array.isArray(c)) {
+      for (const p of c as Array<Record<string, unknown>>) {
+        blocks += 1;
+        const t = typeof p?.text === "string" ? p.text : "";
+        if (msg.role === "toolResult") chars += t.length / 2;
+        else if (t) chars += t.length / 4;
+        else chars += JSON.stringify(p ?? {}).length / 3;
+      }
+    }
+    if (msg.role === "thinking" && typeof c === "string") chars += c.length / 3;
+    total += chars + 12 + blocks * 6;
+  }
+  return Math.ceil(total * 1.2);
+}
+
 class SeqIndex {
   private db: DatabaseSync | null = null;
   private lastSeq = 0;
   private readonly map = new Map<string, number>();
+  private loadedOnce = false;
   failed = false;
 
   constructor(readonly dbPath: string, readonly sessionId: string) {}
 
   private open(): boolean {
     if (this.db) return true;
-    if (this.failed || !existsSync(this.dbPath)) return false;
+    if (this.failed || !existsSync(this.dbPath)) {
+      this.failed = true;
+      return false;
+    }
     try {
       this.db = new DatabaseSync(this.dbPath, { readOnly: true });
       return true;
@@ -82,45 +100,50 @@ class SeqIndex {
     }
   }
 
-  seqOf(message: unknown): number | null {
-    this.refresh();
-    const hit = this.map.get(identityKeyOf(message));
-    return hit ?? null;
-  }
-
-  private refresh(): void {
+  /** One refresh per pass (M5); loop until a chunk comes back short so a fresh index converges. */
+  refresh(): void {
     if (!this.open()) return;
     try {
-      const rows = this.db!
-        .prepare(
-          "SELECT seq, event_json FROM transcript_events WHERE session_id = ? AND seq > ? ORDER BY seq LIMIT ?"
-        )
-        .all(this.sessionId, this.lastSeq, MAX_SEQ_ROWS_PER_LOAD) as Array<{
-        seq: number;
-        event_json: string;
-      }>;
-      for (const r of rows) {
-        const id = eventIdentity(r.event_json);
-        if (!id) continue;
-        this.map.set(id.key, Number(r.seq));
-        if (Number(r.seq) > this.lastSeq) this.lastSeq = Number(r.seq);
-      }
+      let rows: Array<{ seq: number; event_json: string }> = [];
+      do {
+        rows = this.db!
+          .prepare(
+            "SELECT seq, event_json FROM transcript_events WHERE session_id = ? AND seq > ? ORDER BY seq LIMIT ?"
+          )
+          .all(this.sessionId, this.lastSeq, LOAD_CHUNK) as Array<{ seq: number; event_json: string }>;
+        for (const r of rows) {
+          const key = eventIdentity(r.event_json);
+          if (!key) continue;
+          this.map.set(key, Number(r.seq));
+          if (Number(r.seq) > this.lastSeq) this.lastSeq = Number(r.seq);
+        }
+      } while (rows.length === LOAD_CHUNK);
+      this.loadedOnce = true;
     } catch {
-      // degrade: whatever is indexed so far still resolves; new messages return null
+      /* degrade: whatever is indexed still resolves */
     }
+  }
+
+  get ready(): boolean {
+    return this.loadedOnce;
+  }
+
+  seqOf(message: unknown): number | null {
+    return this.map.get(identityKeyOf(message)) ?? null;
   }
 }
 
 const seqIndexes = new Map<string, SeqIndex>();
-function seqIndexFor(sessionKey: string, dbPath: string, sessionId: string): SeqIndex {
-  let ix = seqIndexes.get(sessionKey);
-  if (!ix || ix.dbPath !== dbPath) {
+function seqIndexFor(dbPath: string, sessionId: string): SeqIndex {
+  const cacheKey = `${dbPath}|${sessionId}`; // M4: key by (dbPath, sessionId), not session key
+  let ix = seqIndexes.get(cacheKey);
+  if (!ix) {
     ix = new SeqIndex(dbPath, sessionId);
     if (seqIndexes.size >= 200) {
       const oldest = seqIndexes.keys().next().value;
       if (oldest !== undefined) seqIndexes.delete(oldest);
     }
-    seqIndexes.set(sessionKey, ix);
+    seqIndexes.set(cacheKey, ix);
   }
   return ix;
 }
@@ -128,43 +151,56 @@ function seqIndexFor(sessionKey: string, dbPath: string, sessionId: string): Seq
 export type ApplyContext = {
   sessionKey: string;
   hostDbPath: string;
-  sessionId: string;
-  viewTokens: number;
+  sessionId: string; // B1: the HOST session UUID, never the session key
   tokenBudget: number;
-  turnCount: number;
+  turnCounter: number; // monotonic (lastCommittedSeq), NOT the capped committedKeys length
 };
 
 export type ApplyResult = {
   messages: unknown[];
-  applied: LedgerMark[]; // the marks actually applied this pass
+  admitted: LedgerMark[]; // newly admitted this pass (stamp these)
+  marksInEffect: number; // admitted-before + admitted-now (B2: authority basis)
   changed: boolean;
   tokensBefore: number;
   tokensAfter: number;
-  skipped: string[]; // human-readable skip reasons (one per skipped mark)
+  skipped: string[];
 };
 
-const lastAppliedTurn = new Map<string, number>();
+const lastAdmissionTurn = new Map<string, number>();
 
-/** Very rough token estimate — matches astinusEstimateTokens' char/4 shape. */
-function estimate(list: unknown[]): number {
-  let chars = 0;
-  for (const m of list) {
-    const msg = (m ?? {}) as Record<string, unknown>;
-    const c = msg.content;
-    if (typeof c === "string") chars += c.length;
-    else if (Array.isArray(c))
-      for (const p of c as Array<Record<string, unknown>>)
-        if (typeof p?.text === "string") chars += p.text.length;
+/** Tool-call id of an assistant message's toolCall part, if any (B3: by role, not a phantom type). */
+function toolCallIdOf(m: unknown): string | null {
+  const msg = (m ?? {}) as Record<string, unknown>;
+  if (msg.role !== "assistant") return null;
+  const c = msg.content;
+  if (!Array.isArray(c)) return null;
+  for (const p of c as Array<Record<string, unknown>>) {
+    const id = (p?.id ?? p?.toolCallId) as unknown;
+    if ((p?.type === "toolCall" || p?.type === "tool_use") && typeof id === "string") return id;
   }
-  return Math.ceil(chars / 4);
+  return null;
 }
 
-function isToolSide(m: unknown): "call" | "result" | null {
-  const msg = (m ?? {}) as Record<string, unknown>;
-  const t = typeof msg.type === "string" ? msg.type : "";
-  if (t === "toolCall" || t === "tool_use") return "call";
-  if (t === "toolResult" || t === "tool_result") return "result";
-  return null;
+function isToolResult(m: unknown): boolean {
+  return ((m ?? {}) as Record<string, unknown>).role === "toolResult";
+}
+
+function toolResultCallId(m: unknown): string | null {
+  const id = ((m ?? {}) as Record<string, unknown>).toolCallId as unknown;
+  return typeof id === "string" ? id : null;
+}
+
+/** The index of the first message inside the preserved tail: the last PRESERVE_USER_TURNS user
+ *  turns (M3), not a fixed message count. */
+function preservedFloorIdx(messages: unknown[]): number {
+  let userTurns = 0;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (((messages[i] ?? {}) as Record<string, unknown>).role === "user") {
+      userTurns++;
+      if (userTurns >= PRESERVE_USER_TURNS) return i;
+    }
+  }
+  return 0;
 }
 
 export function applyMarks(
@@ -172,45 +208,61 @@ export function applyMarks(
   marks: LedgerMark[],
   ctx: ApplyContext
 ): ApplyResult {
-  const tokensBefore = estimate(messages);
-  const pressure = ctx.tokenBudget > 0 ? ctx.viewTokens / ctx.tokenBudget : 0;
+  const tokensBefore = estimateTokensHost(messages);
   const out: ApplyResult = {
     messages,
-    applied: [],
+    admitted: [],
+    marksInEffect: 0,
     changed: false,
     tokensBefore,
     tokensAfter: tokensBefore,
     skipped: [],
   };
-  const usable = marks.filter(
-    (m) => m && (m.applied_at == null) && Number.isFinite(m.seq_start) && Number.isFinite(m.seq_end)
+  const wellFormed = marks.filter(
+    (m) => m && Number.isFinite(m.seq_start) && Number.isFinite(m.seq_end)
   );
-  if (usable.length === 0) return out;
-  if (pressure < MIN_PRESSURE) {
-    out.skipped.push(`pressure ${pressure.toFixed(2)} < ${MIN_PRESSURE} (idle)`);
-    return out;
+  if (wellFormed.length === 0) return out;
+  const pressure = ctx.tokenBudget > 0 ? tokensBefore / ctx.tokenBudget : 0;
+  // B2: admission (NEW marks) is gated; re-application (admitted marks) is unconditional —
+  // the view is rebuilt from the transcript every turn, so admitted marks ARE the view.
+  const admitted = wellFormed.filter((m) => m.applied_at != null);
+  let pending = wellFormed.filter((m) => m.applied_at == null);
+  if (pending.length > 0) {
+    if (pressure < MIN_PRESSURE) {
+      out.skipped.push(`admission held: pressure ${pressure.toFixed(2)} < ${MIN_PRESSURE} (idle)`);
+      pending = [];
+    } else {
+      const lastAt = lastAdmissionTurn.get(ctx.sessionKey) ?? -Infinity;
+      if (ctx.turnCounter - lastAt < DEBOUNCE_TURNS && pressure < CRITICAL_PRESSURE) {
+        out.skipped.push(
+          `admission held: debounce ${ctx.turnCounter - lastAt}/${DEBOUNCE_TURNS} turns (cache-hit ruling)`
+        );
+        pending = [];
+      }
+    }
   }
-  const lastAt = lastAppliedTurn.get(ctx.sessionKey) ?? -Infinity;
-  if (ctx.turnCount - lastAt < DEBOUNCE_TURNS && pressure < CRITICAL_PRESSURE) {
-    out.skipped.push(`debounce: ${ctx.turnCount - lastAt}/${DEBOUNCE_TURNS} turns since last apply (cache-hit ruling)`);
-    return out;
-  }
-  const ix = seqIndexFor(ctx.sessionKey, ctx.hostDbPath, ctx.sessionId);
-  // Resolve each message to a seq once. Messages with no seq are never marked (the invariant).
+  const toApply = [...admitted, ...pending];
+  if (toApply.length === 0) return out;
+
+  const ix = seqIndexFor(ctx.hostDbPath, ctx.sessionId);
+  ix.refresh();
   const seqs: (number | null)[] = messages.map((m) => ix.seqOf(m));
   const firstUser = messages.findIndex(
     (m) => ((m ?? {}) as Record<string, unknown>).role === "user"
   );
-  const floorIdx = firstUser < 0 ? 0 : firstUser; // never touch anything at or before the first user message
-  const ceilingIdx = Math.max(floorIdx + 1, messages.length - PRESERVE_MESSAGES);
+  const floorIdx = firstUser < 0 ? 0 : firstUser;
+  const tailFloor = preservedFloorIdx(messages);
   let list = messages.slice();
-  // Apply deepest (highest seq) first so indices stay valid as ranges are removed.
-  const ordered = [...usable].sort((a, b) => b.seq_start - a.seq_start);
+
+  const ordered = [...toApply].sort((a, b) => b.seq_start - a.seq_start);
   for (const mark of ordered) {
     const lo = Number(mark.seq_start);
     const hi = Number(mark.seq_end);
+    // A mark may partially overlap the preserved tail; the in-view part applies, the tail
+    // part is protected by construction (it has no eligible index below tailFloor).
     const idxs: number[] = [];
-    for (let i = floorIdx + 1; i < ceilingIdx; i++) {
+    for (let i = floorIdx + 1; i < list.length; i++) {
+      if (i >= tailFloor) continue;
       const s = seqs[i];
       if (s !== null && s >= lo && s <= hi) idxs.push(i);
     }
@@ -218,51 +270,80 @@ export function applyMarks(
       out.skipped.push(`seq ${lo}-${hi}: no eligible message in view (preserved/unmapped)`);
       continue;
     }
-    const span = [idxs[0], idxs[idxs.length - 1]] as const;
-    // Tool pairs travel together: if the boundary splits a pair, extend to include both sides.
-    let start = span[0];
-    let end = span[1];
-    while (start - 1 > floorIdx && isToolSide(list[start - 1]) && isToolSide(list[start])) start--;
-    while (end + 1 < list.length && isToolSide(list[end]) && isToolSide(list[end + 1])) end++;
+    let start = idxs[0];
+    let end = idxs[idxs.length - 1];
+    // B3: pairs travel together — extend across the toolCallId link, not adjacency.
+    if (isToolResult(list[start]) || isToolResult(list[end])) {
+      const needIds = new Set<string>();
+      for (let i = start; i <= end; i++) {
+        const cid = toolResultCallId(list[i]);
+        if (cid) needIds.add(cid);
+      }
+      while (start - 1 > floorIdx) {
+        const prevCall = toolCallIdOf(list[start - 1]);
+        if (prevCall && needIds.has(prevCall)) {
+          start--;
+          const cid2 = toolResultCallId(list[start + 1]);
+          if (cid2) needIds.add(cid2);
+        } else if (isToolResult(list[start - 1]) && start - 1 >= tailFloor) {
+          start--;
+        } else break;
+      }
+      while (end + 1 < list.length && end + 1 < tailFloor + PRESERVE_USER_TURNS * 2) {
+        const nextCall = toolCallIdOf(list[end + 1]);
+        const nextCid = toolResultCallId(list[end + 1]);
+        if ((nextCall && needIds.has(nextCall)) || nextCid) end++;
+        else break;
+      }
+    }
     if (mark.action === "drop") {
       list.splice(start, end - start + 1);
       out.changed = true;
-      out.applied.push(mark);
     } else if (mark.action === "digest" && mark.digest) {
       const digestMsg = {
         role: "assistant",
-        content:
-          `[injected context — earlier records of this session, digested; not current state; ` +
-          `verify before acting] Astinus digest of seq ${lo}-${hi}: ${mark.digest}`,
+        timestamp: Date.now(),
+        content: [
+          {
+            type: "text",
+            text:
+              `[injected context — earlier records of this session, digested; not current state; ` +
+              `verify before acting] Astinus digest of seq ${lo}-${hi}: ${mark.digest}`,
+          },
+        ],
       };
       list.splice(start, end - start + 1, digestMsg);
       out.changed = true;
-      out.applied.push(mark);
     } else if (mark.action === "placeholder") {
       let placeholdered = false;
       for (let i = start; i <= end; i++) {
         const msg = list[i] as Record<string, unknown> | null;
-        if (!msg || isToolSide(msg) !== "result") continue;
+        if (!msg || !isToolResult(msg)) continue;
         const c = msg.content;
         const text = typeof c === "string" ? c : JSON.stringify(c ?? "");
-        (msg as Record<string, unknown>).content =
-          `[tool output pruned by Astinus (${text.length} chars); the call above retains its shape]`;
+        // M1: replace the ELEMENT — never mutate the host's message object in place.
+        list[i] = {
+          ...msg,
+          content: `[tool output pruned by Astinus (${text.length} chars); the call above retains its shape]`,
+        };
         placeholdered = true;
       }
-      if (placeholdered) {
-        out.changed = true;
-        out.applied.push(mark);
-      } else {
+      if (placeholdered) out.changed = true;
+      else {
         out.skipped.push(`seq ${lo}-${hi}: placeholder found no tool result`);
+        continue;
       }
     } else {
       out.skipped.push(`seq ${lo}-${hi}: unknown action ${mark.action}`);
+      continue;
     }
+    if (mark.applied_at == null) out.admitted.push(mark);
   }
+  out.marksInEffect = admitted.length + out.admitted.length;
+  if (out.admitted.length > 0) lastAdmissionTurn.set(ctx.sessionKey, ctx.turnCounter);
   if (out.changed) {
-    out.tokensAfter = estimate(list);
+    out.tokensAfter = estimateTokensHost(list);
     out.messages = list;
-    lastAppliedTurn.set(ctx.sessionKey, ctx.turnCount);
   }
   return out;
 }

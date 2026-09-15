@@ -20,7 +20,7 @@ import {
   readMarksCached,
   readMaxTurnSeq,
 } from "./session-ledger.js";
-import { applyMarks, type LedgerMark } from "./assemble-marks.js";
+import { applyMarks, estimateTokensHost, type LedgerMark } from "./assemble-marks.js";
 import { compileSessionPatterns, matchesSessionPattern } from "./session-patterns.js";
 import { createHash, randomUUID } from "crypto";
 import { dirname, join } from "path";
@@ -2554,33 +2554,39 @@ function registerAstinusContextEngine(api: MoltbotPluginAPI): void {
         const hostDbPath = agentId
           ? `${WORKSPACE_ROOT}\\agents\\${agentId}\\agent\\openclaw-agent.sqlite`
           : "";
-        const viewTokens = estimatedTokens;
-        let appliedCount = 0;
-        let appliedMarkIds: Array<number | unknown> = [];
+        let marksInEffect = 0;
+        let admittedIds: Array<number | unknown> = [];
         let outList = list;
-        if (key && hostDbPath && Array.isArray(marks)) {
+        let pressure = 0;
+        if (key && hostDbPath && Array.isArray(marks) && typeof params.sessionId === "string" && params.sessionId) {
           try {
             const res = applyMarks(list, marks as LedgerMark[], {
               sessionKey: key,
               hostDbPath,
-              sessionId: key, // transcript rows are keyed by session id == the host sessionId via ledger meta
-              viewTokens,
+              // B1: transcript rows are keyed by the HOST session UUID, never the session key.
+              sessionId: params.sessionId,
               tokenBudget: params.tokenBudget ?? 0,
-              turnCount: state ? state.committedKeys.length : 0,
+              // monotonic counter (lastCommittedSeq) — committedKeys is capped and stops advancing
+              turnCounter: state ? state.lastCommittedSeq : 0,
             });
             outList = res.messages;
-            appliedCount = res.applied.length;
-            appliedMarkIds = res.applied.map((m) => m.mark_id);
-            if (res.changed) {
+            marksInEffect = res.marksInEffect;
+            admittedIds = res.admitted.map((m) => m.mark_id);
+            pressure = res.tokensBefore > 0 && (params.tokenBudget ?? 0) > 0
+              ? res.tokensBefore / (params.tokenBudget as number)
+              : 0;
+            if (admittedIds.length > 0) {
               markMarksApplied(
                 key,
-                appliedMarkIds,
+                admittedIds,
                 state?.lastGenerationSeen ?? "",
                 res.tokensBefore,
                 res.tokensAfter
               );
+            }
+            if (res.changed || marksInEffect > 0) {
               log.info(
-                `astinus view: ${res.messages.length} msgs, ~${res.tokensAfter} tok (from ${res.tokensBefore}; ${appliedCount} marks applied)`
+                `astinus view: ${res.messages.length} msgs, ~${res.tokensAfter} tok (from ${res.tokensBefore}; ${marksInEffect} marks in effect, ${admittedIds.length} admitted; pressure=${pressure.toFixed(2)})`
               );
             } else if (res.skipped.length > 0) {
               debug(
@@ -2591,8 +2597,11 @@ function registerAstinusContextEngine(api: MoltbotPluginAPI): void {
             log.warn(`[astinus-engine] assemble: mark application failed: ${(e as Error).message}`);
           }
         }
-        const viewChanged = appliedCount > 0;
-        const finalEstimate = viewChanged ? astinusEstimateTokens(outList) : estimatedTokens;
+        // B2/B4: authority is "assembled" whenever ANY mark is in effect (admitted marks are
+        // re-applied every turn — they ARE the view); the estimate must then be host-shaped,
+        // because it is no longer backstopped by the host's precheck.
+        const authority = marksInEffect > 0 ? "assembled" : "preassembly_may_overflow";
+        const finalEstimate = marksInEffect > 0 ? estimateTokensHost(outList) : estimatedTokens;
         // v4.2 (Claude, verified in the host): under "preassembly_may_overflow" the host's
         // precheck takes the LARGER of the assembled view and the unwindowed transcript
         // (preemptive-compaction.ts:405, attempt-history.ts:660), so a pruned view can never
@@ -2604,7 +2613,7 @@ function registerAstinusContextEngine(api: MoltbotPluginAPI): void {
         return {
           messages: outList,
           estimatedTokens: finalEstimate,
-          promptAuthority: viewChanged ? "assembled" : "preassembly_may_overflow",
+          promptAuthority: authority as "assembled" | "preassembly_may_overflow",
         };
       },
       async compact(): Promise<{ ok: boolean; compacted: boolean; reason: string }> {
