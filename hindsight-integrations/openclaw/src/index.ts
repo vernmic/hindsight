@@ -2494,7 +2494,7 @@ function registerAstinusContextEngine(api: MoltbotPluginAPI): void {
       }): Promise<{
         messages: unknown[];
         estimatedTokens: number;
-        promptAuthority: "preassembly_may_overflow";
+        promptAuthority: "assembled" | "preassembly_may_overflow";
       }> {
         const list = Array.isArray(params.messages) ? params.messages : [];
         const estimatedTokens = astinusEstimateTokens(list);
@@ -2591,7 +2591,21 @@ function registerAstinusContextEngine(api: MoltbotPluginAPI): void {
             log.warn(`[astinus-engine] assemble: mark application failed: ${(e as Error).message}`);
           }
         }
-        return { messages: outList, estimatedTokens, promptAuthority: "preassembly_may_overflow" };
+        const viewChanged = appliedCount > 0;
+        const finalEstimate = viewChanged ? astinusEstimateTokens(outList) : estimatedTokens;
+        // v4.2 (Claude, verified in the host): under "preassembly_may_overflow" the host's
+        // precheck takes the LARGER of the assembled view and the unwindowed transcript
+        // (preemptive-compaction.ts:405, attempt-history.ts:660), so a pruned view can never
+        // lower the compaction decision. The moment marks actually apply, authority must be
+        // "assembled" — and the estimate must then be honest, because it is no longer
+        // backstopped. Compaction-boundary invariants are structural here: a summary message
+        // carries no transcript seq, so the identity join never marks it, and marks below the
+        // boundary match no in-view message and are skipped.
+        return {
+          messages: outList,
+          estimatedTokens: finalEstimate,
+          promptAuthority: viewChanged ? "assembled" : "preassembly_may_overflow",
+        };
       },
       async compact(): Promise<{ ok: boolean; compacted: boolean; reason: string }> {
         return {
