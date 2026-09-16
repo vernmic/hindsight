@@ -2589,9 +2589,12 @@ function registerAstinusContextEngine(api: MoltbotPluginAPI): void {
                 `astinus view: ${res.messages.length} msgs, ~${res.tokensAfter} tok (from ${res.tokensBefore}; ${marksInEffect} marks in effect, ${admittedIds.length} admitted; pressure=${pressure.toFixed(2)})`
               );
             } else if (res.skipped.length > 0) {
-              debug(
-                `[astinus-engine] assemble: ${res.skipped.length} mark(s) held - ${res.skipped[0]}`
-              );
+              const line = `[astinus-engine] assemble: ${res.skipped.length} mark(s) held - ${res.skipped[0]}`;
+              // Boundary case made visible (Claude's second pass): marks exist and are in
+              // effect, but none mapped to this pass's view (post-compaction, post-/new, or
+              // all inside the preserved tail) - info, not debug, so status.py can see it.
+              if (marksInEffect > 0) log.info(line + ` (${marksInEffect} in effect, none applied)`);
+              else debug(line);
             }
           } catch (e) {
             log.warn(`[astinus-engine] assemble: mark application failed: ${(e as Error).message}`);

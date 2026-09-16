@@ -59,7 +59,7 @@ export function estimateTokensHost(list: unknown[]): number {
     let chars = 0;
     const c = msg.content;
     if (typeof c === "string") {
-      chars += c.length;
+      chars += c.length / 4; // string content is text — /4 like every other text block
       blocks += 1;
     } else if (Array.isArray(c)) {
       for (const p of c as Array<Record<string, unknown>>) {
@@ -168,26 +168,27 @@ export type ApplyResult = {
 
 const lastAdmissionTurn = new Map<string, number>();
 
-/** Tool-call id of an assistant message's toolCall part, if any (B3: by role, not a phantom type). */
-function toolCallIdOf(m: unknown): string | null {
+/** All toolCall ids in an assistant message (P3: parallel calls defeat a single-id lookup). */
+function toolCallIdsOf(m: unknown): string[] {
   const msg = (m ?? {}) as Record<string, unknown>;
-  if (msg.role !== "assistant") return null;
+  if (msg.role !== "assistant") return [];
   const c = msg.content;
-  if (!Array.isArray(c)) return null;
+  if (!Array.isArray(c)) return [];
+  const ids: string[] = [];
   for (const p of c as Array<Record<string, unknown>>) {
     const id = (p?.id ?? p?.toolCallId) as unknown;
-    if ((p?.type === "toolCall" || p?.type === "tool_use") && typeof id === "string") return id;
+    if ((p?.type === "toolCall" || p?.type === "tool_use") && typeof id === "string") ids.push(id);
   }
-  return null;
+  return ids;
+}
+
+function toolResultCallIds(m: unknown): string[] {
+  const id = ((m ?? {}) as Record<string, unknown>).toolCallId as unknown;
+  return typeof id === "string" ? [id] : [];
 }
 
 function isToolResult(m: unknown): boolean {
   return ((m ?? {}) as Record<string, unknown>).role === "toolResult";
-}
-
-function toolResultCallId(m: unknown): string | null {
-  const id = ((m ?? {}) as Record<string, unknown>).toolCallId as unknown;
-  return typeof id === "string" ? id : null;
 }
 
 /** The index of the first message inside the preserved tail: the last PRESERVE_USER_TURNS user
@@ -272,28 +273,54 @@ export function applyMarks(
     }
     let start = idxs[0];
     let end = idxs[idxs.length - 1];
-    // B3: pairs travel together — extend across the toolCallId link, not adjacency.
-    if (isToolResult(list[start]) || isToolResult(list[end])) {
+    // B3/P1/P3: pairs travel together. Enter the block when EITHER boundary touches a tool
+    // message — a result OR a call (P1: a range ending on the call skips this block entirely,
+    // dropping the call and orphaning its result).
+    const startIsResult = isToolResult(list[start]);
+    const endIsResult = isToolResult(list[end]);
+    const endIsCall = toolCallIdsOf(list[end]).length > 0;
+    if (startIsResult || endIsResult || endIsCall) {
       const needIds = new Set<string>();
       for (let i = start; i <= end; i++) {
-        const cid = toolResultCallId(list[i]);
-        if (cid) needIds.add(cid);
+        for (const cid of toolResultCallIds(list[i])) needIds.add(cid);
+        for (const cid of toolCallIdsOf(list[i])) needIds.add(cid);
       }
+      // P3: consider EVERY call id in an assistant message — parallel tool calls mean the
+      // first id alone is not the link.
       while (start - 1 > floorIdx) {
-        const prevCall = toolCallIdOf(list[start - 1]);
-        if (prevCall && needIds.has(prevCall)) {
+        const prev = list[start - 1];
+        const linked = toolCallIdsOf(prev).some((id) => needIds.has(id));
+        if (linked) {
           start--;
-          const cid2 = toolResultCallId(list[start + 1]);
-          if (cid2) needIds.add(cid2);
-        } else if (isToolResult(list[start - 1]) && start - 1 >= tailFloor) {
-          start--;
+          for (const cid of toolResultCallIds(list[start + 1])) needIds.add(cid);
+          for (const cid of toolCallIdsOf(list[start])) needIds.add(cid);
+        } else if (isToolResult(prev) && start - 1 < tailFloor) {
+          start--; // absorb an immediately preceding result so it is not orphaned
         } else break;
       }
-      while (end + 1 < list.length && end + 1 < tailFloor + PRESERVE_USER_TURNS * 2) {
-        const nextCall = toolCallIdOf(list[end + 1]);
-        const nextCid = toolResultCallId(list[end + 1]);
-        if ((nextCall && needIds.has(nextCall)) || nextCid) end++;
-        else break;
+      // P2: forward extension NEVER crosses tailFloor — pruning inside the preserved tail is
+      // worse than leaving a mark unapplied.
+      while (end + 1 < list.length && end + 1 < tailFloor) {
+        const next = list[end + 1];
+        const linked = toolCallIdsOf(next).some((id) => needIds.has(id));
+        if (linked) {
+          end++;
+          for (const cid of toolResultCallIds(list[end])) needIds.add(cid);
+        } else if (isToolResult(next)) {
+          end++; // an adjacent unlinked result would be orphaned — take it too
+        } else break;
+      }
+      // P2 guard: if completing any needed pair would enter the tail, leave BOTH messages.
+      let neededInTail = false;
+      for (let i = tailFloor; i < list.length && !neededInTail; i++) {
+        if (toolResultCallIds(list[i]).some((cid) => needIds.has(cid))) neededInTail = true;
+        else if (toolCallIdsOf(list[i]).some((cid) => needIds.has(cid))) neededInTail = true;
+      }
+      if (neededInTail) {
+        out.skipped.push(
+          `seq ${lo}-${hi}: completing the tool pair would enter the preserved tail; left both messages`
+        );
+        continue;
       }
     }
     if (mark.action === "drop") {
@@ -321,10 +348,16 @@ export function applyMarks(
         if (!msg || !isToolResult(msg)) continue;
         const c = msg.content;
         const text = typeof c === "string" ? c : JSON.stringify(c ?? "");
-        // M1: replace the ELEMENT — never mutate the host's message object in place.
+        // M1: replace the ELEMENT — never mutate the host's message object in place. The
+        // placeholder is a parts array, the same shape as the digest message.
         list[i] = {
           ...msg,
-          content: `[tool output pruned by Astinus (${text.length} chars); the call above retains its shape]`,
+          content: [
+            {
+              type: "text",
+              text: `[tool output pruned by Astinus (${text.length} chars); the call above retains its shape]`,
+            },
+          ],
         };
         placeholdered = true;
       }
