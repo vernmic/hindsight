@@ -3512,11 +3512,39 @@ export default function (api: MoltbotPluginAPI) {
               `astinus recall: thin-subject probe - "${s.subject}" (topic ${s.topic})`
             );
           }
-          const probes = thinSubjects
-            .slice(0, 3)
-            .map((s) =>
-              recallOnce({ via: "subject", query: s.subject }).catch(() => null)
-            );
+          // Probe order (ruling 2026-09-17): the PAIR (subject + predicate) is the
+          // highest-precision query - the current assertion disambiguates common-word
+          // subjects. Single-axis searches are FALLBACKS, tried only when the previous
+          // form returns nothing: subject alone (entity history), then predicate alone
+          // (behavioral precedent - the email's asymmetric case).
+          const probeSubject = async (
+            s: { topic: string; subject: string; predicate: string }
+          ): Promise<RecallResolution | null> => {
+            const forms: Array<{ q: string; kind: string }> = [
+              {
+                q: `${s.subject} ${s.predicate}`.slice(0, 140),
+                kind: `${s.subject} + predicate`,
+              },
+              { q: s.subject, kind: `subject only` },
+              { q: s.predicate, kind: `predicate only` },
+            ];
+            for (const f of forms) {
+              if (!f.q.trim()) continue;
+              try {
+                const res = await recallOnce({ via: "subject", query: f.q });
+                if (res.response.results && res.response.results.length > 0) {
+                  debug(
+                    `[Hindsight] thin-subject probe "${s.subject}" hit on ${f.kind}`
+                  );
+                  return res;
+                }
+              } catch {
+                /* try the next form */
+              }
+            }
+            return null;
+          };
+          const probes = thinSubjects.slice(0, 3).map(probeSubject);
           const unfiltered = await recallOnce({ via: "unfiltered" });
           const [filtered, ...subjectResults] = await Promise.all([
             recallOnce({
