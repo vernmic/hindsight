@@ -20,6 +20,7 @@ import {
   readLiveTopics,
   readMarksCached,
   readMaxTurnSeq,
+  readTopicDelta,
   readTopicsForRanges,
   writeFallbackTopics,
 } from "./session-ledger.js";
@@ -4181,6 +4182,9 @@ ${memoriesFormatted}
     const astinusActiveSpawns = new Map<number, number>(); // childPid -> startMs
     const ASTINUS_DEBOUNCE_MS = 90_000;
     const ASTINUS_SPAWN_CAP = 6;
+// Plan v4.2 SS9.2: the enrich delta rule's lookback - a topic counts as novel
+// when the newest classified turn introduces one unseen in the last K turns.
+const ASTINUS_DELTA_TURNS = 8;
     const ASTINUS_SPAWN_GC_MS = 120_000;
 
     // ============================================================
@@ -4592,6 +4596,26 @@ ${memoriesFormatted}
         if (astinusActiveSpawns.size >= ASTINUS_SPAWN_CAP) return;
         const enrichScript = `${WORKSPACE_ROOT}\\workspace\\skills\\astinus\\enrich.py`;
         if (!existsSync(enrichScript)) return;
+        // DELTA RULE (plan v4.2 SS9.2): enrich fires on topic NOVELTY, not the
+        // clock alone. The ledger's newest classified turn vs the previous K:
+        // skip when every topic is already seen AND the top topic is unchanged.
+        // A skipped check does NOT consume the debounce window (last-spawn is
+        // only stamped on a real spawn). No ledger / no classified turns yet ->
+        // fire, exactly as before (young sessions still get their first enrich).
+        const delta = readTopicDelta(sessionKey, ASTINUS_DELTA_TURNS);
+        if (delta && delta.newest.length > 0) {
+          const novel = delta.newest.filter((t) => !delta.recent.includes(t));
+          const topChanged = delta.prevTop != null && delta.newest[0] !== delta.prevTop;
+          if (novel.length === 0 && !topChanged) {
+            debug(
+              `[Hindsight customizations] enrich skipped: no topic delta (top=${delta.newest[0]}, ${delta.recent.length} recent)`
+            );
+            return;
+          }
+          log.info(
+            `astinus enrich: delta fire (novel: ${novel.join(", ") || "none"}; top ${delta.newest[0]})`
+          );
+        }
         astinusLastSpawnBySession.set(sessionKey, now);
         // Build the JSON payload enrich.py reads on stdin (topics + last turn text).
         let astinusPayload = "{}";
@@ -4630,6 +4654,13 @@ ${memoriesFormatted}
                 (lastUser.toLowerCase().match(/[a-z0-9][a-z0-9_.-]{3,}/g) || []).filter((w: string) => !stop.has(w))
               )
             ).slice(0, 5);
+          }
+          // Ledger-first topics (plan SS9.2): when the delta read classified
+          // topics, they lead the payload (labels = slugs dashed back to words);
+          // the regex topics follow, deduped, capped.
+          if (delta && delta.newest.length > 0) {
+            const ledgerTopics = delta.newest.map((s) => s.replace(/-/g, " "));
+            topics = Array.from(new Set([...ledgerTopics, ...topics])).slice(0, 6);
           }
           astinusPayload = JSON.stringify({
             topics,

@@ -337,6 +337,47 @@ export function readLiveTopics(sessionKey: string, limit: number): string[] {
   }
 }
 
+/** Plan SS9.2 delta rule: the newest CLASSIFIED turn's topics vs the k turns
+ *  before it. prevTop = the immediately previous classified turn's top topic
+ *  (highest last_seen_seq first within each turn). null = no ledger or no
+ *  classified turns yet - the caller fires as before (young session / cold
+ *  handle; the regex classification still governs the query there). */
+export function readTopicDelta(
+  sessionKey: string,
+  k: number
+): { newest: string[]; prevTop: string | null; recent: string[] } | null {
+  const db = cache.get(sessionKey);
+  if (!db || k < 1) return null;
+  try {
+    const turnRows = db
+      .prepare(
+        `SELECT turn_id FROM turns
+         WHERE turn_id IN (SELECT DISTINCT turn_id FROM turn_topics)
+         ORDER BY turn_id DESC LIMIT ?`
+      )
+      .all(k + 1) as Array<{ turn_id: number }>;
+    if (turnRows.length === 0) return null;
+    const slugsOf = db.prepare(
+      `SELECT top.slug FROM turn_topics tt
+       JOIN topics top ON top.topic_id = tt.topic_id
+       WHERE tt.turn_id = ? ORDER BY top.last_seen_seq DESC`
+    );
+    const slugList = (turnId: number): string[] =>
+      (slugsOf.all(turnId) as Array<{ slug: string }>)
+        .map((r) => (typeof r.slug === "string" ? r.slug : ""))
+        .filter((s) => s.length > 0);
+    const newest = slugList(Number(turnRows[0].turn_id));
+    const prevTop = turnRows.length > 1 ? slugList(Number(turnRows[1].turn_id))[0] ?? null : null;
+    const recentSet = new Set<string>();
+    for (let i = 1; i < turnRows.length; i++) {
+      for (const s of slugList(Number(turnRows[i].turn_id))) recentSet.add(s);
+    }
+    return { newest, prevTop, recent: [...recentSet] };
+  } catch {
+    return null;
+  }
+}
+
 export type TurnInsert = {
   sessionKey: string;
   agentId: string;
