@@ -3531,12 +3531,14 @@ export default function (api: MoltbotPluginAPI) {
             subject: string;
             object: string;
           }): Promise<RecallResolution | null> => {
-            const forms: Array<{ q: string; kind: string }> = [
-              { q: `${s.subject} ${s.object}`.slice(0, 140), kind: "pair" },
-              { q: s.subject, kind: "subject only" },
-            ];
-            if (s.object.trim().split(/\s+/).length >= 4) {
-              forms.push({ q: s.object, kind: "object only" });
+            const obj = s.object.trim();
+            const forms: Array<{ q: string; kind: string }> = [];
+            // F2 (fold review 2026-09-17): the object is optional - without one the pair
+            // form would be the subject-only query twice, so it is skipped.
+            if (obj) forms.push({ q: `${s.subject} ${obj}`.slice(0, 140), kind: "pair" });
+            forms.push({ q: s.subject, kind: "subject only" });
+            if (obj.split(/\s+/).length >= 4) {
+              forms.push({ q: obj, kind: "object only" });
             }
             for (const f of forms) {
               if (!f.q.trim()) continue;
@@ -3554,12 +3556,16 @@ export default function (api: MoltbotPluginAPI) {
           };
           // M1: ONE deadline for the whole lane - a slow server must not make the
           // prompt wait; late probes are dropped and the substance lanes carry on.
+          let laneTimer: ReturnType<typeof setTimeout> | undefined;
           const probeLane = Promise.race([
             Promise.all(pickedProbes.map(probeSubject)),
-            new Promise<Array<RecallResolution | null>>((resolve) =>
-              setTimeout(() => resolve([]), recallTimeoutMs)
-            ),
-          ]);
+            new Promise<Array<RecallResolution | null>>((resolve) => {
+              laneTimer = setTimeout(() => resolve([]), recallTimeoutMs);
+            }),
+          ]).finally(() => {
+            // m7 (fold review): never leave a dangling 20 s timer behind the lane.
+            if (laneTimer) clearTimeout(laneTimer);
+          });
           const unfiltered = await recallOnce({ via: "unfiltered" });
           const filtered = await recallOnce({
             via: "topic",
@@ -3597,12 +3603,19 @@ export default function (api: MoltbotPluginAPI) {
             const id = (r as { id?: string }).id;
             if (id) seenIds.add(id);
           }
-          const finalResults = [...(merged.response.results ?? [])];
-          for (const r of subjectCapped) {
+          const bridgeHits = subjectCapped.filter((r) => {
             const id = (r as { id?: string }).id;
-            if (id && seenIds.has(id)) continue;
-            if (id) seenIds.add(id);
-            finalResults.push(r);
+            return !(id && seenIds.has(id));
+          });
+          const mergedList = merged.response.results ?? [];
+          // F1 (fold review 2026-09-17): downstream slices to recallTopK, so appending
+          // bridge hits last meant they were cut on EVERY turn. Reserve their slots
+          // instead - the injected set stays recallTopK total, 3-4 substance + 1-2 bridge.
+          const topK = pluginConfig.recallTopK ?? 0;
+          let finalResults: RecallResponse["results"] = mergedList;
+          if (bridgeHits.length > 0 && topK > 0) {
+            const keep = Math.max(3, topK - bridgeHits.length);
+            finalResults = [...mergedList.slice(0, keep), ...bridgeHits];
           }
           return { response: { ...merged.response, results: finalResults }, via: merged.via };
         };
