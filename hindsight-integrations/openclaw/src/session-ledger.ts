@@ -273,7 +273,11 @@ export function writeFallbackTopics(
   if (!db) return written;
   try {
     const findTurns = db.prepare(
-      `SELECT turn_id, seq_start, seq_end FROM turns WHERE seq_start <= ? AND seq_end >= ?`
+      `SELECT turn_id, seq_start, seq_end, committed_at FROM turns
+       WHERE seq_start <= ? AND seq_end >= ?`
+    );
+    const passRunning = db.prepare(
+      `SELECT 1 AS x FROM passes WHERE turn_id = ? AND finished_at IS NULL LIMIT 1`
     );
     const hasRow = db.prepare(`SELECT 1 AS x FROM turn_topics WHERE turn_id = ? LIMIT 1`);
     const ensureTopic = db.prepare(
@@ -300,9 +304,16 @@ export function writeFallbackTopics(
           turn_id: number;
           seq_start: number;
           seq_end: number;
+          committed_at: number;
         }>;
         for (const t of turns) {
           if (hasRow.get(t.turn_id)) continue; // the pass already classified this turn
+          // B1.ii (review 2026-09-17): never race the in-flight pass. A turn committed
+          // under 180 s ago has not had its chance (the pass takes 3-78 s); a turn with
+          // a running passes row is mid-classification. Stamping either would make
+          // regex rows the steady state on every drain.
+          if (Number(t.committed_at) > now - 180000) continue;
+          if (passRunning.get(t.turn_id)) continue;
           ensureTopic.run(slug, String(label), Number(t.seq_start), Number(t.seq_end), now);
           const id = topicIdOf.get(slug) as { topic_id: number } | undefined;
           if (!id) continue;
@@ -326,7 +337,11 @@ export function readLiveTopics(sessionKey: string, limit: number): string[] {
   try {
     const rows = db
       .prepare(
-        `SELECT slug FROM topics WHERE terminal_at IS NULL ORDER BY last_seen_seq DESC LIMIT ?`
+        `SELECT slug FROM topics
+         WHERE terminal_at IS NULL
+           AND EXISTS (SELECT 1 FROM turn_topics tt
+                       WHERE tt.topic_id = topics.topic_id AND tt.source = 'model')
+         ORDER BY last_seen_seq DESC LIMIT ?`
       )
       .all(Math.floor(limit)) as Array<{ slug: string }>;
     return rows
@@ -352,7 +367,7 @@ export function readTopicDelta(
     const turnRows = db
       .prepare(
         `SELECT turn_id FROM turns
-         WHERE turn_id IN (SELECT DISTINCT turn_id FROM turn_topics)
+         WHERE turn_id IN (SELECT DISTINCT turn_id FROM turn_topics WHERE source = 'model')
          ORDER BY turn_id DESC LIMIT ?`
       )
       .all(k + 1) as Array<{ turn_id: number }>;
@@ -360,7 +375,8 @@ export function readTopicDelta(
     const slugsOf = db.prepare(
       `SELECT top.slug FROM turn_topics tt
        JOIN topics top ON top.topic_id = tt.topic_id
-       WHERE tt.turn_id = ? ORDER BY top.last_seen_seq DESC`
+       WHERE tt.turn_id = ? AND tt.source = 'model'
+       ORDER BY top.last_seen_seq DESC, tt.confidence DESC, top.slug`
     );
     const slugList = (turnId: number): string[] =>
       (slugsOf.all(turnId) as Array<{ slug: string }>)
@@ -421,7 +437,18 @@ export function readThinTopicSubjects(
          FROM topics t
          JOIN topic_subjects s ON s.topic_id = t.topic_id
          WHERE t.terminal_at IS NULL
-           AND (SELECT COUNT(*) FROM turn_topics tt WHERE tt.topic_id = t.topic_id) < ?
+           AND (SELECT COUNT(*) FROM turn_topics tt
+                WHERE tt.topic_id = t.topic_id AND tt.source = 'model') < ?
+           AND EXISTS (
+             SELECT 1 FROM turn_topics tt3
+             WHERE tt3.topic_id = t.topic_id AND tt3.source = 'model'
+               AND tt3.turn_id >= (
+                 SELECT MIN(turn_id) FROM (
+                   SELECT turn_id FROM turn_topics WHERE source = 'model'
+                   GROUP BY turn_id ORDER BY turn_id DESC LIMIT 20
+                 )
+               )
+           )
          ORDER BY t.last_seen_seq DESC, s.updated_at DESC LIMIT ?`
       )
       .all(thinTurnMax, maxRows) as Array<{
