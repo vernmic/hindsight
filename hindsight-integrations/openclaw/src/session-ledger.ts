@@ -316,6 +316,27 @@ export function writeFallbackTopics(
   }
 }
 
+/** The session's LIVE topics (plan SS9.1): newest first by last_seen_seq, terminal
+ *  topics excluded. Read-only from the in-process handle; empty when no ledger
+ *  or no topics yet (young session, cold handle after a restart) - callers fall
+ *  back to the regex classifier. */
+export function readLiveTopics(sessionKey: string, limit: number): string[] {
+  const db = cache.get(sessionKey);
+  if (!db || limit <= 0) return [];
+  try {
+    const rows = db
+      .prepare(
+        `SELECT slug FROM topics WHERE terminal_at IS NULL ORDER BY last_seen_seq DESC LIMIT ?`
+      )
+      .all(Math.floor(limit)) as Array<{ slug: string }>;
+    return rows
+      .map((r) => (typeof r.slug === "string" ? r.slug : ""))
+      .filter((s) => s.length > 0);
+  } catch {
+    return [];
+  }
+}
+
 export type TurnInsert = {
   sessionKey: string;
   agentId: string;

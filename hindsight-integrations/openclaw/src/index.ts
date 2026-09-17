@@ -17,6 +17,7 @@ import {
   configureSessionLedger,
   insertCommittedTurn,
   markMarksApplied,
+  readLiveTopics,
   readMarksCached,
   readMaxTurnSeq,
   readTopicsForRanges,
@@ -3418,6 +3419,23 @@ export default function (api: MoltbotPluginAPI) {
         const recallTopicTags = (() => {
           if (pluginConfig.recallTopicFilter !== true) return [] as string[];
           try {
+            // Plan SS9.1 (ledger-first): the LIVE topics of THIS session drive the
+            // topic tags - the pass's classifications, newest first, terminal
+            // topics excluded. The query itself stays substance-first
+            // (composeRecallQuery above); the tags ride the Gate 1 merge-not-filter
+            // path (unfiltered primary + topic secondary, merged by id - never a
+            // hard filter). No ledger / no topics yet (young session, cold handle
+            // after a restart) -> the regex classification, exactly as before.
+            const ledgerKey = (resolvedCtxForRecall as any)?.sessionKey;
+            if (typeof ledgerKey === "string" && ledgerKey) {
+              const slugs = readLiveTopics(ledgerKey, 2);
+              if (slugs.length > 0) {
+                debug(
+                  `[Hindsight] recall topic tags from ledger: ${slugs.join(", ")}`
+                );
+                return slugs.map((s) => `topic:${s}`);
+              }
+            }
             return topicTags(classifyTurn(prompt).topics);
           } catch {
             return [] as string[];
