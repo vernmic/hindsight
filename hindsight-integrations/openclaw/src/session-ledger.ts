@@ -417,11 +417,11 @@ export function readThinTopicSubjects(
   try {
     const rows = db
       .prepare(
-        `SELECT t.slug AS topic, s.subject AS subject, s.predicate AS predicate,
-                (SELECT COUNT(*) FROM turn_topics tt WHERE tt.topic_id = t.topic_id) AS n_turns
+        `SELECT t.slug AS topic, s.subject AS subject, s.predicate AS predicate
          FROM topics t
          JOIN topic_subjects s ON s.topic_id = t.topic_id
-         WHERE t.terminal_at IS NULL AND n_turns < ?
+         WHERE t.terminal_at IS NULL
+           AND (SELECT COUNT(*) FROM turn_topics tt WHERE tt.topic_id = t.topic_id) < ?
          ORDER BY t.last_seen_seq DESC, s.updated_at DESC LIMIT ?`
       )
       .all(thinTurnMax, maxRows) as Array<{
