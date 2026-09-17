@@ -20,6 +20,7 @@ import {
   readLiveTopics,
   readMarksCached,
   readMaxTurnSeq,
+  readThinTopicSubjects,
   readTopicDelta,
   readTopicSubjects,
   readTopicsForRanges,
@@ -3445,14 +3446,15 @@ export default function (api: MoltbotPluginAPI) {
         })();
         const recallTimeoutMs = pluginConfig.recallTimeoutMs ?? DEFAULT_RECALL_TIMEOUT_MS;
         const recallOnce = (opts: {
-          via: "topic" | "unfiltered";
+          via: "topic" | "unfiltered" | "subject";
           tags?: string[];
           tagsMatch?: "any" | "all" | "any_strict" | "all_strict" | "exact";
+          query?: string;
         }): Promise<RecallResolution> =>
           client
             .recall(
               {
-                query: prompt,
+                query: opts.query ?? prompt,
                 maxTokens: pluginConfig.recallMaxTokens || 1024,
                 budget: pluginConfig.recallBudget,
                 types: pluginConfig.recallTypes,
@@ -3495,19 +3497,63 @@ export default function (api: MoltbotPluginAPI) {
           if (recallTopicTags.length === 0) {
             return recallOnce({ via: "unfiltered" });
           }
+          // THIN-SUBJECT PROBE (ruling 2026-09-17): a NEW topic with little retained
+          // content under it may still have subjects whose history lives in the shared
+          // bank - all desks retain to the same bank, so searching a thin topic's
+          // subjects directly surfaces other desks' material about them. Additive lane:
+          // merged by id, never replaces the substance results. Capped at 3 probes.
+          const probeKey = (resolvedCtxForRecall as any)?.sessionKey;
+          const thinSubjects =
+            typeof probeKey === "string" && probeKey
+              ? readThinTopicSubjects(probeKey, 3, 4)
+              : [];
+          for (const s of thinSubjects.slice(0, 3)) {
+            log.info(
+              `astinus recall: thin-subject probe - "${s.subject}" (topic ${s.topic})`
+            );
+          }
+          const probes = thinSubjects
+            .slice(0, 3)
+            .map((s) =>
+              recallOnce({ via: "subject", query: s.subject }).catch(() => null)
+            );
           const unfiltered = await recallOnce({ via: "unfiltered" });
-          const filtered = await recallOnce({
-            via: "topic",
-            tags: recallTopicTags,
-            tagsMatch: "any",
-          });
-          if (!filtered.response.results || filtered.response.results.length === 0) {
+          const [filtered, ...subjectResults] = await Promise.all([
+            recallOnce({
+              via: "topic",
+              tags: recallTopicTags,
+              tagsMatch: "any",
+            }),
+            ...probes,
+          ]);
+          // Fold the subject hits into the secondary (promoted) side, deduped by id.
+          const secondaryResults: RecallResponse["results"] = [
+            ...(filtered.response.results ?? []),
+          ];
+          const seenSecondary = new Set<string>();
+          for (const r of secondaryResults) {
+            const id = (r as { id?: string }).id;
+            if (id) seenSecondary.add(id);
+          }
+          for (const res of subjectResults) {
+            if (!res) continue;
+            for (const r of res.response.results ?? []) {
+              const id = (r as { id?: string }).id;
+              if (id && seenSecondary.has(id)) continue;
+              if (id) seenSecondary.add(id);
+              secondaryResults.push(r);
+            }
+          }
+          if (secondaryResults.length === 0) {
             debug(
               `[Hindsight] topic-filtered recall returned 0 results (${recallTopicTags.join(", ")}) - using unfiltered results`
             );
             return unfiltered;
           }
-          return mergeRecall(unfiltered, filtered);
+          return mergeRecall(unfiltered, {
+            response: { ...filtered.response, results: secondaryResults },
+            via: "topic+unfiltered",
+          });
         };
 
         // Recall with deduplication: reuse in-flight request for same bank

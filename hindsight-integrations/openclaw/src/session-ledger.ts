@@ -403,6 +403,41 @@ export function readTopicSubjects(sessionKey: string, maxRows: number): TopicSub
   }
 }
 
+/** Subjects of NEW topics that are thin of content (ruling 2026-09-17): live topics
+ *  with fewer than `thinTurnMax` classified turns. Their subjects may carry history in
+ *  the shared bank from other desks - the recall thin-subject probe searches those
+ *  directly. Empty when no ledger / table not yet created. */
+export function readThinTopicSubjects(
+  sessionKey: string,
+  thinTurnMax: number,
+  maxRows: number
+): Array<{ topic: string; subject: string; predicate: string }> {
+  const db = cache.get(sessionKey);
+  if (!db || thinTurnMax < 1 || maxRows <= 0) return [];
+  try {
+    const rows = db
+      .prepare(
+        `SELECT t.slug AS topic, s.subject AS subject, s.predicate AS predicate,
+                (SELECT COUNT(*) FROM turn_topics tt WHERE tt.topic_id = t.topic_id) AS n_turns
+         FROM topics t
+         JOIN topic_subjects s ON s.topic_id = t.topic_id
+         WHERE t.terminal_at IS NULL AND n_turns < ?
+         ORDER BY t.last_seen_seq DESC, s.updated_at DESC LIMIT ?`
+      )
+      .all(thinTurnMax, maxRows) as Array<{
+      topic: string;
+      subject: string;
+      predicate: string;
+      n_turns: number;
+    }>;
+    return rows
+      .filter((r) => r.subject && typeof r.predicate === "string")
+      .map((r) => ({ topic: String(r.topic), subject: r.subject, predicate: r.predicate }));
+  } catch {
+    return [];
+  }
+}
+
 export type TurnInsert = {
   sessionKey: string;
   agentId: string;
