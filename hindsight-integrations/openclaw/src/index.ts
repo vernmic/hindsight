@@ -134,7 +134,7 @@ import type { RecallResponse } from "./types.js";
 // when the result came from a reused in-flight promise (plan v4 item 3).
 export type RecallResolution = {
   response: RecallResponse;
-  via: "topic" | "unfiltered" | "topic+unfiltered";
+  via: "topic" | "unfiltered" | "topic+unfiltered" | "subject";
 };
 const inflightRecalls = new Map<string, Promise<RecallResolution>>();
 
@@ -3501,41 +3501,49 @@ export default function (api: MoltbotPluginAPI) {
           // content under it may still have subjects whose history lives in the shared
           // bank - all desks retain to the same bank, so searching a thin topic's
           // subjects directly surfaces other desks' material about them. Additive lane:
-          // merged by id, never replaces the substance results. Capped at 3 probes.
+          // appended AFTER the prompt-driven lanes (M2), never replacing them.
           const probeKey = (resolvedCtxForRecall as any)?.sessionKey;
-          const thinSubjects =
+          const thinRows =
             typeof probeKey === "string" && probeKey
-              ? readThinTopicSubjects(probeKey, 3, 4)
+              ? readThinTopicSubjects(probeKey, 3, 6)
               : [];
-          for (const s of thinSubjects.slice(0, 3)) {
+          // M3: at most 2 topics x 2 subjects, newest first.
+          const pickedProbes: Array<{ topic: string; subject: string; predicate: string }> =
+            [];
+          const topicCounts = new Map<string, number>();
+          for (const r of thinRows) {
+            const n = topicCounts.get(r.topic) ?? 0;
+            if (n >= 2) continue;
+            if (n === 0 && topicCounts.size >= 2) continue;
+            topicCounts.set(r.topic, n + 1);
+            pickedProbes.push(r);
+          }
+          for (const s of pickedProbes) {
             log.info(
               `astinus recall: thin-subject probe - "${s.subject}" (topic ${s.topic})`
             );
           }
-          // Probe order (ruling 2026-09-17): the PAIR (subject + predicate) is the
-          // highest-precision query - the current assertion disambiguates common-word
-          // subjects. Single-axis searches are FALLBACKS, tried only when the previous
-          // form returns nothing: subject alone (entity history), then predicate alone
-          // (behavioral precedent - the email's asymmetric case).
-          const probeSubject = async (
-            s: { topic: string; subject: string; predicate: string }
-          ): Promise<RecallResolution | null> => {
+          // Probe order (ruling 2026-09-17): the PAIR first, then subject alone.
+          // M1: predicate-alone only when it carries content (>= 4 words) - a bare
+          // "queued" in a shared bank is a noise generator.
+          const probeSubject = async (s: {
+            topic: string;
+            subject: string;
+            predicate: string;
+          }): Promise<RecallResolution | null> => {
             const forms: Array<{ q: string; kind: string }> = [
-              {
-                q: `${s.subject} ${s.predicate}`.slice(0, 140),
-                kind: `${s.subject} + predicate`,
-              },
-              { q: s.subject, kind: `subject only` },
-              { q: s.predicate, kind: `predicate only` },
+              { q: `${s.subject} ${s.predicate}`.slice(0, 140), kind: "pair" },
+              { q: s.subject, kind: "subject only" },
             ];
+            if (s.predicate.trim().split(/\s+/).length >= 4) {
+              forms.push({ q: s.predicate, kind: "predicate only" });
+            }
             for (const f of forms) {
               if (!f.q.trim()) continue;
               try {
                 const res = await recallOnce({ via: "subject", query: f.q });
                 if (res.response.results && res.response.results.length > 0) {
-                  debug(
-                    `[Hindsight] thin-subject probe "${s.subject}" hit on ${f.kind}`
-                  );
+                  debug(`[Hindsight] thin-subject probe "${s.subject}" hit on ${f.kind}`);
                   return res;
                 }
               } catch {
@@ -3544,44 +3552,59 @@ export default function (api: MoltbotPluginAPI) {
             }
             return null;
           };
-          const probes = thinSubjects.slice(0, 3).map(probeSubject);
-          const unfiltered = await recallOnce({ via: "unfiltered" });
-          const [filtered, ...subjectResults] = await Promise.all([
-            recallOnce({
-              via: "topic",
-              tags: recallTopicTags,
-              tagsMatch: "any",
-            }),
-            ...probes,
+          // M1: ONE deadline for the whole lane - a slow server must not make the
+          // prompt wait; late probes are dropped and the substance lanes carry on.
+          const probeLane = Promise.race([
+            Promise.all(pickedProbes.map(probeSubject)),
+            new Promise<Array<RecallResolution | null>>((resolve) =>
+              setTimeout(() => resolve([]), recallTimeoutMs)
+            ),
           ]);
-          // Fold the subject hits into the secondary (promoted) side, deduped by id.
+          const unfiltered = await recallOnce({ via: "unfiltered" });
+          const filtered = await recallOnce({
+            via: "topic",
+            tags: recallTopicTags,
+            tagsMatch: "any",
+          });
+          const subjectResults = await probeLane;
+          // M2: subject hits ride BEHIND the prompt-driven lanes - one per probe,
+          // two total - so substance keeps the top slots with recallTopK=5.
+          const subjectHits: RecallResponse["results"] = [];
+          for (const res of subjectResults) {
+            if (!res) continue;
+            const first = (res.response.results ?? [])[0];
+            if (first) subjectHits.push(first);
+          }
+          const subjectCapped = subjectHits.slice(0, 2);
           const secondaryResults: RecallResponse["results"] = [
             ...(filtered.response.results ?? []),
           ];
-          const seenSecondary = new Set<string>();
-          for (const r of secondaryResults) {
-            const id = (r as { id?: string }).id;
-            if (id) seenSecondary.add(id);
-          }
-          for (const res of subjectResults) {
-            if (!res) continue;
-            for (const r of res.response.results ?? []) {
-              const id = (r as { id?: string }).id;
-              if (id && seenSecondary.has(id)) continue;
-              if (id) seenSecondary.add(id);
-              secondaryResults.push(r);
-            }
-          }
-          if (secondaryResults.length === 0) {
+          if (secondaryResults.length === 0 && subjectCapped.length === 0) {
             debug(
               `[Hindsight] topic-filtered recall returned 0 results (${recallTopicTags.join(", ")}) - using unfiltered results`
             );
             return unfiltered;
           }
-          return mergeRecall(unfiltered, {
-            response: { ...filtered.response, results: secondaryResults },
-            via: "topic+unfiltered",
-          });
+          const merged =
+            secondaryResults.length > 0
+              ? mergeRecall(unfiltered, {
+                  response: { ...filtered.response, results: secondaryResults },
+                  via: "topic+unfiltered",
+                })
+              : unfiltered;
+          const seenIds = new Set<string>();
+          for (const r of merged.response.results ?? []) {
+            const id = (r as { id?: string }).id;
+            if (id) seenIds.add(id);
+          }
+          const finalResults = [...(merged.response.results ?? [])];
+          for (const r of subjectCapped) {
+            const id = (r as { id?: string }).id;
+            if (id && seenIds.has(id)) continue;
+            if (id) seenIds.add(id);
+            finalResults.push(r);
+          }
+          return { response: { ...merged.response, results: finalResults }, via: merged.via };
         };
 
         // Recall with deduplication: reuse in-flight request for same bank
