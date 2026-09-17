@@ -3508,7 +3508,7 @@ export default function (api: MoltbotPluginAPI) {
               ? readThinTopicSubjects(probeKey, 3, 6)
               : [];
           // M3: at most 2 topics x 2 subjects, newest first.
-          const pickedProbes: Array<{ topic: string; subject: string; predicate: string }> =
+          const pickedProbes: Array<{ topic: string; subject: string; object: string }> =
             [];
           const topicCounts = new Map<string, number>();
           for (const r of thinRows) {
@@ -3529,14 +3529,14 @@ export default function (api: MoltbotPluginAPI) {
           const probeSubject = async (s: {
             topic: string;
             subject: string;
-            predicate: string;
+            object: string;
           }): Promise<RecallResolution | null> => {
             const forms: Array<{ q: string; kind: string }> = [
-              { q: `${s.subject} ${s.predicate}`.slice(0, 140), kind: "pair" },
+              { q: `${s.subject} ${s.object}`.slice(0, 140), kind: "pair" },
               { q: s.subject, kind: "subject only" },
             ];
-            if (s.predicate.trim().split(/\s+/).length >= 4) {
-              forms.push({ q: s.predicate, kind: "predicate only" });
+            if (s.object.trim().split(/\s+/).length >= 4) {
+              forms.push({ q: s.object, kind: "object only" });
             }
             for (const f of forms) {
               if (!f.q.trim()) continue;
