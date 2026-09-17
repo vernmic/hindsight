@@ -2619,12 +2619,39 @@ function registerAstinusContextEngine(api: MoltbotPluginAPI): void {
           promptAuthority: authority as "assembled" | "preassembly_may_overflow",
         };
       },
-      async compact(): Promise<{ ok: boolean; compacted: boolean; reason: string }> {
-        return {
-          ok: true,
-          compacted: false,
-          reason: "astinus skeleton: compaction delegated to the runtime (ownsCompaction=false)",
-        };
+      // INCIDENT 2026-09-17 00:21 (main desk wedged at 1.31M tokens): with ownsCompaction=false the
+      // host STILL calls the active engine's compact() for /compact and provider overflow
+      // recovery (docs/concepts/context-engine.md "ownsCompaction: false or unset"). Returning
+      // "compacted: false" here made every overflow recovery on a served desk fail
+      // ("auto-compaction failed for ...: astinus skeleton: compaction delegated to the
+      // runtime"), so the session could never shrink and cycled through provider errors. The
+      // documented implementation for a non-owning engine is to hand the request to the
+      // runtime's built-in compaction via delegateCompactionToRuntime (plugin-sdk/core, line
+      // 382 of that doc) - the same bridge the legacy engine uses. Loaded lazily so a resolver
+      // failure degrades to a logged refusal instead of breaking plugin load.
+      async compact(params: unknown): Promise<unknown> {
+        try {
+          const sdkSpecifier = "openclaw/plugin-sdk/core";
+          const sdk = (await import(sdkSpecifier)) as {
+            delegateCompactionToRuntime?: (p: unknown) => Promise<unknown>;
+          };
+          if (typeof sdk.delegateCompactionToRuntime !== "function") {
+            throw new Error("delegateCompactionToRuntime not exported by openclaw/plugin-sdk/core");
+          }
+          const result = await sdk.delegateCompactionToRuntime(params);
+          log.info("[astinus-engine] compact: delegated to the runtime's built-in compaction");
+          return result;
+        } catch (e) {
+          log.warn(
+            `[astinus-engine] compact: runtime delegation failed (${(e as Error)?.message ?? e}); ` +
+              "returning compacted=false - the host will report auto-compaction failed"
+          );
+          return {
+            ok: false,
+            compacted: false,
+            reason: `astinus: runtime compaction delegation failed: ${(e as Error)?.message ?? e}`,
+          };
+        }
       },
       // Durable-turn commit (Gate 2 decision): ONE atomic, idempotent write keyed
       // by advancementKey. Persists the turn's statement<->topic mapping into the
