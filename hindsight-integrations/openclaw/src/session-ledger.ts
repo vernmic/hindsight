@@ -221,6 +221,101 @@ export function markMarksApplied(
   }
 }
 
+/** Union of ledger topic slugs over the given seq ranges, plus which ranges had no
+ *  turn_topics rows (plan SS9.3: the retain path tags from the LEDGER, not
+ *  classifyTurn(prompt)). Read-only from the in-process handle - after a gateway
+ *  restart the first drain may read nothing until the session commits again (the
+ *  commit path re-opens the handle); that drain falls back to the regex tags.
+ *  Any failure reads as "all uncovered", which degrades to today's behaviour. */
+export function readTopicsForRanges(
+  sessionKey: string,
+  ranges: Array<{ start: number; end: number }>
+): { slugs: string[]; uncovered: Array<{ start: number; end: number }> } {
+  const db = cache.get(sessionKey);
+  if (!db || ranges.length === 0) return { slugs: [], uncovered: ranges.slice() };
+  try {
+    // A turn [seq_start, seq_end] covers a range [start, end] iff they overlap.
+    const st = db.prepare(
+      `SELECT DISTINCT top.slug FROM turns t
+       JOIN turn_topics tt ON tt.turn_id = t.turn_id
+       JOIN topics top ON top.topic_id = tt.topic_id
+       WHERE t.seq_start <= ? AND t.seq_end >= ?`
+    );
+    const slugs = new Set<string>();
+    const uncovered: Array<{ start: number; end: number }> = [];
+    for (const r of ranges) {
+      const rows = st.all(r.end, r.start) as Array<{ slug: string }>;
+      if (rows.length === 0) uncovered.push(r);
+      for (const row of rows) {
+        if (typeof row.slug === "string" && row.slug) slugs.add(row.slug);
+      }
+    }
+    return { slugs: [...slugs], uncovered };
+  } catch {
+    return { slugs: [], uncovered: ranges.slice() };
+  }
+}
+
+/** R6: write the regex classification back for turns the pass has not reached,
+ *  so the coverage gap is visible in Gate L's query (source='fallback'), never
+ *  silent. Only touches turns that have NO turn_topics rows yet; INSERT OR
+ *  IGNORE keeps it safe against the pass racing from its own process. The slug
+ *  regex mirrors topicTag() in index.ts and the pass's Python slugify - keep the
+ *  three in agreement or one topic splits into two rows. */
+export function writeFallbackTopics(
+  sessionKey: string,
+  ranges: Array<{ start: number; end: number }>,
+  labels: string[]
+): number {
+  let written = 0;
+  if (labels.length === 0) return written;
+  const db = cache.get(sessionKey);
+  if (!db) return written;
+  try {
+    const findTurns = db.prepare(
+      `SELECT turn_id, seq_start, seq_end FROM turns WHERE seq_start <= ? AND seq_end >= ?`
+    );
+    const hasRow = db.prepare(`SELECT 1 AS x FROM turn_topics WHERE turn_id = ? LIMIT 1`);
+    const ensureTopic = db.prepare(
+      `INSERT INTO topics (slug, label, first_seen_seq, last_seen_seq, last_seen_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(slug) DO UPDATE SET
+         last_seen_seq = MAX(last_seen_seq, excluded.last_seen_seq),
+         last_seen_at = excluded.last_seen_at`
+    );
+    const topicIdOf = db.prepare(`SELECT topic_id FROM topics WHERE slug = ?`);
+    const insertTT = db.prepare(
+      `INSERT OR IGNORE INTO turn_topics (turn_id, topic_id, class, confidence, source)
+       VALUES (?, ?, 'topic', NULL, 'fallback')`
+    );
+    const now = Date.now();
+    for (const label of labels) {
+      const slug = String(label)
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-+|-+$/g, "");
+      if (!slug) continue;
+      for (const r of ranges) {
+        const turns = findTurns.all(r.end, r.start) as Array<{
+          turn_id: number;
+          seq_start: number;
+          seq_end: number;
+        }>;
+        for (const t of turns) {
+          if (hasRow.get(t.turn_id)) continue; // the pass already classified this turn
+          ensureTopic.run(slug, String(label), Number(t.seq_start), Number(t.seq_end), now);
+          const id = topicIdOf.get(slug) as { topic_id: number } | undefined;
+          if (!id) continue;
+          written += Number(insertTT.run(t.turn_id, id.topic_id).changes);
+        }
+      }
+    }
+    return written;
+  } catch {
+    return written;
+  }
+}
+
 export type TurnInsert = {
   sessionKey: string;
   agentId: string;

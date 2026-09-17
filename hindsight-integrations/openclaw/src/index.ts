@@ -19,6 +19,8 @@ import {
   markMarksApplied,
   readMarksCached,
   readMaxTurnSeq,
+  readTopicsForRanges,
+  writeFallbackTopics,
 } from "./session-ledger.js";
 import { applyMarks, estimateTokensHost, type LedgerMark } from "./assemble-marks.js";
 import { compileSessionPatterns, matchesSessionPattern } from "./session-patterns.js";
@@ -3774,6 +3776,12 @@ ${memoriesFormatted}
           !!sessionStateForRetain &&
           (sessionStateForRetain.lastCommittedAt > 0 ||
             sessionStateForRetain.committedKeys.length > 0);
+        // Plan SS9.3 (retain tags from the ledger): the ranges being drained by
+        // THIS retain, and the tags derived from them. Null = no ledger ranges in
+        // this retain (legacy cadence / seq path) - the regex classification stays
+        // exactly as before.
+        let drainedLedgerRanges: Array<{ start: number; end: number }> | null = null;
+        let ledgerTopicTags: string[] | null = null;
 
         if (
           markerSessionKey &&
@@ -3802,6 +3810,7 @@ ${memoriesFormatted}
           }
           messagesToRetain = pendingMsgs;
           retainFullWindow = true;
+          drainedLedgerRanges = pendingRanges;
           markerAdvance = {
             sessionKey: markerSessionKey,
             seq: pendingEndSeq,
@@ -3985,6 +3994,24 @@ ${memoriesFormatted}
             ? await refreshQueueOperationIdCapability(retainGeneration, retainSignal)
             : asyncRetainOperationIdCapability;
         if (!retainLifecycleIsCurrent()) return;
+        // Ledger topics for the drained ranges (plan SS9.3). Computed HERE because
+        // getTurnClassification is defined below this point - calling it inside the
+        // drain branch would hit the temporal dead zone.
+        if (drainedLedgerRanges && markerSessionKey) {
+          const ledgerTopics = readTopicsForRanges(markerSessionKey, drainedLedgerRanges);
+          if (ledgerTopics.uncovered.length > 0) {
+            // R6: ranges the pass has not reached get the regex classification,
+            // written back as source='fallback' so Gate L sees the coverage gap.
+            const regexTopics = getTurnClassification().topics;
+            writeFallbackTopics(markerSessionKey, ledgerTopics.uncovered, regexTopics);
+            ledgerTopicTags = [
+              ...ledgerTopics.slugs.map((s) => `topic:${s}`),
+              ...topicTags(regexTopics),
+            ];
+          } else {
+            ledgerTopicTags = ledgerTopics.slugs.map((s) => `topic:${s}`);
+          }
+        }
         const retainNow = Date.now();
         const retainRequest = buildRetainRequest(
           transcript,
@@ -3997,7 +4024,10 @@ ${memoriesFormatted}
             windowTurns: retainFullWindow
               ? (pluginConfig.retainEveryNTurns ?? 1) + (pluginConfig.retainOverlapTurns ?? 0)
               : undefined,
-            tags: [...inlineRetainTags, ...topicTags(getTurnClassification().topics)],
+            tags: [
+              ...inlineRetainTags,
+              ...(ledgerTopicTags ?? topicTags(getTurnClassification().topics)),
+            ],
             appendSupported: supportsUpdateModeAppend,
             operationId: createAsyncRetainOperationId(),
           }
