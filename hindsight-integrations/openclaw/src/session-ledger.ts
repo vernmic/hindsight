@@ -378,6 +378,31 @@ export function readTopicDelta(
   }
 }
 
+/** Current-state subject/predicate roster for the session's LIVE topics (ruling
+ *  2026-09-17): instances ride WITH their topic instead of fragmenting it. The
+ *  table is pass-owned and may not exist yet on an older ledger - a missing
+ *  table reads as empty; fold it into SCHEMA at the next schema-version bump. */
+export type TopicSubject = { topic: string; subject: string; predicate: string };
+export function readTopicSubjects(sessionKey: string, maxRows: number): TopicSubject[] {
+  const db = cache.get(sessionKey);
+  if (!db || maxRows <= 0) return [];
+  try {
+    const rows = db
+      .prepare(
+        `SELECT t.slug AS topic, s.subject AS subject, s.predicate AS predicate
+         FROM topic_subjects s JOIN topics t ON t.topic_id = s.topic_id
+         WHERE t.terminal_at IS NULL
+         ORDER BY t.last_seen_seq DESC, s.updated_at DESC LIMIT ?`
+      )
+      .all(Math.floor(maxRows)) as Array<{ topic: string; subject: string; predicate: string }>;
+    return rows
+      .filter((r) => r.subject && typeof r.predicate === "string")
+      .map((r) => ({ topic: String(r.topic), subject: r.subject, predicate: r.predicate }));
+  } catch {
+    return [];
+  }
+}
+
 export type TurnInsert = {
   sessionKey: string;
   agentId: string;

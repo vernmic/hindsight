@@ -21,6 +21,7 @@ import {
   readMarksCached,
   readMaxTurnSeq,
   readTopicDelta,
+  readTopicSubjects,
   readTopicsForRanges,
   writeFallbackTopics,
 } from "./session-ledger.js";
@@ -4664,7 +4665,12 @@ const ASTINUS_DELTA_TURNS = 8;
           }
           astinusPayload = JSON.stringify({
             topics,
-            last_user_message: lastUser.slice(0, 800),
+            // Ruling 2026-09-17: instances ride WITH their topic - the live topics'
+          // subject/predicate roster travels the payload in parallel with recall,
+          // so instance specificity survives the topic zoom-out without
+          // polluting the topic vocabulary.
+          topic_subjects: readTopicSubjects(sessionKey, 12),
+          last_user_message: lastUser.slice(0, 800),
             conversation_summary: `${lastUser.slice(0, 300)}\n---\n${lastAssistant.slice(0, 500)}`.trim(),
             active_tasks: [],
             // PER-SESSION ENRICH (edit 1/3): carry the session identity so enrich.py
