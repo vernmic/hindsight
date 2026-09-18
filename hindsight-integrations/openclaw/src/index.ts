@@ -2419,11 +2419,13 @@ const ASTINUS_MARKS_INDEX_MAX_SESSIONS = 2000;
 // spawn reads the same entry for its pressure inputs (view_tokens / token_budget).
 const astinusLastAssemble = new Map<
   string,
-  { at: number; viewTokens: number; tokenBudget: number | null }
+  { at: number; viewTokens: number; tokenBudget: number | null; estimator: "host" | "plugin" }
 >();
 const ASTINUS_SERVING_WINDOW_MS = 10 * 60 * 1000;
 const ASTINUS_SKIP_LOG_INTERVAL_MS = 60 * 60 * 1000;
 const astinusRetainSkipLoggedAt = new Map<string, number>();
+// Q2 fix (Claude 09-18): serving is turn-relative, so the hook needs the previous agent_end time.
+const astinusLastAgentEnd = new Map<string, number>();
 
 function astinusMessageText(message: unknown): string {
   const content = (message as { content?: unknown } | null | undefined)?.content;
@@ -2633,15 +2635,15 @@ function registerAstinusContextEngine(api: MoltbotPluginAPI): void {
         if (key) {
           // Step 1a/b (2026-09-18): record this session's last assemble - the retain gate's
           // "serving now" signal and the pass payload's pressure inputs both read it.
-          astinusLastAssemble.set(key, {
+          // m1 (Claude 09-18): touch-on-write so a busy desk is not evicted FIFO by 2000
+          // one-shot sessions - delete first, then re-insert, so the cap behaves LRU here.
+          if (astinusLastAssemble.has(key)) astinusLastAssemble.delete(key);
+          setCappedMapValue(astinusLastAssemble, key, {
             at: Date.now(),
             viewTokens: finalEstimate,
             tokenBudget: typeof params.tokenBudget === "number" ? params.tokenBudget : null,
+            estimator: marksInEffect > 0 ? "host" : "plugin",
           });
-          if (astinusLastAssemble.size > ASTINUS_MARKS_INDEX_MAX_SESSIONS) {
-            const oldest = astinusLastAssemble.keys().next().value;
-            if (oldest !== undefined) astinusLastAssemble.delete(oldest);
-          }
         }
         return {
           messages: outList,
@@ -2812,6 +2814,8 @@ function registerAstinusContextEngine(api: MoltbotPluginAPI): void {
                 gen: generation ?? "",
                 view_tokens: lastAssemble?.viewTokens ?? null,
                 token_budget: lastAssemble?.tokenBudget ?? null,
+                // Claude Q4 (09-18): the pass must read the estimate against the right scale.
+                estimator: lastAssemble?.estimator ?? "plugin",
               });
               const passChild = spawn("python", [passScript], {
                 detached: true,
@@ -3930,17 +3934,28 @@ ${memoriesFormatted}
         // The engine "serves" a session once it has committed a durable turn.
         // While it serves, the legacy cadence must never run - it would re-retain
         // turns the commit-range path already covers (review 2026-09-13, Q1 major).
-        // Q3 fix (2026-09-18): serving = the engine ASSEMBLED this session in the last
-        // ASTINUS_SERVING_WINDOW_MS, not "committed at some point". A stale committed-turn flag
-        // (kill switch on, or a desk whose turns exceed the host's accepted-turn caps and so
-        // never reach commitTurn) must fall through to the legacy cadence instead of skipping.
+        // Q2 fix (Claude 09-18): serving is TURN-relative - an assemble happened after the
+        // previous agent_end for this session. A 10-minute clock expires during long tool turns
+        // (exec with 600s timeouts) and mis-read a serving engine as not-serving; the clock is
+        // now only the first-turn-after-restart fallback (no previous agent_end recorded).
         const lastAssembledAt = markerSessionKey
           ? astinusLastAssemble.get(markerSessionKey)?.at
           : undefined;
+        const prevAgentEndAt = markerSessionKey
+          ? astinusLastAgentEnd.get(markerSessionKey)
+          : undefined;
+        const assembledThisTurn =
+          typeof lastAssembledAt === "number" &&
+          (typeof prevAgentEndAt === "number"
+            ? lastAssembledAt > prevAgentEndAt
+            : Date.now() - lastAssembledAt < ASTINUS_SERVING_WINDOW_MS);
+        // Record THIS turn's end before any early return, so the next turn compares against it.
+        if (markerSessionKey) {
+          setCappedMapValue(astinusLastAgentEnd, markerSessionKey, Date.now());
+        }
         const engineServing =
           !!sessionStateForRetain &&
-          typeof lastAssembledAt === "number" &&
-          Date.now() - lastAssembledAt < ASTINUS_SERVING_WINDOW_MS &&
+          assembledThisTurn &&
           (sessionStateForRetain.lastCommittedAt > 0 ||
             sessionStateForRetain.committedKeys.length > 0);
         // Plan SS9.3 (retain tags from the ledger): the ranges being drained by
@@ -3960,6 +3975,11 @@ ${memoriesFormatted}
           // are the only precise source. Drain them on the same cadence and
           // advance only on a successful retain (slot-day change).
           const pendingRanges = sessionStateForRetain.pendingRetain;
+          if (!engineServing) {
+            // Q1 (Claude 09-18): the legacy counter froze while the engine served, so its next
+            // boundary could re-retain turns this drain is about to cover. Reset it for this key.
+            turnCountBySession.delete(`${bankId}:${effectiveCtx?.sessionKey || "session"}`);
+          }
           const pendingMsgs = pendingRanges.flatMap((r) => r.messages);
           if (pendingMsgs.length === 0) {
             // Nothing conversational in the pending ranges: clear them without
@@ -4006,10 +4026,15 @@ ${memoriesFormatted}
           const lastSkipLog = markerSessionKey
             ? astinusRetainSkipLoggedAt.get(markerSessionKey)
             : undefined;
-          const skipLine = `[Hindsight Hook] commit-range: engine serving, nothing committed-unretained - skipping retain`;
+          // Q3 (Claude 09-18): cap the map, and the line carries the numbers a reader needs.
+          const skipLine =
+            `[Hindsight Hook] commit-range: engine serving, nothing committed-unretained - skipping retain` +
+            ` (lastAssembledAt=${typeof lastAssembledAt === "number" ? `${Math.round((Date.now() - lastAssembledAt) / 1000)}s` : "n/a"}` +
+            ` pending=${sessionStateForRetain.pendingRetain.length}` +
+            ` lastCommittedSeq=${sessionStateForRetain.lastCommittedSeq})`;
           if (!lastSkipLog || Date.now() - lastSkipLog > ASTINUS_SKIP_LOG_INTERVAL_MS) {
             if (markerSessionKey) {
-              astinusRetainSkipLoggedAt.set(markerSessionKey, Date.now());
+              setCappedMapValue(astinusRetainSkipLoggedAt, markerSessionKey, Date.now());
             }
             log.info(skipLine);
           } else {
