@@ -2413,6 +2413,17 @@ const ASTINUS_MAPPING_MAX_SESSIONS = 2000;
  */
 const astinusMarksIndex = new Map<string, unknown[]>();
 const ASTINUS_MARKS_INDEX_MAX_SESSIONS = 2000;
+// Step 1 (2026-09-18, wedge response Q3 + design §6): the retain gate must ask "is the engine
+// serving this session RIGHT NOW", not "did it ever commit" (that reading starved t31 for five
+// days and main since noon 09-17). assemble() records its last run per session here; the pass
+// spawn reads the same entry for its pressure inputs (view_tokens / token_budget).
+const astinusLastAssemble = new Map<
+  string,
+  { at: number; viewTokens: number; tokenBudget: number | null }
+>();
+const ASTINUS_SERVING_WINDOW_MS = 10 * 60 * 1000;
+const ASTINUS_SKIP_LOG_INTERVAL_MS = 60 * 60 * 1000;
+const astinusRetainSkipLoggedAt = new Map<string, number>();
 
 function astinusMessageText(message: unknown): string {
   const content = (message as { content?: unknown } | null | undefined)?.content;
@@ -2619,6 +2630,19 @@ function registerAstinusContextEngine(api: MoltbotPluginAPI): void {
         // backstopped. Compaction-boundary invariants are structural here: a summary message
         // carries no transcript seq, so the identity join never marks it, and marks below the
         // boundary match no in-view message and are skipped.
+        if (key) {
+          // Step 1a/b (2026-09-18): record this session's last assemble - the retain gate's
+          // "serving now" signal and the pass payload's pressure inputs both read it.
+          astinusLastAssemble.set(key, {
+            at: Date.now(),
+            viewTokens: finalEstimate,
+            tokenBudget: typeof params.tokenBudget === "number" ? params.tokenBudget : null,
+          });
+          if (astinusLastAssemble.size > ASTINUS_MARKS_INDEX_MAX_SESSIONS) {
+            const oldest = astinusLastAssemble.keys().next().value;
+            if (oldest !== undefined) astinusLastAssemble.delete(oldest);
+          }
+        }
         return {
           messages: outList,
           estimatedTokens: finalEstimate,
@@ -2777,13 +2801,17 @@ function registerAstinusContextEngine(api: MoltbotPluginAPI): void {
           try {
             const passScript = `${WORKSPACE_ROOT}\\workspace\\skills\\astinus\\astinus_pass.py`;
             if (existsSync(passScript)) {
+              // Step 1b (2026-09-18): fill the pressure inputs the pass needs, from the last
+              // assemble for this session. Without them "pressure" in the pass prompt is always
+              // unknown and marks stay 0 - the smart path can never fire (design §6.1).
+              const lastAssemble = astinusLastAssemble.get(key);
               const passPayload = JSON.stringify({
                 session_key: key,
                 session_id: typeof params.sessionId === "string" ? params.sessionId : key,
                 range: [startSeq ?? 0, endSeq ?? 0],
                 gen: generation ?? "",
-                view_tokens: null,
-                token_budget: null,
+                view_tokens: lastAssemble?.viewTokens ?? null,
+                token_budget: lastAssemble?.tokenBudget ?? null,
               });
               const passChild = spawn("python", [passScript], {
                 detached: true,
@@ -3902,8 +3930,17 @@ ${memoriesFormatted}
         // The engine "serves" a session once it has committed a durable turn.
         // While it serves, the legacy cadence must never run - it would re-retain
         // turns the commit-range path already covers (review 2026-09-13, Q1 major).
+        // Q3 fix (2026-09-18): serving = the engine ASSEMBLED this session in the last
+        // ASTINUS_SERVING_WINDOW_MS, not "committed at some point". A stale committed-turn flag
+        // (kill switch on, or a desk whose turns exceed the host's accepted-turn caps and so
+        // never reach commitTurn) must fall through to the legacy cadence instead of skipping.
+        const lastAssembledAt = markerSessionKey
+          ? astinusLastAssemble.get(markerSessionKey)?.at
+          : undefined;
         const engineServing =
           !!sessionStateForRetain &&
+          typeof lastAssembledAt === "number" &&
+          Date.now() - lastAssembledAt < ASTINUS_SERVING_WINDOW_MS &&
           (sessionStateForRetain.lastCommittedAt > 0 ||
             sessionStateForRetain.committedKeys.length > 0);
         // Plan SS9.3 (retain tags from the ledger): the ranges being drained by
@@ -3932,7 +3969,11 @@ ${memoriesFormatted}
           }
           const pendingTurns = pendingMsgs.filter((m: any) => m?.role === "user").length;
           const pendingEndSeq = Math.max(...pendingRanges.map((r) => r.end));
-          if (!force && pendingTurns < retainEveryN) {
+          // Holding is only justified while the engine is still committing turns. With the
+          // engine not serving (kill switch, or a caps-blocked desk) these ranges are real,
+          // committed, un-retained conversation that nothing will ever re-offer - drain them
+          // now (Q3 fix, 2026-09-18), then the counter path resumes on the next turn.
+          if (!force && pendingTurns < retainEveryN && engineServing) {
             debug(
               `[Hindsight Hook] commit-range: ${pendingTurns}/${retainEveryN} un-retained turns - holding (${pendingMsgs.length} msgs, ${pendingRanges.length} ranges)`
             );
@@ -3960,9 +4001,20 @@ ${memoriesFormatted}
             `[Hindsight Hook] commit-range: draining ${pendingRanges.length} committed range(s)`
           );
         } else if (engineServing) {
-          debug(
-            `[Hindsight Hook] commit-range: engine serving, nothing committed-unretained - skipping retain`
-          );
+          // Q3 fix: info once per session per hour - this skip was debug-only and stayed
+          // silent while it starved two desks' bank writes for days (09-18 wedge response).
+          const lastSkipLog = markerSessionKey
+            ? astinusRetainSkipLoggedAt.get(markerSessionKey)
+            : undefined;
+          const skipLine = `[Hindsight Hook] commit-range: engine serving, nothing committed-unretained - skipping retain`;
+          if (!lastSkipLog || Date.now() - lastSkipLog > ASTINUS_SKIP_LOG_INTERVAL_MS) {
+            if (markerSessionKey) {
+              astinusRetainSkipLoggedAt.set(markerSessionKey, Date.now());
+            }
+            log.info(skipLine);
+          } else {
+            debug(skipLine);
+          }
           return;
         } else if (retainEveryN > 1) {
           const sessionTrackingKey = `${bankId}:${effectiveCtx?.sessionKey || "session"}`;
