@@ -342,7 +342,7 @@ type AstinusSessionState = {
    * retained. The retain path drains these (the agent_end payload never carries
    * seqs). Holds only conversational roles, capped at ASTINUS_MAX_PENDING_TURNS.
    */
-  pendingRetain: Array<{ start: number; end: number; messages: unknown[] }>;
+  pendingRetain: Array<{ start: number; end: number; messages: unknown[]; at?: number }>;
 };
 function retainMarkerDir(): string {
   return `${WORKSPACE_ROOT}\\workspace\\state\\astinus`;
@@ -456,7 +456,9 @@ function appendPendingRange(
   queue: AstinusSessionState["pendingRetain"],
   range: AstinusSessionState["pendingRetain"][number]
 ): AstinusSessionState["pendingRetain"] {
-  const next = [...queue, range];
+  // Caps-gap review item 2 (Claude, 2026-09-20): stamp each range so the age-based sweep can
+  // drain ranges the commit path will never re-offer.
+  const next = [...queue, { ...range, at: Date.now() }];
   if (next.length <= ASTINUS_MAX_PENDING_TURNS) return next;
   const dropped = next.length - ASTINUS_MAX_PENDING_TURNS;
   log.warn(
@@ -2423,6 +2425,10 @@ const astinusLastAssemble = new Map<
 >();
 const ASTINUS_SERVING_WINDOW_MS = 10 * 60 * 1000;
 const ASTINUS_SKIP_LOG_INTERVAL_MS = 60 * 60 * 1000;
+// Caps-gap review (Claude, 2026-09-20): item 1 - "serving" means committed RECENTLY, not once;
+// item 2 - a range older than two cadence windows drains regardless (the pressure-watch RED line).
+const ASTINUS_COMMIT_RECENCY_MS = 15 * 60 * 1000;
+const ASTINUS_STUCK_RANGE_MS = 2 * 60 * 60 * 1000;
 const astinusRetainSkipLoggedAt = new Map<string, number>();
 // Q2 fix (Claude 09-18): serving is turn-relative, so the hook needs the previous agent_end time.
 const astinusLastAgentEnd = new Map<string, number>();
@@ -3953,11 +3959,17 @@ ${memoriesFormatted}
         if (markerSessionKey) {
           setCappedMapValue(astinusLastAgentEnd, markerSessionKey, Date.now());
         }
-        const engineServing =
+        // Caps-gap review item 1 (Claude, 2026-09-20): recency, not history. The old second
+        // clause was an "ever committed once" flag - permanently true after a single commit - so a
+        // desk whose commits STOPPED (topic:31: zero commits in 2+ hours under constant traffic)
+        // kept holding its pending ranges forever. The engine serves only while it has committed
+        // inside the recency window; otherwise the legacy drain path gets the ranges.
+        const committedRecently =
           !!sessionStateForRetain &&
-          assembledThisTurn &&
-          (sessionStateForRetain.lastCommittedAt > 0 ||
-            sessionStateForRetain.committedKeys.length > 0);
+          sessionStateForRetain.lastCommittedAt > 0 &&
+          Date.now() - sessionStateForRetain.lastCommittedAt < ASTINUS_COMMIT_RECENCY_MS;
+        const engineServing =
+          !!sessionStateForRetain && assembledThisTurn && committedRecently;
         // Plan SS9.3 (retain tags from the ledger): the ranges being drained by
         // THIS retain, and the tags derived from them. Null = no ledger ranges in
         // this retain (legacy cadence / seq path) - the regex classification stays
@@ -3975,9 +3987,16 @@ ${memoriesFormatted}
           // are the only precise source. Drain them on the same cadence and
           // advance only on a successful retain (slot-day change).
           const pendingRanges = sessionStateForRetain.pendingRetain;
-          if (!engineServing) {
+          // Caps-gap review item 2 (Claude, 2026-09-20): the unfoolable backstop. A range older
+          // than ASTINUS_STUCK_RANGE_MS drains no matter what `engineServing` says; ranges written
+          // before this deploy carry no stamp and count as already stuck (they are).
+          const stuckPending = pendingRanges.some(
+            (r) => typeof r.at !== "number" || Date.now() - r.at > ASTINUS_STUCK_RANGE_MS
+          );
+          if (!engineServing || stuckPending) {
             // Q1 (Claude 09-18): the legacy counter froze while the engine served, so its next
-            // boundary could re-retain turns this drain is about to cover. Reset it for this key.
+            // boundary could re-retain turns this drain is about to cover. Reset it for this key -
+            // and likewise when an age-stuck range forces the drain under a nominally-serving engine.
             turnCountBySession.delete(`${bankId}:${effectiveCtx?.sessionKey || "session"}`);
           }
           const pendingMsgs = pendingRanges.flatMap((r) => r.messages);
@@ -3993,11 +4012,16 @@ ${memoriesFormatted}
           // engine not serving (kill switch, or a caps-blocked desk) these ranges are real,
           // committed, un-retained conversation that nothing will ever re-offer - drain them
           // now (Q3 fix, 2026-09-18), then the counter path resumes on the next turn.
-          if (!force && pendingTurns < retainEveryN && engineServing) {
+          if (!force && pendingTurns < retainEveryN && engineServing && !stuckPending) {
             debug(
               `[Hindsight Hook] commit-range: ${pendingTurns}/${retainEveryN} un-retained turns - holding (${pendingMsgs.length} msgs, ${pendingRanges.length} ranges)`
             );
             return;
+          }
+          if (stuckPending && engineServing) {
+            log.info(
+              `[astinus-engine] commit-range: age-stuck range(s) (> ${Math.round(ASTINUS_STUCK_RANGE_MS / 60000)} min) - draining despite engine-serving`
+            );
           }
           messagesToRetain = pendingMsgs;
           retainFullWindow = true;

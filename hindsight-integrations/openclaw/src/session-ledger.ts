@@ -98,6 +98,12 @@ CREATE TABLE IF NOT EXISTS rebases (
 `;
 
 const cache = new Map<string, DatabaseSync>();
+// Caps-gap review item 6 (Claude, 2026-09-20): last-touch per cached ledger so an idle sweep can
+// release handles - nothing else in production ever closes one, and archiving needs that.
+const lastUsedAt = new Map<string, number>();
+const IDLE_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
+const IDLE_LEDGER_MS = 2 * 60 * 60 * 1000;
+let lastIdleSweepAt = 0;
 // F10: a schema mismatch deserves to be sticky; a transient open failure (a momentary lock, a
 // full disk) must not disable a session's ledger for the process lifetime, or nothing ever
 // re-tries it. Transient entries carry a cooldown.
@@ -122,7 +128,10 @@ export function openSessionLedger(
     disabled.delete(sessionKey); // cooldown expired - try again
   }
   const cached = cache.get(sessionKey);
-  if (cached) return { ok: true, db: cached };
+  if (cached) {
+    lastUsedAt.set(sessionKey, Date.now());
+    return { ok: true, db: cached };
+  }
   if (!ledgerRoot) return { ok: false, reason: "not-configured" };
   const path = ledgerPath(sessionKey);
   let db: DatabaseSync;
@@ -157,9 +166,16 @@ export function openSessionLedger(
           /* ignore */
         }
         cache.delete(oldest);
+        lastUsedAt.delete(oldest);
       }
     }
     cache.set(sessionKey, db);
+    lastUsedAt.set(sessionKey, Date.now());
+    // Item 6: hourly idle-close sweep, piggybacked on the per-turn open path.
+    if (Date.now() - lastIdleSweepAt > IDLE_SWEEP_INTERVAL_MS) {
+      lastIdleSweepAt = Date.now();
+      sweepIdleLedgers();
+    }
     return { ok: true, db };
   } catch (e) {
     const reason = `open-failed:${(e as Error)?.message ?? e}`;
@@ -183,6 +199,24 @@ export function closeSessionLedger(sessionKey: string): void {
     /* ignore */
   }
   cache.delete(sessionKey);
+  lastUsedAt.delete(sessionKey);
+}
+
+/**
+ * Caps-gap review item 6 (Claude, 2026-09-20): close handles for sessions idle past `maxIdleMs`.
+ * Without this, archiving or resetting a ledger file requires a gateway restart (the Windows
+ * handle blocks the unlink). Best-effort; never throws. Returns the number of handles closed.
+ */
+export function sweepIdleLedgers(maxIdleMs: number = IDLE_LEDGER_MS): number {
+  const cutoff = Date.now() - maxIdleMs;
+  let closed = 0;
+  for (const key of [...cache.keys()]) {
+    const last = lastUsedAt.get(key);
+    if (typeof last === "number" && last > cutoff) continue;
+    closeSessionLedger(key);
+    closed += 1;
+  }
+  return closed;
 }
 
 /**
@@ -199,6 +233,7 @@ export function closeAllLedgers(): void {
     }
     cache.delete(key);
   }
+  lastUsedAt.clear();
 }
 
 /** Stamp marks as applied (best-effort; never throws). Plan §8: applied_gen/applied_at + before/after. */
@@ -236,10 +271,15 @@ export function readTopicsForRanges(
   try {
     // A turn [seq_start, seq_end] covers a range [start, end] iff they overlap.
     const st = db.prepare(
+      // Caps-gap review item 3 (Claude, 2026-09-20): this was the one consumer that never got the
+      // source='model' filter - a drained range could tag the bank with the regex buckets.
       `SELECT DISTINCT top.slug FROM turns t
        JOIN turn_topics tt ON tt.turn_id = t.turn_id
        JOIN topics top ON top.topic_id = tt.topic_id
-       WHERE t.seq_start <= ? AND t.seq_end >= ?`
+       WHERE t.seq_start <= ? AND t.seq_end >= ?
+         AND EXISTS (SELECT 1 FROM turn_topics tt2
+                     WHERE tt2.turn_id = t.turn_id AND tt2.topic_id = top.topic_id
+                       AND tt2.source = 'model')`
     );
     const slugs = new Set<string>();
     const uncovered: Array<{ start: number; end: number }> = [];
