@@ -168,6 +168,14 @@ export interface PluginConfig {
    * diagnose latency without patching the dist. Default: false.
    */
   debugPerfTiming?: boolean;
+  /**
+   * Marks admission policy (Vern 2026-09-21): the engine admits a SHARE of the pending marks, in
+   * priority order (pressure, then topic dormancy, then statement age), on a turn cadence.
+   * Declared in openclaw.plugin.json as `astinusMarks`. Kept on ONE line on purpose:
+   * manifest.test.ts extracts PluginConfig keys per line, so a nested block would read as four
+   * extra top-level fields and fail the schema-parity assertion.
+   */
+  astinusMarks?: { minPressure?: number; admitShare?: boolean; debounceTurns?: number; criticalPressure?: number };
 }
 
 export interface ServiceConfig {

@@ -376,6 +376,17 @@
         "description": "Register agent_knowledge_* tools for explicit lookup, reflection, ingest, and knowledge-page management. Set automatically by the self-driving-agents CLI.",
         "default": false
       },
+      "astinusMarks": {
+        "type": "object",
+        "description": "Marks admission policy (Vern 2026-09-21): the engine admits a SHARE of the pending marks, in priority order (pressure, then topic dormancy, then statement age), on a turn cadence. Defaults: mark from 0.30, admit ceil(pressure x pending), hold five turns after an admission, and 0.65 bypasses the debounce.",
+        "additionalProperties": false,
+        "properties": {
+          "minPressure": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.3 },
+          "admitShare": { "type": "boolean", "default": true },
+          "debounceTurns": { "type": "integer", "minimum": 1, "default": 5 },
+          "criticalPressure": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.65 }
+        }
+      },
       "senderPrefixPattern": {
         "type": "string",
         "description": "Regex matching a human display-name prefix some channels prepend to user text (e.g. 'Alice: today weather?'). Supply the name part only — 'Alice|Bob' or '[A-Za-z ]{1,20}' — the ':' separator and anchoring are added by the plugin. When set, the prefix is stripped from both recall queries and retained transcripts. Unset strips nothing; an invalid regex is ignored."
@@ -635,6 +646,10 @@
     "retainQualityGate": {
       "label": "Retain Quality Gate",
       "placeholder": "false (default)"
+    },
+    "astinusMarks": {
+      "label": "Astinus Marks Admission",
+      "placeholder": "minPressure 0.30, admitShare true, debounceTurns 5, criticalPressure 0.65"
     },
     "senderPrefixPattern": {
       "label": "Sender Prefix Pattern",

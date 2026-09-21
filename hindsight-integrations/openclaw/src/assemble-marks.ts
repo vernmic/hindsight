@@ -17,13 +17,32 @@ export type LedgerMark = {
   reason?: string;
   applied_gen?: string | null;
   applied_at?: number | null;
+  // Admission priority inputs (Vern 2026-09-21); written by the pass, read here in that order.
+  pressure?: number | null;
+  topic_dormancy_s?: number | null;
+  stmt_age_s?: number | null;
 };
 
 const PRESERVE_USER_TURNS = 8;
-const MIN_PRESSURE = 0.4;
-const CRITICAL_PRESSURE = 0.65;
-const DEBOUNCE_TURNS = 10;
 const LOAD_CHUNK = 5000;
+
+/** Marks admission policy (Vern 2026-09-21). Defaults below; the plugin config `astinus.marks.*`
+ *  supplies overrides through ApplyContext.policy. Mark from 0.30, admit the share of the pending
+ *  pool in priority order, hold five turns between admissions, and let 0.65 bypass the debounce -
+ *  a desk over its window must not wait. */
+export type MarksAdmissionPolicy = {
+  minPressure: number;
+  admitShare: boolean;
+  debounceTurns: number;
+  criticalPressure: number;
+};
+
+export const DEFAULT_MARKS_POLICY: MarksAdmissionPolicy = {
+  minPressure: 0.3,
+  admitShare: true,
+  debounceTurns: 5,
+  criticalPressure: 0.65,
+};
 
 export function identityKeyOf(m: unknown): string {
   const msg = (m ?? {}) as Record<string, unknown>;
@@ -154,6 +173,7 @@ export type ApplyContext = {
   sessionId: string; // B1: the HOST session UUID, never the session key
   tokenBudget: number;
   turnCounter: number; // monotonic (lastCommittedSeq), NOT the capped committedKeys length
+  policy?: Partial<MarksAdmissionPolicy>; // `astinus.marks.*`; DEFAULT_MARKS_POLICY otherwise
 };
 
 export type ApplyResult = {
@@ -161,6 +181,7 @@ export type ApplyResult = {
   admitted: LedgerMark[]; // newly admitted this pass (stamp these)
   marksInEffect: number; // admitted-before + admitted-now (B2: authority basis)
   changed: boolean;
+  pendingCount: number; // pending marks considered this call (the share denominator)
   tokensBefore: number;
   tokensAfter: number;
   skipped: string[];
@@ -218,6 +239,7 @@ export function applyMarks(
     tokensBefore,
     tokensAfter: tokensBefore,
     skipped: [],
+    pendingCount: 0,
   };
   const wellFormed = marks.filter(
     (m) => m && Number.isFinite(m.seq_start) && Number.isFinite(m.seq_end)
@@ -228,18 +250,45 @@ export function applyMarks(
   // the view is rebuilt from the transcript every turn, so admitted marks ARE the view.
   const admitted = wellFormed.filter((m) => m.applied_at != null);
   let pending = wellFormed.filter((m) => m.applied_at == null);
+  const policy = { ...DEFAULT_MARKS_POLICY, ...(ctx.policy ?? {}) };
+  const pendingBefore = pending.length;
+  out.pendingCount = pendingBefore;
   if (pending.length > 0) {
-    if (pressure < MIN_PRESSURE) {
-      out.skipped.push(`admission held: pressure ${pressure.toFixed(2)} < ${MIN_PRESSURE} (idle)`);
+    if (pressure < policy.minPressure) {
+      // Below the floor nothing is admitted and the debounce clock restarts from zero for the
+      // next time it crosses 0.30. Already-applied marks are NOT reverted (B2).
+      lastAdmissionTurn.delete(ctx.sessionKey);
+      out.skipped.push(
+        `admission held: pressure ${pressure.toFixed(2)} < ${policy.minPressure} (idle; debounce reset)`
+      );
       pending = [];
     } else {
-      const lastAt = lastAdmissionTurn.get(ctx.sessionKey) ?? -Infinity;
-      if (ctx.turnCounter - lastAt < DEBOUNCE_TURNS && pressure < CRITICAL_PRESSURE) {
+      const lastAt = lastAdmissionTurn.get(ctx.sessionKey);
+      const since = lastAt === undefined ? Number.POSITIVE_INFINITY : ctx.turnCounter - lastAt;
+      if (since < policy.debounceTurns && pressure < policy.criticalPressure) {
         out.skipped.push(
-          `admission held: debounce ${ctx.turnCounter - lastAt}/${DEBOUNCE_TURNS} turns (cache-hit ruling)`
+          `admission held: debounce ${since}/${policy.debounceTurns} turns (cache-hit ruling)`
         );
         pending = [];
+      } else if (policy.admitShare) {
+        // Admit the SHARE of the pending pool, in priority order: pressure desc, then topic
+        // dormancy desc, then statement age desc. The rest stay pending for the next admission.
+        const shareCount = Math.min(pending.length, Math.ceil(pressure * pending.length));
+        pending = [...pending]
+          .sort(
+            (a, b) =>
+              Number(b.pressure ?? 0) - Number(a.pressure ?? 0) ||
+              Number(b.topic_dormancy_s ?? 0) - Number(a.topic_dormancy_s ?? 0) ||
+              Number(b.stmt_age_s ?? 0) - Number(a.stmt_age_s ?? 0)
+          )
+          .slice(0, shareCount);
+        out.skipped.push(
+          `admission share: admitted=${pending.length}/${pendingBefore} share=${pressure.toFixed(2)}`
+        );
       }
+      // B1 (review 2026-09-21): do NOT stamp the debounce here. A held turn must not move the
+      // clock, or `since` stays 1 forever and the debounce never expires below critical. The
+      // stamp belongs after an actual admission - see `out.admitted.length > 0` below.
     }
   }
   const toApply = [...admitted, ...pending];

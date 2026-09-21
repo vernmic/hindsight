@@ -19,6 +19,7 @@ import {
   markMarksApplied,
   readLiveTopics,
   readMarksCached,
+  readMaxTurnId,
   readMaxTurnSeq,
   readThinTopicSubjects,
   readTopicDelta,
@@ -32,6 +33,7 @@ import { createHash, randomUUID } from "crypto";
 import { dirname, join } from "path";
 import * as log from "./logger.js";
 import { configureLogger, setApiLogger, stopLogger } from "./logger.js";
+import type { MarksAdmissionPolicy } from "./assemble-marks.js";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "fs";
 import { access, readFile, readdir, stat, unlink, writeFile } from "fs/promises";
 import { spawn } from "child_process";
@@ -302,6 +304,20 @@ const MAX_TRACKED_SESSIONS = 10_000;
 // the marker module and the deployment customizations both reference it.
 const WORKSPACE_ROOT = "I:\\OpenClaw\\.openclaw";
 const RETAIN_MARKER_MAX_HASHES = 500;
+/** Marks admission knobs from plugin config (declared in openclaw.plugin.json as `astinusMarks`).
+ *  Review answer 1 (2026-09-21): the knobs are read HERE and ride ApplyContext.policy; the config
+ *  linter strips unknown keys, so the schema declares them. Unset keys fall back to
+ *  DEFAULT_MARKS_POLICY inside applyMarks. */
+function astinusMarksPolicy(config: unknown): Partial<MarksAdmissionPolicy> | undefined {
+  const raw = (config as { astinusMarks?: Record<string, unknown> } | undefined)?.astinusMarks;
+  if (!raw || typeof raw !== "object") return undefined;
+  const out: Partial<MarksAdmissionPolicy> = {};
+  if (typeof raw.minPressure === "number") out.minPressure = raw.minPressure;
+  if (typeof raw.admitShare === "boolean") out.admitShare = raw.admitShare;
+  if (typeof raw.debounceTurns === "number") out.debounceTurns = raw.debounceTurns;
+  if (typeof raw.criticalPressure === "number") out.criticalPressure = raw.criticalPressure;
+  return Object.keys(out).length > 0 ? out : undefined;
+}
 const ASTINUS_MAX_COMMITTED_KEYS = 2000;
 const ASTINUS_MAX_PENDING_TURNS = 500;
 
@@ -2609,8 +2625,14 @@ function registerAstinusContextEngine(api: MoltbotPluginAPI): void {
               // B1: transcript rows are keyed by the HOST session UUID, never the session key.
               sessionId: params.sessionId,
               tokenBudget: params.tokenBudget ?? 0,
+              // Review answer 1: the admission knobs ride the apply context from plugin config.
+              policy: astinusMarksPolicy(currentPluginConfig),
               // monotonic counter (lastCommittedSeq) — committedKeys is capped and stops advancing
-              turnCounter: state ? state.lastCommittedSeq : 0,
+              // M1 (Claude, 2026-09-21): the debounce is measured in TURNS, not seqs. This used to
+              // pass state.lastCommittedSeq, and a turn spans 8-45 seqs on a real desk, so a
+              // five-turn debounce expired inside the very next turn. Read the real turn count off
+              // the cached ledger handle; the seq counter is only the cold-handle fallback.
+              turnCounter: readMaxTurnId(key) ?? (state ? state.lastCommittedSeq : 0),
             });
             outList = res.messages;
             marksInEffect = res.marksInEffect;
@@ -2629,7 +2651,7 @@ function registerAstinusContextEngine(api: MoltbotPluginAPI): void {
             }
             if (res.changed || marksInEffect > 0) {
               log.info(
-                `astinus view: ${res.messages.length} msgs, ~${res.tokensAfter} tok (from ${res.tokensBefore}; ${marksInEffect} marks in effect, ${admittedIds.length} admitted; pressure=${pressure.toFixed(2)})`
+                `astinus view: ${res.messages.length} msgs, ~${res.tokensAfter} tok (from ${res.tokensBefore}; ${marksInEffect} marks in effect, ${admittedIds.length} admitted of ${res.pendingCount} pending; share=${pressure.toFixed(2)})`
               );
             } else if (res.skipped.length > 0) {
               const line = `[astinus-engine] assemble: ${res.skipped.length} mark(s) held - ${res.skipped[0]}`;

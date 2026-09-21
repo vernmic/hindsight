@@ -627,3 +627,16 @@ export function readMaxTurnSeq(sessionKey: string): number | null {
     return null;
   }
 }
+export function readMaxTurnId(sessionKey: string): number | null {
+  const db = cache.get(sessionKey);
+  if (!db) return null;
+  try {
+    const row = db.prepare("SELECT MAX(turn_id) AS m FROM turns WHERE heartbeat = 0").get() as
+      | { m?: number | null }
+      | undefined;
+    return typeof row?.m === "number" ? row.m : null;
+  } catch {
+    return null;
+  }
+}
+
