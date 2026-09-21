@@ -34,7 +34,7 @@ import { dirname, join } from "path";
 import * as log from "./logger.js";
 import { configureLogger, setApiLogger, stopLogger } from "./logger.js";
 import type { MarksAdmissionPolicy } from "./assemble-marks.js";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "fs";
 import { access, readFile, readdir, stat, unlink, writeFile } from "fs/promises";
 import { spawn } from "child_process";
 import { createRequire } from "module";
@@ -398,6 +398,31 @@ function isRecallSuspended(sessionKey: string | undefined): boolean {
   } catch {
     return false;
   }
+}
+
+// PERF (2026-09-21): assemble read+parsed the per-session state file on EVERY model call.
+// Cache by (path, mtime); the file is written through tryUpdateSessionState (tmp+rename), so a
+// changed mtime is the invalidation signal and a stale read is impossible.
+const sessionStateCache = new Map<string, { mtimeMs: number; state: AstinusSessionState }>();
+const SESSION_STATE_CACHE_MAX = 2000;
+function loadSessionStateCached(sessionKey: string): AstinusSessionState {
+  const path = retainMarkerPath(sessionKey);
+  let mtimeMs = -1;
+  try {
+    mtimeMs = statSync(path).mtimeMs;
+  } catch {
+    /* missing file: loadSessionState returns the default; do not cache a miss */
+    return loadSessionState(sessionKey);
+  }
+  const hit = sessionStateCache.get(path);
+  if (hit && hit.mtimeMs === mtimeMs) return hit.state;
+  const state = loadSessionState(sessionKey);
+  if (sessionStateCache.size >= SESSION_STATE_CACHE_MAX) {
+    const oldest = sessionStateCache.keys().next().value;
+    if (oldest !== undefined) sessionStateCache.delete(oldest);
+  }
+  sessionStateCache.set(path, { mtimeMs, state });
+  return state;
 }
 
 function loadSessionState(sessionKey: string): AstinusSessionState {
@@ -2555,13 +2580,19 @@ function registerAstinusContextEngine(api: MoltbotPluginAPI): void {
         estimatedTokens: number;
         promptAuthority: "assembled" | "preassembly_may_overflow";
       }> {
+        const assembleStartedAt = Date.now();
         const list = Array.isArray(params.messages) ? params.messages : [];
-        const estimatedTokens = astinusEstimateTokens(list);
+        // PERF (2026-09-21 saturation): ONE estimator pass per assemble. applyMarks computes the
+        // host-shaped `tokensBefore` over the same list; the pass-through estimate reuses it
+        // instead of a second (class-4) pass, and `tokensAfter` is only recomputed when the
+        // view changed. Under preassembly_may_overflow the host takes max(assembled,
+        // unwindowed), so a host-shaped pass-through estimate is safe (never lower than /4).
+        let estimatedTokens = 0;
         const key = params.sessionKey ?? params.sessionId;
         // The durable state file is the SOURCE for the mapping; the in-memory
         // Map is only a cache (empty after a restart until ingest refills it) -
         // review 2026-09-13, Q5.5.
-        const state = key ? loadSessionState(key) : null;
+        const state = key ? loadSessionStateCached(key) : null;
         const topics = state ? Object.keys(state.topics) : [];
         const statements = state
           ? Object.values(state.topics).reduce((n, t) => n + (t?.statements ?? 0), 0)
@@ -2594,7 +2625,7 @@ function registerAstinusContextEngine(api: MoltbotPluginAPI): void {
         // Dry-run: report the plan. Pass-through - the view is unchanged.
         // debug (not info): this fires every turn of every session (Q5.3).
         debug(
-          `[astinus-engine] assemble dry-run: ${list.length} msgs, ~${estimatedTokens} tok` +
+          `[astinus-engine] assemble: ${list.length} msgs` +
             (params.tokenBudget ? ` / budget ${params.tokenBudget}` : "") +
             `, topics=[${topics.join(", ")}], statements=${statements}` +
             `, marks=${marks.length} (${marksApplied} applied, src=${marksSource})` +
@@ -2635,6 +2666,7 @@ function registerAstinusContextEngine(api: MoltbotPluginAPI): void {
               turnCounter: readMaxTurnId(key) ?? (state ? state.lastCommittedSeq : 0),
             });
             outList = res.messages;
+            estimatedTokens = res.tokensBefore;
             marksInEffect = res.marksInEffect;
             admittedIds = res.admitted.map((m) => m.mark_id);
             pressure = res.tokensBefore > 0 && (params.tokenBudget ?? 0) > 0
@@ -2669,7 +2701,22 @@ function registerAstinusContextEngine(api: MoltbotPluginAPI): void {
         // re-applied every turn — they ARE the view); the estimate must then be host-shaped,
         // because it is no longer backstopped by the host's precheck.
         const authority = marksInEffect > 0 ? "assembled" : "preassembly_may_overflow";
-        const finalEstimate = marksInEffect > 0 ? estimateTokensHost(outList) : estimatedTokens;
+        // applyMarks did not run (no key / no session id): fall back to one class-4 pass.
+        if (estimatedTokens === 0 && list.length > 0) estimatedTokens = astinusEstimateTokens(list);
+        const finalEstimate =
+          marksInEffect > 0 && outList !== list ? estimateTokensHost(outList) : estimatedTokens;
+        // PERF instrumentation: assemble runs on the gateway's event loop once per MODEL CALL,
+        // and a tool-loop turn on a 1M-token desk makes dozens of calls. Name the cost so a
+        // saturation episode is attributable from one log line (warn above 150 ms).
+        const assembleMs = Date.now() - assembleStartedAt;
+        if (assembleMs > 150) {
+          log.warn(
+            `[astinus-engine] assemble took ${assembleMs}ms: ${list.length} msgs, ~${finalEstimate} tok, marks=${marks.length} (${marksInEffect} in effect)` +
+              (key ? ` session=${key}` : "")
+          );
+        } else if (assembleMs > 50) {
+          debug(`[astinus-engine] assemble took ${assembleMs}ms: ${list.length} msgs, ~${finalEstimate} tok`);
+        }
         // v4.2 (Claude, verified in the host): under "preassembly_may_overflow" the host's
         // precheck takes the LARGER of the assembled view and the unwindowed transcript
         // (preemptive-compaction.ts:405, attempt-history.ts:660), so a pruned view can never
