@@ -366,6 +366,24 @@ function defaultSessionState(): AstinusSessionState {
     pendingRetain: [],
   };
 }
+
+/**
+ * Context-pressure suspension (Vern 2026-09-21): true when the desk context is over the
+ * suspend fraction of its window. Fail-open: any read error means resume injection.
+ */
+function isRecallSuspended(sessionKey: string | undefined): boolean {
+  try {
+    if (!sessionKey) return false;
+    const safe = sessionKey.replace(/[^a-zA-Z0-9_.-]/g, "_").slice(0, 120);
+    const p = `${WORKSPACE_ROOT}/workspace/state/astinus/pressure/${safe}.json`;
+    if (!existsSync(p)) return false;
+    const st = JSON.parse(readFileSync(p, "utf8"));
+    return st?.suspend === true;
+  } catch {
+    return false;
+  }
+}
+
 function loadSessionState(sessionKey: string): AstinusSessionState {
   const base = defaultSessionState();
   try {
@@ -3351,6 +3369,15 @@ export default function (api: MoltbotPluginAPI) {
           return;
         }
 
+        // Context-pressure suspension (Vern 2026-09-21): over the suspend fraction, stop
+        // adding recall tokens until the desk recedes.
+        if (isRecallSuspended(ctx?.sessionKey)) {
+          debug(
+            `[Hindsight] Skipping recall: context over suspend fraction for ${ctx?.sessionKey}`
+          );
+          return;
+        }
+
         const sessionKeyForCache =
           ctx?.sessionKey ?? (typeof event?.sessionKey === "string" ? event.sessionKey : undefined);
         const skipTurnReason = sessionKeyForCache
@@ -4567,7 +4594,12 @@ const ASTINUS_DELTA_TURNS = 8;
         // Inject folder drain: reads workspace/inject/, injects as <injected file>,
         // deletes consumed files.
         const injectDir = `${WORKSPACE_ROOT}\\workspace\\inject`;
-        const injectExists = await access(injectDir).then(() => true).catch(() => false);
+        const injectSuspended = isRecallSuspended(ctx?.sessionKey);
+        if (injectSuspended)
+          debug("[Hindsight customizations] inject drain suspended (context pressure)");
+        const injectExists = injectSuspended
+          ? false
+          : await access(injectDir).then(() => true).catch(() => false);
         if (injectExists) {
           const files = (await readdir(injectDir, { withFileTypes: true })).filter(
             (e) => !e.name.startsWith(".")
@@ -4641,7 +4673,7 @@ const ASTINUS_DELTA_TURNS = 8;
         // Heartbeat injection: for heartbeat sessions, inject heartbeat-full.md.
         const sessionKey =
           ctx?.sessionKey || (typeof event?.sessionKey === "string" ? event.sessionKey : "");
-        if (sessionKey.includes(":heartbeat")) {
+        if (sessionKey.includes(":heartbeat") && !isRecallSuspended(sessionKey)) {
           const hbPath = `${WORKSPACE_ROOT}\\workspace\\heartbeat-full.md`;
           if (existsSync(hbPath)) {
             const hbContent = await readFile(hbPath, "utf8");
