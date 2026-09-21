@@ -4819,6 +4819,10 @@ const ASTINUS_DELTA_TURNS = 8;
       try {
         const sessionKey =
           ctx?.sessionKey || (typeof event?.sessionKey === "string" ? event.sessionKey : "");
+        if (isRecallSuspended(sessionKey)) {
+          debug("[Hindsight customizations] enrich suspended (context pressure)");
+          return;
+        }
         // PER-SESSION ENRICH (review finding 3): gate on the CHANNEL segment, not
         // ':main:' — the old test matched the agent-id segment and admitted
         // subagent/cron/heartbeat sessions too (live log counts confirmed).
