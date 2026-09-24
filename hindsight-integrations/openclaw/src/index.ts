@@ -18,6 +18,7 @@ import {
   insertCommittedTurn,
   markMarksApplied,
   readLiveTopics,
+  readNewestLiveTopic,
   readMarksCached,
   readMaxTurnId,
   readMaxTurnSeq,
@@ -318,6 +319,10 @@ function astinusMarksPolicy(config: unknown): Partial<MarksAdmissionPolicy> | un
   if (typeof raw.criticalPressure === "number") out.criticalPressure = raw.criticalPressure;
   return Object.keys(out).length > 0 ? out : undefined;
 }
+/** Recall cadence (Vern, order 2026-09-23 as amended): fire every 2 turns per session,
+ *  keyed on the ledger's real turn count (readMaxTurnId). Module-level like the other
+ *  per-session maps; a restart clears it, which only ever makes recall fire sooner. */
+const lastRecallFireTurn = new Map<string, number>();
 const ASTINUS_MAX_COMMITTED_KEYS = 2000;
 const ASTINUS_MAX_PENDING_TURNS = 500;
 
@@ -3447,6 +3452,34 @@ export default function (api: MoltbotPluginAPI) {
           return;
         }
 
+        // Cadence (Vern, order 2026-09-23 as amended; no-cold-start ruling 09-24 14:12):
+        // fire every 2 turns, with the FIRST fire on the second turn - a session on its
+        // first turn holds. A restart mid-session keeps firing: the ledger count is
+        // already past the floor. If this regresses recall latency (the 09-13
+        // shared-server concern), the debounce is the guard: report it, never silently
+        // revert.
+        const cadenceKey =
+          ctx?.sessionKey ??
+          (typeof event?.sessionKey === "string" ? event.sessionKey : undefined);
+        if (typeof cadenceKey === "string" && cadenceKey) {
+          const turnNow = readMaxTurnId(cadenceKey);
+          if (turnNow != null) {
+            // No cold start (Vern, 09-24 14:12): the FIRST fire is the second turn. At
+            // the second turn's assemble the ledger holds one committed turn, so an
+            // entry-less session holds while turnNow < 1: first fire lands on turn 2,
+            // then every 2 turns (2, 4, 6 ...).
+            const lastFired = lastRecallFireTurn.get(cadenceKey);
+            const floor = lastFired != null ? lastFired : -1;
+            if (turnNow - floor < 2) {
+              debug(
+                `[Hindsight] Recall cadence hold: turn ${turnNow}, last fired ${lastFired ?? "never"} (first fire is turn 2; every 2 turns)`
+              );
+              return;
+            }
+            lastRecallFireTurn.set(cadenceKey, turnNow);
+          }
+        }
+
         const sessionKeyForCache =
           ctx?.sessionKey ?? (typeof event?.sessionKey === "string" ? event.sessionKey : undefined);
         const skipTurnReason = sessionKeyForCache
@@ -3513,13 +3546,34 @@ export default function (api: MoltbotPluginAPI) {
           );
         }
         const recallRoles = pluginConfig.recallRoles ?? ["user", "assistant"];
+        // Edit 4 (order 2026-09-23, confirmed by Vern): the query seed is the LEDGER's
+        // newest live topic - the desk's own classification - not words lifted from the
+        // raw message. The raw extraction (validated above) stays as the first-touch
+        // fallback when nothing is classified yet, so a young session fires as today.
+        const edit4Key =
+          ctx?.sessionKey ??
+          (typeof event?.sessionKey === "string" ? event.sessionKey : undefined);
+        const newestLive =
+          typeof edit4Key === "string" && edit4Key
+            ? readNewestLiveTopic(edit4Key)
+            : null;
+        const topicSubstance = newestLive
+          ? `${newestLive.label}${newestLive.digest ? ` - ${newestLive.digest}` : ""}`.trim()
+          : null;
+        const querySeed =
+          topicSubstance && topicSubstance.length >= 8 ? topicSubstance : extracted;
+        if (topicSubstance && topicSubstance.length >= 8) {
+          debug(
+            `[Hindsight] Edit 4: recall query from ledger topic '${newestLive!.slug}' (${topicSubstance.length} chars)`
+          );
+        }
         const composedPrompt = composeRecallQuery(
-          extracted,
+          querySeed,
           sessionMessages,
           recallContextTurns,
           recallRoles
         );
-        let prompt = truncateRecallQuery(composedPrompt, extracted, recallMaxQueryChars);
+        let prompt = truncateRecallQuery(composedPrompt, querySeed, recallMaxQueryChars);
 
         // Final defensive cap
         if (prompt.length > recallMaxQueryChars) {
@@ -3798,9 +3852,17 @@ export default function (api: MoltbotPluginAPI) {
           `[Hindsight] Raw recall response (${response.results.length} results before topK):\n${response.results.map((r: any, i: number) => `  [${i}] score=${r.score?.toFixed(3) ?? "n/a"} type=${r.type ?? "n/a"}: ${JSON.stringify(r.content ?? r.text ?? r).substring(0, 200)}`).join("\n")}`
         );
 
+        // Order 2026-09-24: recency is the sort key, never a filter - newest first,
+        // so stale-era records lose their slot to fresher ones (era-noise fix).
+        const byRecency = [...response.results].sort(
+          (a: any, b: any) =>
+            String(b.mentioned_at ?? b.occurred_start ?? "").localeCompare(
+              String(a.mentioned_at ?? a.occurred_start ?? "")
+            )
+        );
         const results = pluginConfig.recallTopK
-          ? response.results.slice(0, pluginConfig.recallTopK)
-          : response.results;
+          ? byRecency.slice(0, pluginConfig.recallTopK)
+          : byRecency;
 
         debug(
           `[Hindsight] After topK (${pluginConfig.recallTopK ?? "unlimited"}): ${results.length} results injected`

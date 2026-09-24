@@ -371,6 +371,37 @@ export function writeFallbackTopics(
  *  topics excluded. Read-only from the in-process handle; empty when no ledger
  *  or no topics yet (young session, cold handle after a restart) - callers fall
  *  back to the regex classifier. */
+/** Edit 4 (Vern, order 2026-09-23): the newest LIVE topic's label and digest - the
+ *  desk's own classification of what this session is about, the content-relevance source
+ *  for the recall query. Same liveness and classification constraints as readLiveTopics;
+ *  null on a cold handle or when nothing is classified yet (the raw extraction is the
+ *  fallback there). */
+export function readNewestLiveTopic(
+  sessionKey: string
+): { slug: string; label: string; digest: string } | null {
+  const db = cache.get(sessionKey);
+  if (!db) return null;
+  try {
+    const row = db
+      .prepare(
+        `SELECT slug, label, digest FROM topics
+         WHERE terminal_at IS NULL
+           AND EXISTS (SELECT 1 FROM turn_topics tt
+                       WHERE tt.topic_id = topics.topic_id AND tt.source = 'model')
+         ORDER BY last_seen_seq DESC LIMIT 1`
+      )
+      .get() as { slug?: string; label?: string; digest?: string } | undefined;
+    if (!row || typeof row.slug !== "string" || !row.slug) return null;
+    return {
+      slug: row.slug,
+      label: typeof row.label === "string" ? row.label : "",
+      digest: typeof row.digest === "string" ? row.digest : "",
+    };
+  } catch {
+    return null;
+  }
+}
+
 export function readLiveTopics(sessionKey: string, limit: number): string[] {
   const db = cache.get(sessionKey);
   if (!db || limit <= 0) return [];
