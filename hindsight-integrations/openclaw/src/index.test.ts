@@ -1,5 +1,8 @@
-import { describe, it, expect, vi, afterEach } from "vitest";
+import { describe, it, expect, vi, afterEach, afterAll } from "vitest";
 import { createRequire } from "module";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   stripMemoryTags,
   extractRecallQuery,
@@ -26,6 +29,10 @@ import {
   deriveBankId,
   resolveBankIdForKnowledgeTools,
   normalizeRetainTags,
+  mergeRetainTagList,
+  accumulateRetainTags,
+  RETAIN_TAG_LIST_MAX,
+  setSessionStateDir,
   extractInlineRetainTags,
   stripInlineRetainTags,
   stripInlineTimestampPrefix,
@@ -39,6 +46,23 @@ import {
   DEFAULT_RETAIN_CONTEXT,
 } from "./index.js";
 import type { PluginConfig, MemoryResult, MoltbotPluginAPI } from "./types.js";
+
+// Scratch state directory for the session-state tests (review amendment 1c,
+// 2026-09-25): the durable per-session JSON is written under a temp dir, never the
+// live workspace/state/astinus tree the engine scans for real sessions.
+const SESSION_STATE_TEST_DIR = mkdtempSync(join(tmpdir(), "hindsight-session-state-"));
+setSessionStateDir(SESSION_STATE_TEST_DIR);
+afterAll(() => {
+  setSessionStateDir(null);
+  rmSync(SESSION_STATE_TEST_DIR, { recursive: true, force: true });
+});
+const sessionStatePathFor = (sessionKey: string): string =>
+  join(SESSION_STATE_TEST_DIR, `${sessionKey}.json`);
+const writeSessionState = (sessionKey: string, patch: Record<string, unknown>): void => {
+  writeFileSync(sessionStatePathFor(sessionKey), JSON.stringify(patch), "utf8");
+};
+const readSessionState = (sessionKey: string): Record<string, any> =>
+  JSON.parse(readFileSync(sessionStatePathFor(sessionKey), "utf8"));
 
 const require = createRequire(import.meta.url);
 const openclawManifest = require("../openclaw.plugin.json") as {
@@ -727,6 +751,84 @@ describe("buildRetainRequest", () => {
       channel_id: "direct:12345",
       sender_id: "12345",
     });
+  });
+});
+
+describe("session retain tag accumulation (fix 2026-09-25)", () => {
+  // The running tag list lives in the durable per-session state JSON, so this
+  // block exercises the real read/union/persist round trip under a key no live
+  // session can own. The file lives in the scratch state dir set up above
+  // (review amendment 1c), never the live workspace/state/astinus tree.
+  const testSessionKey = "vitest-retain-tags-session";
+  const statePath = sessionStatePathFor(testSessionKey);
+
+  // Each case starts from a clean file - now a scratch file in the temp state dir
+  // (amendment 1c), not one under the live workspace/state/astinus tree.
+  afterEach(() => {
+    rmSync(statePath, { force: true });
+  });
+
+  it("keeps accumulated topics when a later window carries none", () => {
+    const first = accumulateRetainTags(testSessionKey, ["topic:ops-board-queue"]);
+    expect(first).toEqual(["topic:ops-board-queue"]);
+
+    // Second retain: this window's ledger ranges carry no topics at all.
+    const second = accumulateRetainTags(testSessionKey, []);
+    expect(second).toEqual(["topic:ops-board-queue"]);
+
+    // Persisted, so the next retain (or process) sees it too.
+    const persisted = JSON.parse(readFileSync(statePath, "utf8"));
+    expect(persisted.retainTagList).toEqual(["topic:ops-board-queue"]);
+  });
+
+  it("unions a new window's topics in instead of replacing", () => {
+    accumulateRetainTags(testSessionKey, ["topic:ops-board-queue", "topic:spine-pipeline-build"]);
+    const next = accumulateRetainTags(testSessionKey, ["topic:fresh-topic"]);
+    expect(next).toEqual([
+      "topic:ops-board-queue",
+      "topic:spine-pipeline-build",
+      "topic:fresh-topic",
+    ]);
+  });
+
+  it("never drops a topic once seen (add-only union)", () => {
+    expect(mergeRetainTagList(["topic:a", "topic:b"], ["topic:b"])).toEqual(["topic:a", "topic:b"]);
+    expect(mergeRetainTagList(["topic:a"], [])).toEqual(["topic:a"]);
+    expect(mergeRetainTagList([], [])).toEqual([]);
+  });
+
+  it("omits the tags field entirely when the accumulated set is empty", () => {
+    expect(accumulateRetainTags(testSessionKey, [])).toEqual([]);
+    const request = buildRetainRequest("hello world", 1, {}, {}, 1700000000000, {
+      turnIndex: 1,
+      tags: [],
+    });
+    expect(request.tags).toBeUndefined();
+    expect("tags" in (JSON.parse(JSON.stringify(request)) as Record<string, unknown>)).toBe(false);
+  });
+
+  it("bounds the accumulated list and still persists a new tag at constant length", () => {
+    const key = "vitest-retain-tag-cap";
+    const full = Array.from({ length: RETAIN_TAG_LIST_MAX }, (_, i) => `topic:t${i}`);
+    writeSessionState(key, { retainTagList: full });
+
+    const next = accumulateRetainTags(key, ["topic:fresh"]);
+
+    // Bounded: the list stays at the cap, the newest tag is kept, the oldest dropped.
+    expect(next.length).toBe(RETAIN_TAG_LIST_MAX);
+    expect(next[RETAIN_TAG_LIST_MAX - 1]).toBe("topic:fresh");
+    expect(next[0]).toBe("topic:t1");
+    // Persisted even though the length did not change (amendment 1b's invariant): a
+    // length-only write test would have skipped this write and lost the new tag.
+    expect(readSessionState(key).retainTagList).toEqual(next);
+  });
+
+  it("caps a merge at the maximum, keeping the most recent tags", () => {
+    const many = Array.from({ length: RETAIN_TAG_LIST_MAX + 5 }, (_, i) => `topic:m${i}`);
+    const capped = mergeRetainTagList([], many);
+    expect(capped.length).toBe(RETAIN_TAG_LIST_MAX);
+    expect(capped[0]).toBe("topic:m5");
+    expect(capped[capped.length - 1]).toBe(`topic:m${RETAIN_TAG_LIST_MAX + 4}`);
   });
 });
 

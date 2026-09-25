@@ -305,6 +305,15 @@ const MAX_TRACKED_SESSIONS = 10_000;
 // the marker module and the deployment customizations both reference it.
 const WORKSPACE_ROOT = "I:\\OpenClaw\\.openclaw";
 const RETAIN_MARKER_MAX_HASHES = 500;
+/**
+ * Review amendment 1a (2026-09-25): hard bound on the running per-document tag
+ * list. The list is add-only, so without a bound a long-lived session accumulates
+ * topics for its whole life and every retain ships the whole array; document tags
+ * are retrieval labels (design P4), so an over-long list is a retrieval smear, not
+ * a label. The session roll (change 2) is the real bound - this cap is the
+ * belt-and-braces limit and it logs when it bites.
+ */
+export const RETAIN_TAG_LIST_MAX = 64;
 /** Marks admission knobs from plugin config (declared in openclaw.plugin.json as `astinusMarks`).
  *  Review answer 1 (2026-09-21): the knobs are read HERE and ride ApplyContext.policy; the config
  *  linter strips unknown keys, so the schema declares them. Unset keys fall back to
@@ -348,6 +357,14 @@ type AstinusSessionState = {
   chunkHashes: string[];
   // --- durable statement<->topic mapping (context engine) ---
   topics: Record<string, { firstSeenAt: number; lastSeenAt: number; statements: number }>;
+  /**
+   * Running, append-only per-document tag list (fix 2026-09-25, session-retain
+   * tag loss). Topics never leave this list once seen: the Hindsight upsert
+   * rewrites a document's tags from the request's set, so a window re-retain
+   * whose drained ranges carry no ledger topics would otherwise shrink (or
+   * empty) the document's tags and drop every earlier window's topics.
+   */
+  retainTagList: string[];
   // --- durable-turn commit state (context engine) ---
   committedKeys: string[];
   /** Terminal anchor rawSeq of the last committed turn (durable seq source). */
@@ -365,8 +382,17 @@ type AstinusSessionState = {
    */
   pendingRetain: Array<{ start: number; end: number; messages: unknown[]; at?: number }>;
 };
+/**
+ * Durable per-session state directory. Overridable (review amendment 1c) so a
+ * test - or a relocated deployment - points the state files at a scratch
+ * directory instead of the engine's live workspace/state/astinus tree.
+ */
+let sessionStateDirOverride: string | null = null;
+export function setSessionStateDir(dir: string | null): void {
+  sessionStateDirOverride = dir && dir.trim().length > 0 ? dir : null;
+}
 function retainMarkerDir(): string {
-  return `${WORKSPACE_ROOT}\\workspace\\state\\astinus`;
+  return sessionStateDirOverride ?? `${WORKSPACE_ROOT}\\workspace\\state\\astinus`;
 }
 function retainMarkerPath(sessionKey: string): string {
   const safe = String(sessionKey).replace(/[^a-zA-Z0-9_.-]/g, "_").slice(0, 120);
@@ -379,6 +405,7 @@ function defaultSessionState(): AstinusSessionState {
     lastRetainedAt: 0,
     chunkHashes: [],
     topics: {},
+    retainTagList: [],
     committedKeys: [],
     lastCommittedSeq: 0,
     lastCommittedRange: null,
@@ -446,6 +473,9 @@ function loadSessionState(sessionKey: string): AstinusSessionState {
         : [],
       topics:
         p?.topics && typeof p.topics === "object" && !Array.isArray(p.topics) ? p.topics : {},
+      retainTagList: Array.isArray(p?.retainTagList)
+        ? p.retainTagList.filter((t: any) => typeof t === "string")
+        : [],
       committedKeys: Array.isArray(p?.committedKeys)
         ? p.committedKeys.filter((k: any) => typeof k === "string")
         : [],
@@ -504,13 +534,73 @@ function updateSessionState(
  */
 function tryUpdateSessionState(
   sessionKey: string,
-  mutate: (state: AstinusSessionState) => AstinusSessionState
+  mutate: (state: AstinusSessionState) => AstinusSessionState,
+  onFailure?: (error: unknown) => void
 ): void {
   try {
     updateSessionState(sessionKey, mutate);
   } catch (e) {
-    debug(`[Hindsight Hook] session state write failed: ${e}`);
+    if (onFailure) onFailure(e);
+    else debug(`[Hindsight Hook] session state write failed: ${e}`);
   }
+}
+
+/**
+ * Union a window's tags into the running per-document tag list: add-only and
+ * order-preserving (previously seen tags first, then new ones). Within the bound a
+ * topic never leaves the list once seen - the list keeps its append-only shape.
+ * Past RETAIN_TAG_LIST_MAX the OLDEST entries are dropped, never silently: the
+ * drop is logged at warn (review amendment 1a).
+ */
+export function mergeRetainTagList(previous: unknown, windowTags: unknown): string[] {
+  const merged = normalizeRetainTags([
+    ...normalizeRetainTags(previous),
+    ...normalizeRetainTags(windowTags),
+  ]);
+  if (merged.length <= RETAIN_TAG_LIST_MAX) return merged;
+  const dropped = merged.length - RETAIN_TAG_LIST_MAX;
+  log.warn(
+    `[Hindsight Hook] retain tag list capped at ${RETAIN_TAG_LIST_MAX}: dropping the ${dropped} oldest topic tag(s)`
+  );
+  return merged.slice(-RETAIN_TAG_LIST_MAX);
+}
+
+/**
+ * Accumulate the session document's tag set across its lifetime (fix
+ * 2026-09-25): seed from the durable per-session state JSON, union in THIS
+ * window's topics, persist the result back (best-effort, add-only) and return
+ * the accumulated set - which is what every retain sends. Without this a window
+ * re-retain sent only its own ledger ranges' topics, and the upsert rewrote the
+ * document's tags from that subset, dropping every earlier window's topics.
+ *
+ * Persist condition: the LIST CONTENT must have changed, not merely its length.
+ * The original `accumulated.length !== previous.length` test was correct while the
+ * merge was pure add-only growth (content changes iff length changes) and is not
+ * any more: once the 1a cap bites, appending a topic evicts the oldest one, so the
+ * content changes at constant length and a length-only test would skip the write
+ * and silently lose the newest tag. Review amendment 1b asked for that invariant
+ * to be named; it is now enforced by comparing elements.
+ */
+export function accumulateRetainTags(sessionKey: string, windowTags: string[]): string[] {
+  const previous = loadSessionState(sessionKey).retainTagList;
+  const accumulated = mergeRetainTagList(previous, windowTags);
+  const changed =
+    accumulated.length !== previous.length ||
+    accumulated.some((tag, index) => tag !== previous[index]);
+  if (changed) {
+    tryUpdateSessionState(
+      sessionKey,
+      (s) => ({ ...s, retainTagList: accumulated }),
+      // Review amendment 1b: a failed persist silently shortens the NEXT window's
+      // list, which is exactly the loss shape this change exists to prevent - so it
+      // is a warn, not the debug the shared writer defaults to.
+      (e) =>
+        log.warn(
+          `[Hindsight Hook] retain tag list persist failed for ${sessionKey}: ${e} - the next retain starts from a shorter list (tag loss)`
+        )
+    );
+  }
+  return accumulated;
 }
 /**
  * Append a committed range, capping the queue. On overflow the OLDEST ranges are
@@ -4413,9 +4503,17 @@ ${memoriesFormatted}
             windowTurns: retainFullWindow
               ? (pluginConfig.retainEveryNTurns ?? 1) + (pluginConfig.retainOverlapTurns ?? 0)
               : undefined,
+            // Session-scoped topics accumulate add-only across windows (fix
+            // 2026-09-25, session-retain tag loss). Inline `retain:` tags stay
+            // per-window: they are scoped to the messages that carried them.
             tags: [
               ...inlineRetainTags,
-              ...(ledgerTopicTags ?? topicTags(getTurnClassification().topics)),
+              ...(markerSessionKey
+                ? accumulateRetainTags(
+                    markerSessionKey,
+                    ledgerTopicTags ?? topicTags(getTurnClassification().topics)
+                  )
+                : (ledgerTopicTags ?? topicTags(getTurnClassification().topics))),
             ],
             appendSupported: supportsUpdateModeAppend,
             operationId: createAsyncRetainOperationId(),
