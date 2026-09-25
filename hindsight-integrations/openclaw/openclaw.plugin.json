@@ -216,6 +216,12 @@
         "minimum": 0,
         "default": 0
       },
+      "retainSegmentUnitThreshold": {
+        "type": "integer",
+        "description": "Session document roll (2026-09-25): units written to a session document before the next retain closes it and opens the next segment (`<session document id>:seg:<n>`). The new segment's tag list resets and is re-seeded from the ledger's current topics; the closed segment is left untouched. Roughly 300 bytes of transcript per unit, so the default of 50 is about 15 kB per segment. Lower it to bound the rows a single retain can rewrite.",
+        "minimum": 1,
+        "default": 50
+      },
       "recallBudget": {
         "type": "string",
         "description": "Recall effort level. Higher budgets use more retrieval strategies for better results but take longer.",
@@ -540,6 +546,10 @@
     "retainOverlapTurns": {
       "label": "Retain Overlap Turns",
       "placeholder": "0 (no overlap, default)"
+    },
+    "retainSegmentUnitThreshold": {
+      "label": "Session Segment Unit Threshold",
+      "placeholder": "50 (units per segment before the session document rolls)"
     },
     "recallBudget": {
       "label": "Recall Budget",

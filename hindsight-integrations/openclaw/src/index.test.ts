@@ -32,7 +32,14 @@ import {
   mergeRetainTagList,
   accumulateRetainTags,
   RETAIN_TAG_LIST_MAX,
+  DEFAULT_RETAIN_SEGMENT_UNITS,
   setSessionStateDir,
+  segmentDocumentId,
+  shouldRollSegment,
+  estimateSegmentUnits,
+  reseedRetainTagList,
+  planRetainSegment,
+  advanceSegmentUnits,
   extractInlineRetainTags,
   stripInlineRetainTags,
   stripInlineTimestampPrefix,
@@ -810,7 +817,7 @@ describe("session retain tag accumulation (fix 2026-09-25)", () => {
   it("bounds the accumulated list and still persists a new tag at constant length", () => {
     const key = "vitest-retain-tag-cap";
     const full = Array.from({ length: RETAIN_TAG_LIST_MAX }, (_, i) => `topic:t${i}`);
-    writeSessionState(key, { retainTagList: full });
+    writeSessionState(key, { retainTagList: full, retainDocSegment: 1, retainSegmentUnits: 0 });
 
     const next = accumulateRetainTags(key, ["topic:fresh"]);
 
@@ -831,6 +838,197 @@ describe("session retain tag accumulation (fix 2026-09-25)", () => {
     expect(capped[capped.length - 1]).toBe(`topic:m${RETAIN_TAG_LIST_MAX + 4}`);
   });
 });
+
+describe("session document roll (change 2, 2026-09-25)", () => {
+  const planArgs = (
+    sessionKey: string,
+    over: Partial<Parameters<typeof planRetainSegment>[0]> = {}
+  ): Parameters<typeof planRetainSegment>[0] => ({
+    sessionKey,
+    threshold: DEFAULT_RETAIN_SEGMENT_UNITS,
+    windowTopicTags: [],
+    liveLedgerTopicTags: [],
+    transcriptLength: 0,
+    rollable: true,
+    ...over,
+  });
+
+  it("measures a segment in units and rolls only at the threshold", () => {
+    expect(estimateSegmentUnits(0)).toBe(0);
+    expect(estimateSegmentUnits(300)).toBe(1);
+    expect(estimateSegmentUnits(301)).toBe(2);
+    expect(shouldRollSegment(DEFAULT_RETAIN_SEGMENT_UNITS - 1, DEFAULT_RETAIN_SEGMENT_UNITS)).toBe(false);
+    expect(shouldRollSegment(DEFAULT_RETAIN_SEGMENT_UNITS, DEFAULT_RETAIN_SEGMENT_UNITS)).toBe(true);
+    expect(shouldRollSegment(10, 0)).toBe(false);
+  });
+
+  it("rolls to the next segment once the open one reaches the threshold", () => {
+    const key = "vitest-roll-threshold";
+    writeSessionState(key, {
+      lastRetainedSeq: 12,
+      retainDocSegment: 1,
+      retainSegmentUnits: 0,
+      retainTagList: ["topic:old"],
+    });
+
+    const below = planRetainSegment(
+      planArgs(key, { transcriptLength: DEFAULT_RETAIN_SEGMENT_UNITS * 300 })
+    );
+    expect(below.rolled).toBe(false);
+    expect(below.segment).toBe(1);
+    expect(below.tagList).toEqual(["topic:old"]);
+
+    // The successful retain charges its units: the segment is now exactly full.
+    advanceSegmentUnits(key, below.segment, below.unitsDelta);
+    expect(readSessionState(key).retainSegmentUnits).toBe(DEFAULT_RETAIN_SEGMENT_UNITS);
+
+    const at = planRetainSegment(planArgs(key, { liveLedgerTopicTags: ["topic:ledger"] }));
+    expect(at.rolled).toBe(true);
+    expect(at.segment).toBe(2);
+    expect(at.rolledFromUnits).toBe(DEFAULT_RETAIN_SEGMENT_UNITS);
+  });
+
+  it("the new document id carries the segment sequence", () => {
+    const base = "openclaw:agent:main:telegram:group:1";
+    expect(segmentDocumentId(base, 1)).toBe(base);
+    expect(segmentDocumentId(base, 4)).toBe(`${base}:seg:4`);
+
+    const ctx = { sessionKey: "agent:main:telegram:group:1" };
+    const firstDoc = buildRetainRequest("hello world", 1, ctx, {}, 1700000000000, {
+      turnIndex: 1,
+      appendSupported: true,
+    });
+    const segmentDoc = buildRetainRequest("hello world", 1, ctx, {}, 1700000000000, {
+      turnIndex: 1,
+      appendSupported: true,
+      segment: 4,
+      tags: ["topic:x"],
+    });
+    expect(segmentDoc.documentId).toBe(`${firstDoc.documentId}:seg:4`);
+    // Without append support the segment is irrelevant: the per-turn fallback id stands.
+    const fallback = buildRetainRequest("hello world", 1, ctx, {}, 1700000000000, {
+      turnIndex: 1,
+      segment: 4,
+    });
+    expect(fallback.documentId).not.toContain(":seg:");
+  });
+
+  it("resets the tag list and reseeds it from the ledger's current topics", () => {
+    const key = "vitest-roll-reseed";
+    writeSessionState(key, {
+      lastRetainedSeq: 5,
+      retainDocSegment: 1,
+      retainSegmentUnits: DEFAULT_RETAIN_SEGMENT_UNITS,
+      retainTagList: ["topic:stale-a", "topic:stale-b"],
+    });
+
+    const plan = planRetainSegment(
+      planArgs(key, {
+        windowTopicTags: ["topic:this-window"],
+        liveLedgerTopicTags: ["topic:ledger-live"],
+        transcriptLength: 900,
+      })
+    );
+
+    expect(plan.rolled).toBe(true);
+    // RESET, then the ledger's current topics only - not the stale list, and not the
+    // closing window's own topics.
+    expect(plan.tagList).toEqual(["topic:ledger-live"]);
+    expect(plan.unitsDelta).toBe(3);
+    const persisted = readSessionState(key);
+    expect(persisted.retainTagList).toEqual(["topic:ledger-live"]);
+    expect(persisted.retainDocSegment).toBe(2);
+    expect(persisted.retainSegmentUnits).toBe(0);
+  });
+
+  it("keeps the closing window's topics when the ledger has no current topics", () => {
+    expect(reseedRetainTagList(["topic:ledger"], ["topic:window"])).toEqual(["topic:ledger"]);
+    expect(reseedRetainTagList([], ["topic:window"])).toEqual(["topic:window"]);
+    expect(reseedRetainTagList([], [])).toEqual([]);
+
+    const key = "vitest-roll-cold-ledger";
+    writeSessionState(key, {
+      lastRetainedSeq: 5,
+      retainDocSegment: 2,
+      retainSegmentUnits: DEFAULT_RETAIN_SEGMENT_UNITS,
+      retainTagList: ["topic:stale"],
+    });
+    const plan = planRetainSegment(
+      planArgs(key, { windowTopicTags: ["topic:window"], liveLedgerTopicTags: [] })
+    );
+    expect(plan.tagList).toEqual(["topic:window"]);
+  });
+
+  it("leaves the closed segment untouched: its id is not reissued and its list is not carried", () => {
+    const key = "vitest-roll-frozen";
+    const base = "openclaw:agent:main:telegram:group:1";
+    writeSessionState(key, {
+      lastRetainedSeq: 5,
+      retainDocSegment: 1,
+      retainSegmentUnits: DEFAULT_RETAIN_SEGMENT_UNITS,
+      retainTagList: ["topic:old"],
+    });
+
+    const first = planRetainSegment(
+      planArgs(key, { liveLedgerTopicTags: ["topic:re-seeded"], transcriptLength: 300 })
+    );
+    expect(first.rolled).toBe(true);
+    // The closed document keeps its own id and its own frozen list; the new retain
+    // targets a different document.
+    expect(segmentDocumentId(base, first.segment)).not.toBe(segmentDocumentId(base, 1));
+
+    advanceSegmentUnits(key, first.segment, first.unitsDelta);
+    const second = planRetainSegment(
+      planArgs(key, {
+        windowTopicTags: ["topic:after"],
+        liveLedgerTopicTags: ["topic:re-seeded"],
+      })
+    );
+    expect(second.rolled).toBe(false);
+    expect(second.segment).toBe(first.segment);
+    // Accumulation resumes from the reseeded list: the closed segment's topics are gone.
+    expect(second.tagList).toEqual(["topic:re-seeded", "topic:after"]);
+  });
+
+  it("closes an oversized legacy document on the first retain; a new session starts at segment 1", () => {
+    const legacyKey = "vitest-roll-legacy";
+    // Retained before, no segment state: the document it owns is already at the
+    // threshold or beyond (roll spec 7).
+    writeSessionState(legacyKey, { lastRetainedSeq: 42, retainTagList: ["topic:old"] });
+    const legacy = planRetainSegment(
+      planArgs(legacyKey, { liveLedgerTopicTags: ["topic:live"], transcriptLength: 600 })
+    );
+    expect(legacy.rolled).toBe(true);
+    expect(legacy.segment).toBe(2);
+
+    const fresh = planRetainSegment(
+      planArgs("vitest-roll-fresh", { windowTopicTags: ["topic:first"], transcriptLength: 600 })
+    );
+    expect(fresh.rolled).toBe(false);
+    expect(fresh.segment).toBe(1);
+  });
+
+  it("does not roll when append mode is unsupported", () => {
+    const key = "vitest-roll-fallback";
+    writeSessionState(key, {
+      lastRetainedSeq: 5,
+      retainDocSegment: 1,
+      retainSegmentUnits: DEFAULT_RETAIN_SEGMENT_UNITS,
+      retainTagList: ["topic:old"],
+    });
+    const plan = planRetainSegment(
+      planArgs(key, {
+        rollable: false,
+        windowTopicTags: ["topic:new"],
+        liveLedgerTopicTags: ["topic:ledger"],
+      })
+    );
+    expect(plan.rolled).toBe(false);
+    expect(plan.segment).toBe(1);
+    expect(plan.tagList).toEqual(["topic:old", "topic:new"]);
+  });
+});
+
 
 describe("stripInlineTimestampPrefix", () => {
   it("strips weekday/date/time/GMT offset prefixes", () => {

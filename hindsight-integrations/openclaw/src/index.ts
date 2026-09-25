@@ -314,6 +314,25 @@ const RETAIN_MARKER_MAX_HASHES = 500;
  * belt-and-braces limit and it logs when it bites.
  */
 export const RETAIN_TAG_LIST_MAX = 64;
+/** Roll spec 7 (Vern #1737): units per session segment; the config knob
+ *  `retainSegmentUnitThreshold` overrides it. */
+export const DEFAULT_RETAIN_SEGMENT_UNITS = 50;
+/** Roll spec 7: roughly 300 bytes of transcript per extracted fact, so a 50-unit
+ *  segment is about 15 kB / five pages of text.
+ *
+ *  This is a per-window byte proxy, and it is only honest while windows do not
+ *  overlap - it is tied to `retainOverlapTurns` (left unset = 0 in the plugin config).
+ *  If overlap is ever enabled, the SAME transcript bytes are counted in consecutive
+ *  windows, so a segment fills faster than real units accumulate, segments roll
+ *  early, and each roll opens a fresh small segment. That is exactly the shape in
+ *  which an append degrades to a full re-derivation (P5: a non-delta append
+ *  re-inserts everything), and a full re-derivation creates new unit rows and loses
+ *  the protection sweep's tags. Do not enable overlap without re-sizing this divisor,
+ *  and do not lower the 50-unit threshold either: it is a safety number now, not just
+ *  tag hygiene. */
+export const SEGMENT_UNIT_ESTIMATE_CHARS = 300;
+/** Cap on the ledger topics a roll re-seeds from (a label set, not a corpus). */
+export const RETAIN_SEGMENT_RESEED_MAX = 32;
 /** Marks admission knobs from plugin config (declared in openclaw.plugin.json as `astinusMarks`).
  *  Review answer 1 (2026-09-21): the knobs are read HERE and ride ApplyContext.policy; the config
  *  linter strips unknown keys, so the schema declares them. Unset keys fall back to
@@ -365,6 +384,17 @@ type AstinusSessionState = {
    * empty) the document's tags and drop every earlier window's topics.
    */
   retainTagList: string[];
+  /**
+   * Session document roll state (change 2, 2026-09-25). `retainDocSegment` is the
+   * 1-based segment of the open document (1 = the base id `openclaw:<sessionKey>`,
+   * 2+ = `<base>:seg:<n>`); null = not tracked yet, which for a session that has
+   * already retained reads as "already at the threshold", so its first retain after
+   * rollout closes the oversized legacy document (roll spec 7). `retainSegmentUnits`
+   * is the units written to that segment so far (a transcript-byte estimate; see
+   * SEGMENT_UNIT_ESTIMATE_CHARS).
+   */
+  retainDocSegment: number | null;
+  retainSegmentUnits: number;
   // --- durable-turn commit state (context engine) ---
   committedKeys: string[];
   /** Terminal anchor rawSeq of the last committed turn (durable seq source). */
@@ -406,6 +436,8 @@ function defaultSessionState(): AstinusSessionState {
     chunkHashes: [],
     topics: {},
     retainTagList: [],
+    retainDocSegment: null,
+    retainSegmentUnits: 0,
     committedKeys: [],
     lastCommittedSeq: 0,
     lastCommittedRange: null,
@@ -476,6 +508,14 @@ function loadSessionState(sessionKey: string): AstinusSessionState {
       retainTagList: Array.isArray(p?.retainTagList)
         ? p.retainTagList.filter((t: any) => typeof t === "string")
         : [],
+      retainDocSegment:
+        typeof p?.retainDocSegment === "number" && p.retainDocSegment >= 1
+          ? Math.floor(p.retainDocSegment)
+          : null,
+      retainSegmentUnits:
+        typeof p?.retainSegmentUnits === "number" && p.retainSegmentUnits >= 0
+          ? p.retainSegmentUnits
+          : 0,
       committedKeys: Array.isArray(p?.committedKeys)
         ? p.committedKeys.filter((k: any) => typeof k === "string")
         : [],
@@ -601,6 +641,147 @@ export function accumulateRetainTags(sessionKey: string, windowTags: string[]): 
     );
   }
   return accumulated;
+}
+/**
+ * Document id for a session segment (change 2): segment 1 is the base session
+ * document id, 2+ carries the sequence so a segment is deterministic and
+ * traceable from the session key alone.
+ */
+export function segmentDocumentId(baseDocumentId: string, segment: number): string {
+  const n = Math.max(1, Math.floor(segment));
+  return n === 1 ? baseDocumentId : `${baseDocumentId}:seg:${n}`;
+}
+
+/** True when the open segment is full: the next retain must open a new one. */
+export function shouldRollSegment(segmentUnits: number, threshold: number): boolean {
+  return threshold > 0 && segmentUnits >= threshold;
+}
+
+/**
+ * Transcript bytes to estimated units written (roll spec 7: roughly 300 bytes of
+ * transcript per extracted fact). The plugin never sees the server's unit rows, so
+ * the segment size is tracked from what the plugin sends - the same quantity the
+ * spec sizes a segment in (50 units ~ 15 kB ~ five pages of text).
+ */
+export function estimateSegmentUnits(transcriptLength: number): number {
+  if (!(transcriptLength > 0)) return 0;
+  return Math.max(1, Math.ceil(transcriptLength / SEGMENT_UNIT_ESTIMATE_CHARS));
+}
+
+/**
+ * The tag list an opened segment starts from (roll spec 2): RESET, then re-seeded
+ * from the ledger's current topics ONLY - never from the accumulated list the
+ * previous segment carried. A cold ledger handle (no current topics readable) must
+ * not throw the closing window's own topics away: absence of a ledger read is not
+ * the same as "this session has no topics", and the never-send-empty rule still
+ * holds downstream.
+ */
+export function reseedRetainTagList(ledgerTopicTags: string[], windowTopicTags: string[]): string[] {
+  const live = normalizeRetainTags(ledgerTopicTags);
+  return live.length > 0 ? live : normalizeRetainTags(windowTopicTags);
+}
+
+export type RetainSegmentPlan = {
+  /** 1-based segment this retain writes to. */
+  segment: number;
+  /** Tag list to send: the rolled segment's reseeded set, else the accumulated one. */
+  tagList: string[];
+  /** True when THIS call rolled the session onto a new segment. */
+  rolled: boolean;
+  /** Estimated units this retain adds to its segment (applied after a success). */
+  unitsDelta: number;
+  /** Units the closed segment carried at the roll (0 when it did not roll). */
+  rolledFromUnits: number;
+};
+
+/**
+ * Decide which segment THIS retain writes to, and what tag list it sends.
+ *
+ * In append mode a segment whose unit count has reached the threshold is closed
+ * here: the session moves to segment+1 and the state is updated in one
+ * load-modify-write (segment, zeroed unit count, reseeded tag list) so the next
+ * window cannot re-roll the same boundary. The closed segment is left untouched -
+ * no request is ever built for it again, so its units and its frozen tag list stay
+ * as they were.
+ *
+ * A session that has already retained but has no segment state yet carries a
+ * legacy document of unknown, already-over-threshold size (roll spec 7: every live
+ * document exceeds the threshold), so this first retain after rollout closes it.
+ * A brand-new session starts at segment 1.
+ *
+ * Not rollable (the API has no append support, so every retain is its own document
+ * anyway) the plan is a plain accumulation: rolling would only churn state.
+ *
+ * Roll at plan time, charge on success (review finding R1, 2026-09-25). The roll is
+ * persisted here - new segment, zeroed unit count, reseeded tag list, one
+ * load-modify-write - BEFORE the retain is attempted, while `advanceSegmentUnits`
+ * charges units only after the retain succeeds. A failed retain therefore still
+ * consumes a segment: the closed one keeps the units and the frozen tag list it had
+ * and is simply short, and the content retries into the new (still empty) segment.
+ * The asymmetry is deliberate. Persisting the roll here is what makes a double-roll
+ * impossible - a second window cannot re-roll a boundary that is already recorded -
+ * and that property is worth more than a tidily-sized segment.
+ */
+export function planRetainSegment(params: {
+  sessionKey: string;
+  threshold: number;
+  windowTopicTags: string[];
+  liveLedgerTopicTags: string[];
+  transcriptLength: number;
+  rollable?: boolean;
+}): RetainSegmentPlan {
+  const { sessionKey, threshold, windowTopicTags, liveLedgerTopicTags, transcriptLength } = params;
+  const state = loadSessionState(sessionKey);
+  const unitsDelta = estimateSegmentUnits(transcriptLength);
+  const segment = state.retainDocSegment ?? 1;
+  const untrackedLegacy = state.retainDocSegment === null && state.lastRetainedSeq > 0;
+  const segmentUnits = untrackedLegacy ? threshold : state.retainSegmentUnits;
+  if (params.rollable === false || !shouldRollSegment(segmentUnits, threshold)) {
+    return {
+      segment,
+      tagList: accumulateRetainTags(sessionKey, windowTopicTags),
+      rolled: false,
+      unitsDelta,
+      rolledFromUnits: 0,
+    };
+  }
+  const nextSegment = segment + 1;
+  const tagList = reseedRetainTagList(liveLedgerTopicTags, windowTopicTags);
+  tryUpdateSessionState(
+    sessionKey,
+    (s) => ({ ...s, retainDocSegment: nextSegment, retainSegmentUnits: 0, retainTagList: tagList }),
+    (e) =>
+      log.warn(
+        `[Hindsight Hook] session segment roll persist failed for ${sessionKey}: ${e} - the next retain may re-roll this boundary`
+      )
+  );
+  log.warn(
+    `[Hindsight Hook] session segment roll: ${sessionKey} -> segment ${nextSegment} at ${segmentUnits} unit(s) >= ${threshold}; tag list reset and reseeded from the ledger (${tagList.length} tag(s)); the previous segment is frozen`
+  );
+  return { segment: nextSegment, tagList, rolled: true, unitsDelta, rolledFromUnits: segmentUnits };
+}
+
+/**
+ * Charge a successful retain's units to the segment it wrote to. A segment
+ * mismatch means another window rolled in between: the write is then a no-op
+ * rather than charging the new segment for the old one's work.
+ */
+export function advanceSegmentUnits(sessionKey: string, segment: number, unitsDelta: number): void {
+  if (!(unitsDelta > 0)) return;
+  tryUpdateSessionState(
+    sessionKey,
+    (s) => {
+      if (s.retainDocSegment === segment) {
+        return { ...s, retainSegmentUnits: s.retainSegmentUnits + unitsDelta };
+      }
+      // First retain of a brand-new session: adopt the segment it just wrote to.
+      if (s.retainDocSegment === null) {
+        return { ...s, retainDocSegment: segment, retainSegmentUnits: unitsDelta };
+      }
+      return s;
+    },
+    (e) => log.warn(`[Hindsight Hook] segment unit count persist failed for ${sessionKey}: ${e}`)
+  );
 }
 /**
  * Append a committed range, capping the queue. On overflow the OLDEST ranges are
@@ -2397,6 +2578,11 @@ export function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
       typeof config.retainOverlapTurns === "number" && config.retainOverlapTurns >= 0
         ? config.retainOverlapTurns
         : 0,
+    retainSegmentUnitThreshold:
+      typeof config.retainSegmentUnitThreshold === "number" &&
+      config.retainSegmentUnitThreshold >= 1
+        ? Math.floor(config.retainSegmentUnitThreshold)
+        : DEFAULT_RETAIN_SEGMENT_UNITS,
     recallTopK: typeof config.recallTopK === "number" ? config.recallTopK : undefined,
     recallTopicFilter: config.recallTopicFilter === true,
     recallContextTurns:
@@ -4491,6 +4677,24 @@ ${memoriesFormatted}
             ledgerTopicTags = ledgerTopics.slugs.map((s) => `topic:${s}`);
           }
         }
+        // Change 2 (2026-09-25, roll spec 2 + 7): decide the segment and the tag set
+        // for THIS retain. In append mode a segment that has reached the threshold is
+        // closed here and the next one opens (its tag list reset + reseeded from the
+        // ledger); otherwise the list just accumulates. getTurnClassification is safe
+        // to call here (the same point the ledgerTopicTags fallback above uses it).
+        const windowTopicTags = ledgerTopicTags ?? topicTags(getTurnClassification().topics);
+        const retainSegmentPlan = markerSessionKey
+          ? planRetainSegment({
+              sessionKey: markerSessionKey,
+              threshold: pluginConfig.retainSegmentUnitThreshold ?? DEFAULT_RETAIN_SEGMENT_UNITS,
+              windowTopicTags,
+              liveLedgerTopicTags: readLiveTopics(markerSessionKey, RETAIN_SEGMENT_RESEED_MAX).map(
+                (slug) => `topic:${slug}`
+              ),
+              transcriptLength: transcript.length,
+              rollable: supportsUpdateModeAppend,
+            })
+          : null;
         const retainNow = Date.now();
         const retainRequest = buildRetainRequest(
           transcript,
@@ -4504,17 +4708,11 @@ ${memoriesFormatted}
               ? (pluginConfig.retainEveryNTurns ?? 1) + (pluginConfig.retainOverlapTurns ?? 0)
               : undefined,
             // Session-scoped topics accumulate add-only across windows (fix
-            // 2026-09-25, session-retain tag loss). Inline `retain:` tags stay
-            // per-window: they are scoped to the messages that carried them.
-            tags: [
-              ...inlineRetainTags,
-              ...(markerSessionKey
-                ? accumulateRetainTags(
-                    markerSessionKey,
-                    ledgerTopicTags ?? topicTags(getTurnClassification().topics)
-                  )
-                : (ledgerTopicTags ?? topicTags(getTurnClassification().topics))),
-            ],
+            // 2026-09-25, session-retain tag loss), bounded by the cap and reset on a
+            // roll. Inline `retain:` tags stay per-window: they are scoped to the
+            // messages that carried them.
+            tags: [...inlineRetainTags, ...(retainSegmentPlan ? retainSegmentPlan.tagList : windowTopicTags)],
+            segment: retainSegmentPlan ? retainSegmentPlan.segment : undefined,
             appendSupported: supportsUpdateModeAppend,
             operationId: createAsyncRetainOperationId(),
           }
@@ -4566,6 +4764,15 @@ ${memoriesFormatted}
             }));
             debug(
               `[Hindsight Hook] marker advanced to seq ${advance.seq} (+${advance.hashes.length} hashes)`
+            );
+          }
+          // Roll spec 4: charge the successful retain's units to the segment it
+          // wrote to, so the next retain can tell whether that segment is full.
+          if (markerSessionKey && retainSegmentPlan) {
+            advanceSegmentUnits(
+              markerSessionKey,
+              retainSegmentPlan.segment,
+              retainSegmentPlan.unitsDelta
             );
           }
           // After a successful retain, try flushing any queued items
@@ -5291,6 +5498,11 @@ export function buildRetainRequest(
      * prior turns aren't overwritten. Defaults to false (conservative).
      */
     appendSupported?: boolean;
+    /**
+     * Session segment (roll spec 2, change 2): 1 = the base session document id,
+     * 2+ = `<base>:seg:<n>`. Ignored on the per-turn fallback ids. Defaults to 1.
+     */
+    segment?: number;
     /** Stable UUID allocated before the initial asynchronous retain request. */
     operationId?: string;
   }
@@ -5311,7 +5523,7 @@ export function buildRetainRequest(
   // `…:turn:000001` onto the previous cycle's document and `update_mode:
   // 'replace'` deletes what was there. (#3686)
   const documentId = useSessionScopedDoc
-    ? documentBase
+    ? segmentDocumentId(documentBase, options?.segment ?? 1)
     : `${documentBase}:${documentKind}:${getDocumentIdBootToken()}:${String(turnIndex).padStart(6, "0")}`;
   const provider = effectiveCtx?.messageProvider || parsedSession.provider;
   const channelId = sanitizeChannelId(effectiveCtx?.channelId, provider) || parsedSession.channel;
