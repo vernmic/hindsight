@@ -4195,6 +4195,62 @@ async def _consolidate_batch_with_llm(
     )
 
 
+def _protected_retain_prefixes() -> list[str]:
+    """Protected tag prefixes a derivation keeper must carry over from its sources (T-117 fix A).
+
+    Reads the retain-side gate (env ``HINDSIGHT_API_RETAIN_PRESERVE_TAG_PREFIXES``) through the
+    same accessor the document-tags write path uses, so both readers of "protected prefixes"
+    agree on parsing and on the off/empty default. Deferred import: the retain pipeline pulls in
+    engines this module already depends on, so a module-level import would close a cycle.
+    """
+    from ..retain.fact_storage import _retain_preserve_prefixes  # noqa: PLC0415
+
+    return _retain_preserve_prefixes()
+
+
+async def _protected_prefix_tags_of_sources(
+    conn: "Connection",
+    bank_id: str,
+    source_memory_ids: list[uuid.UUID],
+    prefixes: list[str],
+) -> list[str]:
+    """The protected-prefix tags carried by the given source rows, in a stable order.
+
+    Keeps only entries starting with one of ``prefixes`` so a keeper inherits the protection
+    tier without vacuuming up unrelated tags its sources happen to carry. Deterministic: the
+    caller's source order first, then each row's own tag order, deduplicated. A SQL store reads
+    ``memory_units``; a store that owns its rows answers through ``get_memories``.
+    """
+    if not source_memory_ids or not prefixes:
+        return []
+    tags_by_id: dict[str, list[str]] = {}
+    store = get_memories()
+    if not store.store_owned_for(bank_id):
+        rows = await conn.fetch(
+            f"SELECT id, tags FROM {fq_table('memory_units')} WHERE id = ANY($1::uuid[]) AND bank_id = $2",
+            source_memory_ids,
+            bank_id,
+        )
+        for row in rows:
+            tags_by_id[str(row["id"])] = list(row["tags"] or [])
+    else:
+        present = await store.get_memories(
+            conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[str(mid) for mid in source_memory_ids]
+        )
+        for memory in present:
+            tags_by_id[str(memory.unit_id)] = list(memory.tags or [])
+    out: list[str] = []
+    seen: set[str] = set()
+    for mid in source_memory_ids:
+        for tag in tags_by_id.get(str(mid), []):
+            if tag in seen:
+                continue
+            if any(tag.startswith(prefix) for prefix in prefixes):
+                seen.add(tag)
+                out.append(str(tag))
+    return out
+
+
 async def _apply_create_observation(
     conn,
     memory_engine: "MemoryEngine",
@@ -4237,6 +4293,31 @@ async def _apply_create_observation(
     # Each source once: the store stores len() of this list as proof_count. It used to
     # write a literal 1, so a multi-source observation was undercounted until updated (#4955).
     source_memory_ids = list(dict.fromkeys(live_source_memory_ids))
+
+    # Derivation-keeper prefix inheritance (T-117 fix A). A CREATE mints a brand-new observation
+    # whose only inherited tags are the batch's scope tags (:func:`_aggregate_source_fields` falls
+    # back to those, and the batch enforces one shared tag set), so a protection tier the source
+    # rows themselves carry -- retain:long, retain:permanent -- is dropped the instant the keeper
+    # appears. Nothing downstream restores it: the tier classifier selects candidates on
+    # mentioned_at, and the protection sweep only diffs against prior-day snapshots, so a row that
+    # was never tagged when first written is invisible to both. Union the configured protected
+    # prefixes of the live source rows onto the keeper, add-only, copying ONLY those prefixes (an
+    # unrelated source tag stays on its own row). Gated on
+    # HINDSIGHT_API_RETAIN_PRESERVE_TAG_PREFIXES: gate off/empty issues no read and leaves the tag
+    # list exactly as the caller passed it.
+    preserve_prefixes = _protected_retain_prefixes()
+    if preserve_prefixes:
+        inherited_tags = await _protected_prefix_tags_of_sources(
+            conn, bank_id, source_memory_ids, preserve_prefixes
+        )
+        if inherited_tags:
+            obs_tags = list(obs_tags)
+            for tag in inherited_tags:
+                if tag not in obs_tags:
+                    obs_tags.append(tag)
+            logger.debug(
+                f"Create inherits {len(inherited_tags)} protected tag(s) from sources: {inherited_tags}"
+            )
 
     t0 = time.perf_counter()
     created_id = await store.insert_observation(
