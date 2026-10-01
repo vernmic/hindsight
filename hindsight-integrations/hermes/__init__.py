@@ -671,6 +671,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 "default": "conversation between Hermes Agent and the User",
             },
             {"key": "recall_max_tokens", "description": "Maximum tokens for recall results", "default": 4096},
+            {"key": "recall_max_results", "description": "Cap on number of memories returned by recall/prefetch (results are relevance-ranked; 0 = no cap)", "default": 0},
             {
                 "key": "recall_max_input_chars",
                 "description": "Maximum input query length for auto-recall",
@@ -1128,6 +1129,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._auto_recall = cfg.get("auto_recall", True)
         self._recall_sync = bool(cfg.get("recall_sync", False))
         self._recall_max_tokens = int(cfg.get("recall_max_tokens", 4096))
+        self._recall_max_results = int(cfg.get("recall_max_results", 0))
         self._recall_max_input_chars = int(cfg.get("recall_max_input_chars", 800))
         # None -> observation-only (Hindsight's consolidated, deduplicated layer; raw
         # world/experience facts re-ship the evidence they summarize and burn the
@@ -1252,7 +1254,10 @@ class HindsightMemoryProvider(MemoryProvider):
         if self._recall_types:
             kwargs["types"] = self._recall_types
         resp = self._run_hindsight_operation(lambda client: client.arecall(**kwargs))
-        return resp.results or []
+        results = resp.results or []
+        if self._recall_max_results and len(results) > self._recall_max_results:
+            results = results[: self._recall_max_results]
+        return results
 
     def _reflect(self, query: str) -> str | None:
         resp = self._run_hindsight_operation(
