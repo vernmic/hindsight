@@ -185,6 +185,7 @@ export type ApplyResult = {
   tokensBefore: number;
   tokensAfter: number;
   skipped: string[];
+  windowFirstSeq: number | null; // min mapped seq of this view (2026-10-07): the pass bounds proposals to the assembled window
 };
 
 const lastAdmissionTurn = new Map<string, number>();
@@ -240,7 +241,25 @@ export function applyMarks(
     tokensAfter: tokensBefore,
     skipped: [],
     pendingCount: 0,
+    windowFirstSeq: null,
   };
+  // 2026-10-07 (Vern: "so fix it"): the assembled window's first mapped seq. The pass bounds
+  // its proposals to the window the host actually assembles - marks outside it can never
+  // map ("no eligible message in view" forever) and the pools filled with unapplicable
+  // marks while the in-window content sat unmarked. Computed before the early returns so
+  // every session reports it, marks or not. Same cached SeqIndex the loop below uses.
+  try {
+    const wix = seqIndexFor(ctx.hostDbPath, ctx.sessionId);
+    wix.refresh();
+    let wfs: number | null = null;
+    for (const m of messages) {
+      const s = wix.seqOf(m);
+      if (s !== null && (wfs === null || s < wfs)) wfs = s;
+    }
+    out.windowFirstSeq = wfs;
+  } catch {
+    /* degrade: windowFirstSeq stays null; the pass falls back to the compaction bound */
+  }
   const wellFormed = marks.filter(
     (m) => m && Number.isFinite(m.seq_start) && Number.isFinite(m.seq_end)
   );

@@ -2485,7 +2485,7 @@ const ASTINUS_MARKS_INDEX_MAX_SESSIONS = 2000;
 // spawn reads the same entry for its pressure inputs (view_tokens / token_budget).
 const astinusLastAssemble = new Map<
   string,
-  { at: number; viewTokens: number; tokenBudget: number | null; estimator: "host" | "plugin" }
+  { at: number; viewTokens: number; tokenBudget: number | null; estimator: "host" | "plugin"; windowFirstSeq: number | null }
 >();
 const ASTINUS_SERVING_WINDOW_MS = 10 * 60 * 1000;
 const ASTINUS_SKIP_LOG_INTERVAL_MS = 60 * 60 * 1000;
@@ -2593,6 +2593,9 @@ function registerAstinusContextEngine(api: MoltbotPluginAPI): void {
         // view changed. Under preassembly_may_overflow the host takes max(assembled,
         // unwindowed), so a host-shaped pass-through estimate is safe (never lower than /4).
         let estimatedTokens = 0;
+        // 2026-10-07: the assembled window's first seq, captured from applyMarks and carried
+        // in the pass payload (window_first_seq) so proposals stay inside the window.
+        let windowFirstSeq: number | null = null;
         const key = params.sessionKey ?? params.sessionId;
         // The durable state file is the SOURCE for the mapping; the in-memory
         // Map is only a cache (empty after a restart until ingest refills it) -
@@ -2690,6 +2693,7 @@ function registerAstinusContextEngine(api: MoltbotPluginAPI): void {
               log.info(
                 `astinus view: ${res.messages.length} msgs, ~${res.tokensAfter} tok (from ${res.tokensBefore}; ${marksInEffect} marks in effect, ${admittedIds.length} admitted of ${res.pendingCount} pending; share=${pressure.toFixed(2)})`
               );
+              windowFirstSeq = res.windowFirstSeq ?? null;
             } else if (res.skipped.length > 0) {
               const line = `[astinus-engine] assemble: ${res.skipped.length} mark(s) held - ${res.skipped[0]}`;
               // Boundary case made visible (Claude's second pass): marks exist and are in
@@ -2741,6 +2745,7 @@ function registerAstinusContextEngine(api: MoltbotPluginAPI): void {
             viewTokens: finalEstimate,
             tokenBudget: typeof params.tokenBudget === "number" ? params.tokenBudget : null,
             estimator: marksInEffect > 0 ? "host" : "plugin",
+            windowFirstSeq,
           });
         }
         return {
@@ -2914,6 +2919,7 @@ function registerAstinusContextEngine(api: MoltbotPluginAPI): void {
                 token_budget: lastAssemble?.tokenBudget ?? null,
                 // Claude Q4 (09-18): the pass must read the estimate against the right scale.
                 estimator: lastAssemble?.estimator ?? "plugin",
+                window_first_seq: lastAssemble?.windowFirstSeq ?? null,
               });
               const passChild = spawn("python", [passScript], {
                 detached: true,
