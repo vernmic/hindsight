@@ -2689,11 +2689,18 @@ function registerAstinusContextEngine(api: MoltbotPluginAPI): void {
                 res.tokensAfter
               );
             }
+            // Captured UNCONDITIONALLY, outside the log branches (Claude review 2026-10-07, Q1).
+            // It was assigned inside `if (res.changed || marksInEffect > 0)`, which excludes the
+            // `else if (res.skipped.length > 0)` branch below - and that branch IS the production
+            // failure this fix targets ("marks exist, none mapped, no eligible message in view").
+            // So the sessions whose marks are entirely out-of-window were exactly the ones that
+            // reported null, the pass fell back to the compaction bound, and it kept proposing
+            // out-of-window marks. The fix would not have taken effect for its own motivating case.
+            windowFirstSeq = res.windowFirstSeq ?? null;
             if (res.changed || marksInEffect > 0) {
               log.info(
                 `astinus view: ${res.messages.length} msgs, ~${res.tokensAfter} tok (from ${res.tokensBefore}; ${marksInEffect} marks in effect, ${admittedIds.length} admitted of ${res.pendingCount} pending; share=${pressure.toFixed(2)})`
               );
-              windowFirstSeq = res.windowFirstSeq ?? null;
             } else if (res.skipped.length > 0) {
               const line = `[astinus-engine] assemble: ${res.skipped.length} mark(s) held - ${res.skipped[0]}`;
               // Boundary case made visible (Claude's second pass): marks exist and are in
