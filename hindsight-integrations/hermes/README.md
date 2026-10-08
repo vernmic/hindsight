@@ -237,6 +237,7 @@ The lookup stops at the repository root. Only `bank_id` is read.
 | `recall_budget` | `mid` | Recall thoroughness: `low` / `mid` / `high` |
 | `recall_prefetch_method` | `recall` | Auto-recall method: `recall` (raw facts) or `reflect` (LLM synthesis) |
 | `recall_max_tokens` | `4096` | Maximum tokens for recall results |
+| `recall_max_results` | `0` | Maximum total recall records after score filtering and cross-bank deduplication; `0` is uncapped. Applies to automatic recall and `hindsight_recall`, not reflect. |
 | `recall_max_input_chars` | `800` | Maximum input query length for auto-recall |
 | `recall_prompt_preamble` | — | Custom preamble for recalled memories in context |
 | `recall_tags` | — | Tags to filter when searching memories |

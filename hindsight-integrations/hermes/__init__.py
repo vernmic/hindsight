@@ -729,6 +729,11 @@ class HindsightMemoryProvider(MemoryProvider):
             },
             {"key": "recall_max_tokens", "description": "Maximum tokens for recall results", "default": 4096},
             {
+                "key": "recall_max_results",
+                "description": "Total recall result count cap; zero is uncapped",
+                "default": 0,
+            },
+            {
                 "key": "recall_max_input_chars",
                 "description": "Maximum input query length for auto-recall",
                 "default": 800,
@@ -1299,6 +1304,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._auto_recall = cfg.get("auto_recall", True)
         self._recall_sync = bool(cfg.get("recall_sync", False))
         self._recall_max_tokens = int(cfg.get("recall_max_tokens", 4096))
+        self._recall_max_results = max(0, int(cfg.get("recall_max_results", 0)))
         self._recall_max_input_chars = int(cfg.get("recall_max_input_chars", 800))
         # None -> observation-only (Hindsight's consolidated, deduplicated layer; raw
         # world/experience facts re-ship the evidence they summarize and burn the
@@ -1474,7 +1480,8 @@ class HindsightMemoryProvider(MemoryProvider):
             kept = [r for r in bank_results if getattr(r, "text", None) not in seen]
             results.extend(kept)
             seen.update(text for r in kept if (text := getattr(r, "text", None)))
-        return results
+        cap = self._recall_max_results
+        return results[:cap] if cap else results
 
     def _reflect(self, query: str) -> str | None:
         try:
