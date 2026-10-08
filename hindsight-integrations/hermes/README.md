@@ -454,3 +454,12 @@ Things to know when changing this plugin:
   `_prompt`, ...). Those are Hermes internals, not a public API — expect to own a copy or drop
   the wizard hook if they move.
 - `pyproject.toml` is the only dependency authority; bump it when a newer client is needed.
+
+## Fork-maintained Hermes quality tools
+
+The optional [operator companion](extras/hermes_ops/README.md) maintains the Jev
+selector, gardener, post-extraction tag queue and controls. Publishing or updating
+this source does not enable write governance or filtering. `recall_max_results`
+limits the total legacy recall result count after filtering and cross-bank
+deduplication; zero keeps the legacy uncapped behavior. Structured candidate
+feeds set their own per-feed depth, independent of that legacy setting.

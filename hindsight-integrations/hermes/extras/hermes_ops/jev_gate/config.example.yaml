@@ -1,0 +1,26 @@
+# Merge into the active profile configuration; do not replace the existing file.
+# Shipped disabled. Shadow/pilot activation is a separate configuration change.
+jev_gate:
+  mode: "off"
+  model: typesafe/jev-1.13-20260917
+  tag_filters_enabled: false
+  judge_timeout_seconds: 3.0
+  turn_budget_seconds: 36.0
+  recall_timeout_seconds: 30.0
+  write_gate:
+    mode: "off"
+    min_independent_sessions: 2
+    threshold: 0.85
+    contradiction_max: 0.20
+skills:
+  unattended_write_policy_required: false
+fallback_review:
+  enabled: false
+  dry_run: true
+  grouping: skill_session
+  automatic_delivery: true
+  start_after: null
+  include_historical: false
+# Enable the jev_gate plugin in plugins.enabled while preserving existing entries.
+# Merge session_search into auxiliary.background_review.extra_tools if the
+# parent advertises it; source message IDs are needed for improvement evidence.
