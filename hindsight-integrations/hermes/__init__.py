@@ -544,6 +544,7 @@ class HindsightMemoryProvider(MemoryProvider):
         for name in _SESSION_KWARGS:
             setattr(self, f"_{name}", "")
         self._session_id = self._parent_session_id = self._document_id = ""
+        self._previous_retained_turn = ""
         self._status_callback: Optional[Callable[[str], None]] = None
         # Set from initialize() kwargs; defaults keep _start_embedded_daemon safe when a
         # host constructs the provider without calling initialize() (availability probes do).
@@ -938,12 +939,12 @@ class HindsightMemoryProvider(MemoryProvider):
         api_key = _load_simple_env(_embedded_profile_env_path(cfg)).get("HINDSIGHT_API_TENANT_API_KEY") or self._api_key
         return Hindsight(base_url=self._embedded_url, api_key=api_key or None)
 
-    def _new_cloud_client(self):
+    def _new_cloud_client(self, *, timeout=None):
         from hindsight_client import Hindsight
 
         kwargs = {
             "base_url": self._api_url,
-            "timeout": float(self._timeout or _DEFAULT_TIMEOUT),
+            "timeout": float((self._timeout or _DEFAULT_TIMEOUT) if timeout is None else timeout),
             "user_agent": _USER_AGENT,
         }
         if self._api_key:
@@ -1310,6 +1311,7 @@ class HindsightMemoryProvider(MemoryProvider):
             setattr(self, f"_{name}", str(kwargs.get(name) or "").strip())
         self._turn_index = self._last_retained_turn_count = 0
         self._session_turns = []
+        self._previous_retained_turn = ""
         self._mode = cfg.get("mode", "cloud")
         self._timeout = self._int_setting("timeout", "HINDSIGHT_TIMEOUT", _DEFAULT_TIMEOUT)
         self._idle_timeout = self._int_setting("idle_timeout", "HINDSIGHT_IDLE_TIMEOUT", _DEFAULT_IDLE_TIMEOUT)
@@ -1688,6 +1690,84 @@ class HindsightMemoryProvider(MemoryProvider):
             logger.debug("Prefetch: skipped (%s)", why)
         return why is not None
 
+    structured_recall_api_version = 1
+
+    def prefetch_candidates(self, feed: dict, *, session_id: str = "") -> dict:
+        """Current-feed records; the old prefetch/cache/reflect paths remain available."""
+        result = {"candidates": [], "error": None, "feed_hash": feed.get("feed_hash"), "query_provenance": []}
+        if self._bank_id in {"main", "openclaw"}:
+            result["error"] = "bank_excluded"
+            return result
+        if self._recall_disabled():
+            return result
+        query = feed["query"]
+        groups = feed.get("tag_groups") or []
+        requests = [(groups, "filtered" if groups else "unfiltered")]
+        if groups and feed.get("unfiltered_rescue"):
+            requests.append(([], "unfiltered_rescue"))
+        seen = set()
+        errors = []
+        for tag_groups, path in requests:
+            kwargs = {
+                "bank_id": self._bank_id,
+                "query": query,
+                "budget": feed.get("budget", self._budget),
+                "max_tokens": max(1, int(feed.get("max_tokens", self._recall_max_tokens)) // len(requests)),
+            }
+            if tag_groups:
+                kwargs["tag_groups"] = tag_groups
+            result["query_provenance"].append({"path": path, "request": kwargs})
+            try:
+                timeout = feed.get("timeout_seconds")
+                if timeout is not None and self._mode != "local_embedded":
+                    # A private request client avoids changing the cached client's
+                    # transport timeout while retain or explicit recall is using it.
+                    async def recall_once():
+                        client = self._new_cloud_client(timeout=timeout)
+                        try:
+                            return await client.arecall(**kwargs)
+                        finally:
+                            await client.aclose()
+
+                    response = _run_sync(recall_once(), timeout=timeout)
+                else:
+                    response = self._run_hindsight_operation(lambda client: client.arecall(**kwargs))
+                rows = list(response.results or [])
+                # Depth is a total per-feed resource budget, independent of the
+                # provider's legacy config cap. Zero requests uncapped results.
+                cap = max(0, int(feed.get("max_results", 0)))
+                if cap:
+                    remaining = max(0, cap - len(result["candidates"]))
+                    if len(requests) > 1 and path == "filtered":
+                        remaining = max(1, (remaining + 1) // 2)
+                    rows = rows[:remaining]
+                for item in rows:
+                    row = item.model_dump(mode="json") if hasattr(item, "model_dump") else vars(item)
+                    identity = self._bank_id + "/" + str(row["id"])
+                    if identity in seen or not row.get("text"):
+                        continue
+                    seen.add(identity)
+                    result["candidates"].append(
+                        {
+                            "id": identity,
+                            "bank": self._bank_id,
+                            "text": row["text"],
+                            "tags": row.get("tags") or [],
+                            "date": row.get("occurred_start") or row.get("mentioned_at"),
+                            "scores": row.get("scores"),
+                            "query_path": path,
+                            "metadata": row.get("metadata") or {},
+                        }
+                    )
+            except Exception as exc:
+                errors.append({"path": path, "error": type(exc).__name__})
+        result["query_errors"] = errors
+        if errors and not result["candidates"]:
+            result["error"] = "structured_recall_failed"
+        self._last_recall_returned = bool(result["candidates"])
+        self._last_recall_count = len(result["candidates"])
+        return result
+
     def _recall(self, query: str) -> list:
         """Semantic recall across the write set (primary bank first, then
         mirrors/additional banks), then any recall-only banks. A result whose text an
@@ -1944,9 +2024,31 @@ class HindsightMemoryProvider(MemoryProvider):
         # would flip the document's tag set and re-consolidate it from scratch.
         parent = self._parent_session_id if self._parent_session_id != self._session_id else ""
         lineage = (("session", self._session_id), ("parent", parent))
-        tags = [f"{kind}:{sid}" for kind, sid in lineage if sid] or None
+        tags = [f"{kind}:{sid}" for kind, sid in lineage if sid]
+        for default in (
+            "kind:fact",
+            f"scope:{self._bank_id}",
+            "domain:knowledge",
+            "confidence:provisional",
+            "source:session",
+        ):
+            dimension = default.split(":", 1)[0] + ":"
+            if not any(tag.startswith(dimension) for tag in list(self._retain_tags) + tags):
+                tags.append(default)
         bank_ids = list(self._write_bank_ids)
         retain_async, retain_context = self._retain_async, self._retain_context
+        previous = ""
+        if update_mode == "append":
+            if len(self._session_turns) > len(turns):
+                previous = self._session_turns[len(self._session_turns) - len(turns) - 1]
+            else:
+                previous = getattr(self, "_previous_retained_turn", "")
+        if previous:
+            retain_context = (
+                (retain_context or "")
+                + "\nPREVIOUS TURN SOURCE DATA: Resolve current claims only; do not extract neighbor-only facts.\n"
+                + previous
+            )
         # Fixed per job and bank, so a resend after a failure the server did receive is a
         # replay, not a second copy (#5218). One id can't serve two banks: the server answers 409.
         operation_ids = {bank_id: str(uuid.uuid4()) for bank_id in bank_ids}
@@ -2011,11 +2113,20 @@ class HindsightMemoryProvider(MemoryProvider):
 
         return _job
 
+    def _monitoring_retain_excluded(self, session_id: str = "") -> bool:
+        if not (self._config or {}).get("exclude_monitoring_auto_retain", True):
+            return False
+        job_ids = ("3a3da94c3a4b", "1c7606c34c24", "aab9d856059d")
+        sessions = (session_id or self._session_id, self._parent_session_id)
+        return any(str(sid).startswith("cron_" + job + "_") for sid in sessions for job in job_ids)
+
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         """Enqueue a retain for the current turn (non-blocking; writer thread). Dropped
         once shutdown() fired so post-exit retains never reach aiohttp during teardown."""
         why = (
-            "auto_retain disabled"
+            "monitoring auto-retain excluded"
+            if self._monitoring_retain_excluded(session_id)
+            else "auto_retain disabled"
             if not self._auto_retain
             else "shutting down"
             if self._shutting_down.is_set()
@@ -2025,6 +2136,8 @@ class HindsightMemoryProvider(MemoryProvider):
             logger.debug("sync_turn: skipped (%s)", why)
             return
         if session_id:
+            if str(session_id).strip() != self._session_id:
+                self._previous_retained_turn = ""
             self._session_id = str(session_id).strip()
 
         self._session_turns.append(
@@ -2075,6 +2188,7 @@ class HindsightMemoryProvider(MemoryProvider):
             # instead of letting the buffer grow for the whole session. Overwrite
             # mode is deliberately untouched: it resends the full session each
             # retain and must keep every turn.
+            self._previous_retained_turn = turns_to_retain[-1]
             self._session_turns.clear()
             self._last_retained_turn_count = 0
 
@@ -2226,6 +2340,7 @@ class HindsightMemoryProvider(MemoryProvider):
             self._bank_id = self._resolve_template_bank()
             self._write_bank_ids = self._build_write_bank_ids()
         self._session_turns = []
+        self._previous_retained_turn = ""
         self._turn_counter = self._turn_index = self._last_retained_turn_count = 0
         logger.debug(
             "Hindsight on_session_switch: new_session=%s parent=%s reset=%s doc=%s",
