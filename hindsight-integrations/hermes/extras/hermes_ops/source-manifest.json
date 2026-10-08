@@ -86,7 +86,7 @@
     "scripts/jev-write-control.py": "e4b8a22ab43ab1668aec6e9a4a13038cd5da81de0aaf1eed7d748c31b6de9ba0",
     "scripts/jev-write-off.ps1": "8a76120f03b4ac66c6ff6cb5061a1a30182fe23aad2bafcd109488c41d16c29a",
     "scripts/jev-write-on.ps1": "12f4767c56dec79d4f0ece0e2b032ef35b68335a66f1fc59c013aa5ab38093b0",
-    "scripts/memory-quality-control.ps1": "4302ae82ed5b6a85b8cae84e3a59a3e9b6a655e0a1667c38ecaae544772fbc26",
+    "scripts/memory-quality-control.ps1": "e40f3f355bd388c5f538b3189b89876b7b44bcd9b71758e99ce53bae80623252",
     "scripts/memory-quality-control.py": "49e7a80546bffcb06a37ca6319be1ab76448d01515ec61d6d10a3050510eb21f",
     "scripts/post_extraction_tag_queue.py": "004e912cd907025fc1be7ae265c40ab80a7bdafb480c7ae3c5a0abfb14434a54",
     "scripts/retain-takeaway.py": "c0179a5c94a7e5e37758cbb571cb98af1f708f651ba7274cfcfdc1298aafa281",
@@ -105,5 +105,6 @@
     "tests/fixtures/retain-takeaway-before.txt": "962c2dc8752af539b4a4b401b2ce949fc6e3f205472971b2e1f8789e97b7f5b2"
   },
   "publication_does_not_activate": true,
-  "raw_memories_included": false
+  "raw_memories_included": false,
+  "source_hash_convention": "Git text content: normalize CRLF to LF before SHA-256; carried runtime hashes use original bytes"
 }
