@@ -1918,7 +1918,13 @@ async def retain_batch(
     from ..memories import get_memories as _get_memories_delta
 
     _delta_provider = _get_memories_delta()
-    if not force_reextract and attempts_delta_retain(_delta_provider, bank_id, is_first_batch):
+    from .source_context import enabled as source_context_enabled
+
+    if (
+        not force_reextract
+        and not source_context_enabled(config)
+        and attempts_delta_retain(_delta_provider, bank_id, is_first_batch)
+    ):
         delta_result = await _try_delta_retain(
             pool,
             embeddings_model,
@@ -2736,11 +2742,33 @@ async def _streaming_retain_batch(
     # semaphore inside fact_extraction to 32 concurrent).  As each completes
     # it pushes the enriched result into the queue for the DB consumer.
     async def _llm_producer() -> None:
+        from .source_context import contexts as source_contexts
+        from .source_context import enabled as source_context_enabled
+
+        contexts_by_chunk = None
+        if source_context_enabled(config):
+            complete_chunks = None
+            if full_document_body:
+                complete_chunks = list(
+                    fact_extraction.iter_chunks(
+                        full_document_body,
+                        config.retain_chunk_size,
+                        structured_chunk_size=config.retain_structured_chunk_size,
+                        max_attachments_per_chunk=config.retain_max_attachments_per_chunk,
+                    )
+                )
+            contexts_by_chunk = source_contexts(
+                all_pre_chunks,
+                chunk_to_content,
+                [(contents[owner] if contents else _default_content).context for owner in chunk_to_content],
+                complete_chunks,
+            )
+
         async def _extract_one(global_idx: int, chunk_text: str) -> None:
             source = contents[chunk_to_content[global_idx]] if contents else _default_content
             content = RetainContent(
                 content=chunk_text,
-                context=source.context,
+                context=contexts_by_chunk[global_idx] if contexts_by_chunk is not None else source.context,
                 event_date=source.event_date,
                 metadata=source.metadata,
                 entities=source.entities,
