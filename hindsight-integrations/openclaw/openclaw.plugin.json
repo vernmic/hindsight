@@ -1,7 +1,7 @@
 {
   "id": "hindsight-openclaw",
   "name": "Hindsight Memory",
-  "kind": "memory",
+  "kind": ["memory", "context-engine"],
   "configContracts": {
     "secretInputs": {
       "paths": [
@@ -279,6 +279,11 @@
         "minimum": 1,
         "description": "Maximum number of memories to inject per turn. Applied after API response as a hard cap."
       },
+      "recallTopicFilter": {
+        "type": "boolean",
+        "description": "EXPERIMENTAL, default false. When true, recall also queries with a topic:<slug> tag filter and MERGES those hits ahead of the unfiltered results. Never a hard filter: Hindsight's tags_match 'any' includes untagged memories but excludes memories tagged with other vocabularies, so a hard filter would drop the protected retain:*/tier:* corpus. Leave off until the upstream namespace-aware match lands.",
+        "default": false
+      },
       "recallPromptPreamble": {
         "type": "string",
         "description": "Text shown above recalled memories in the injected context block.",
@@ -370,6 +375,17 @@
         "type": "boolean",
         "description": "Register agent_knowledge_* tools for explicit lookup, reflection, ingest, and knowledge-page management. Set automatically by the self-driving-agents CLI.",
         "default": false
+      },
+      "astinusMarks": {
+        "type": "object",
+        "description": "Marks admission policy (Vern 2026-09-21): the engine admits a SHARE of the pending marks, in priority order (pressure, then topic dormancy, then statement age), on a turn cadence. Defaults: mark from 0.30, admit ceil(pressure x pending), hold five turns after an admission, and 0.65 bypasses the debounce.",
+        "additionalProperties": false,
+        "properties": {
+          "minPressure": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.3 },
+          "admitShare": { "type": "boolean", "default": true },
+          "debounceTurns": { "type": "integer", "minimum": 1, "default": 5 },
+          "criticalPressure": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.65 }
+        }
       },
       "senderPrefixPattern": {
         "type": "string",
@@ -561,6 +577,10 @@
       "label": "Recall Top K",
       "placeholder": "e.g. 5 (no limit by default)"
     },
+    "recallTopicFilter": {
+      "label": "Recall Topic Filter (experimental)",
+      "placeholder": "false (default) — merge topic-tagged recall ahead of unfiltered results"
+    },
     "recallPromptPreamble": {
       "label": "Recall Prompt Preamble",
       "placeholder": "Instruction shown above recalled memories in injected context"
@@ -626,6 +646,10 @@
     "retainQualityGate": {
       "label": "Retain Quality Gate",
       "placeholder": "false (default)"
+    },
+    "astinusMarks": {
+      "label": "Astinus Marks Admission",
+      "placeholder": "minPressure 0.30, admitShare true, debounceTurns 5, criticalPressure 0.65"
     },
     "senderPrefixPattern": {
       "label": "Sender Prefix Pattern",

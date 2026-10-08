@@ -13,12 +13,29 @@ import {
   type MinScores,
 } from "@vectorize-io/hindsight-client";
 import { RetainQueue } from "./retain-queue.js";
+import {
+  configureSessionLedger,
+  insertCommittedTurn,
+  markMarksApplied,
+  readLiveTopics,
+  readNewestLiveTopic,
+  readMarksCached,
+  readMaxTurnId,
+  readMaxTurnSeq,
+  readThinTopicSubjects,
+  readTopicDelta,
+  readTopicSubjects,
+  readTopicsForRanges,
+  writeFallbackTopics,
+} from "./session-ledger.js";
+import { applyMarks, estimateTokensHost, type LedgerMark } from "./assemble-marks.js";
 import { compileSessionPatterns, matchesSessionPattern } from "./session-patterns.js";
 import { createHash, randomUUID } from "crypto";
 import { dirname, join } from "path";
 import * as log from "./logger.js";
 import { configureLogger, setApiLogger, stopLogger } from "./logger.js";
-import { existsSync, mkdirSync } from "fs";
+import type { MarksAdmissionPolicy } from "./assemble-marks.js";
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "fs";
 import { access, readFile, readdir, stat, unlink, writeFile } from "fs/promises";
 import { spawn } from "child_process";
 import { createRequire } from "module";
@@ -114,7 +131,15 @@ const banksWithDefaultsApplied = new Set<string>();
 
 // In-flight recall deduplication: concurrent recalls for the same bank reuse one promise
 import type { RecallResponse } from "./types.js";
-const inflightRecalls = new Map<string, Promise<RecallResponse>>();
+
+// A recall resolution remembers WHICH path served it — the topic-filtered
+// query or the unfiltered fallback — so the hook can log the serving path even
+// when the result came from a reused in-flight promise (plan v4 item 3).
+export type RecallResolution = {
+  response: RecallResponse;
+  via: "topic" | "unfiltered" | "topic+unfiltered" | "subject";
+};
+const inflightRecalls = new Map<string, Promise<RecallResolution>>();
 
 // Lightweight bank-scoped facade over HindsightClient. Created per-request via
 // getClientForContext() so hook bodies can keep their bankId-implicit style
@@ -136,6 +161,14 @@ export interface BankScopedClient {
       types?: Array<"world" | "experience" | "observation">;
       preferObservations?: boolean;
       minScores?: MinScores;
+      /**
+       * Server-side tag filter (plan v4 item 3). The recall QUERY stays
+       * substance-first; the topic ledger only narrows the bank scan via
+       * `topic:<slug>` tags. The generated client maps these fields
+       * explicitly (tags/tags_match), so unknown keys would be dropped.
+       */
+      tags?: string[];
+      tagsMatch?: "any" | "all" | "any_strict" | "all_strict" | "exact";
     },
     timeoutMs?: number
   ): Promise<RecallResponse>;
@@ -170,6 +203,8 @@ export function scopeClient(c: HindsightClient, bankId: string): BankScopedClien
         types: req.types,
         preferObservations: req.preferObservations,
         minScores: req.minScores,
+        tags: req.tags,
+        tagsMatch: req.tagsMatch,
       });
       if (!timeoutMs) return call;
       // The generated client doesn't accept a per-call AbortSignal, so we race
@@ -256,6 +291,245 @@ function toStringMetadata(
 }
 const turnCountBySession = new Map<string, number>();
 const MAX_TRACKED_SESSIONS = 10_000;
+
+// ---------------------------------------------------------------------------
+// Astinus retain marker (plan v4): durable per-session retention position.
+// The POSITION is the transcript sequence (lastRetainedSeq). The watermark's
+// generation is the rewrite INVALIDATION token — a differing value means a
+// rewrite happened and seq positions must be re-anchored before they are
+// trusted (v0 records it; the invalidation trigger lands with the DB-access
+// step). Written after every successful retain; read at flush time and by the
+// pruner's retention check.
+// ---------------------------------------------------------------------------
+// Canonical workspace root for this deployment. Single module-scope literal;
+// the marker module and the deployment customizations both reference it.
+const WORKSPACE_ROOT = "I:\\OpenClaw\\.openclaw";
+const RETAIN_MARKER_MAX_HASHES = 500;
+/** Marks admission knobs from plugin config (declared in openclaw.plugin.json as `astinusMarks`).
+ *  Review answer 1 (2026-09-21): the knobs are read HERE and ride ApplyContext.policy; the config
+ *  linter strips unknown keys, so the schema declares them. Unset keys fall back to
+ *  DEFAULT_MARKS_POLICY inside applyMarks. */
+function astinusMarksPolicy(config: unknown): Partial<MarksAdmissionPolicy> | undefined {
+  const raw = (config as { astinusMarks?: Record<string, unknown> } | undefined)?.astinusMarks;
+  if (!raw || typeof raw !== "object") return undefined;
+  const out: Partial<MarksAdmissionPolicy> = {};
+  if (typeof raw.minPressure === "number") out.minPressure = raw.minPressure;
+  if (typeof raw.admitShare === "boolean") out.admitShare = raw.admitShare;
+  if (typeof raw.debounceTurns === "number") out.debounceTurns = raw.debounceTurns;
+  if (typeof raw.criticalPressure === "number") out.criticalPressure = raw.criticalPressure;
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+/** Recall cadence (Vern, order 2026-09-23 as amended): fire every 2 turns per session,
+ *  keyed on the ledger's real turn count (readMaxTurnId). Module-level like the other
+ *  per-session maps; a restart clears it, which only ever makes recall fire sooner. */
+const lastRecallFireTurn = new Map<string, number>();
+const ASTINUS_MAX_COMMITTED_KEYS = 2000;
+const ASTINUS_MAX_PENDING_TURNS = 500;
+
+/**
+ * One durable per-session state document (plan v4). It hosts all three pieces
+ * so the retain loop (agent_end) and the context engine (commitTurn) share one
+ * file: the retain marker, the durable statement<->topic mapping, and the
+ * commit idempotency keys. Writes are load-modify-write + atomic (tmp+rename),
+ * so the two writers never clobber each other's fields.
+ */
+type AstinusSessionState = {
+  // --- retain marker (advanced only after a successful retain) ---
+  lastRetainedSeq: number;
+  lastGenerationSeen: string | null;
+  lastRetainedAt: number;
+  /**
+   * Per-message content hashes recorded at retain time. AUDIT ONLY - not yet
+   * consulted for idempotency. The seq marker already gives exactly-once on the
+   * normal path, and content-hash filtering would drop legitimate turns that
+   * repeat identical text (two "ok" turns hash the same). Capped as a size
+   * bound on the audit trail.
+   */
+  chunkHashes: string[];
+  // --- durable statement<->topic mapping (context engine) ---
+  topics: Record<string, { firstSeenAt: number; lastSeenAt: number; statements: number }>;
+  // --- durable-turn commit state (context engine) ---
+  committedKeys: string[];
+  /** Terminal anchor rawSeq of the last committed turn (durable seq source). */
+  lastCommittedSeq: number;
+  /** Inclusive [admission.rawSeq, terminal.rawSeq] of the last committed turn. */
+  lastCommittedRange: { start: number; end: number } | null;
+  lastCommittedAt: number;
+  /** True when the last commit's ledger write failed (best-effort store; R1). */
+  lastLedgerFailed: boolean;
+  // --- committed-unretained ranges (option a; slot-day) ---
+  /**
+   * Accepted turns the engine committed but the retain loop has not yet
+   * retained. The retain path drains these (the agent_end payload never carries
+   * seqs). Holds only conversational roles, capped at ASTINUS_MAX_PENDING_TURNS.
+   */
+  pendingRetain: Array<{ start: number; end: number; messages: unknown[]; at?: number }>;
+};
+function retainMarkerDir(): string {
+  return `${WORKSPACE_ROOT}\\workspace\\state\\astinus`;
+}
+function retainMarkerPath(sessionKey: string): string {
+  const safe = String(sessionKey).replace(/[^a-zA-Z0-9_.-]/g, "_").slice(0, 120);
+  return `${retainMarkerDir()}\\${safe}.json`;
+}
+function defaultSessionState(): AstinusSessionState {
+  return {
+    lastRetainedSeq: 0,
+    lastGenerationSeen: null,
+    lastRetainedAt: 0,
+    chunkHashes: [],
+    topics: {},
+    committedKeys: [],
+    lastCommittedSeq: 0,
+    lastCommittedRange: null,
+    lastCommittedAt: 0,
+    lastLedgerFailed: false,
+    pendingRetain: [],
+  };
+}
+
+/**
+ * Context-pressure suspension (Vern 2026-09-21): true when the desk context is over the
+ * suspend fraction of its window. Fail-open: any read error means resume injection.
+ */
+function isRecallSuspended(sessionKey: string | undefined): boolean {
+  try {
+    if (!sessionKey) return false;
+    const safe = sessionKey.replace(/[^a-zA-Z0-9_.-]/g, "_").slice(0, 120);
+    const p = `${WORKSPACE_ROOT}/workspace/state/astinus/pressure/${safe}.json`;
+    if (!existsSync(p)) return false;
+    const st = JSON.parse(readFileSync(p, "utf8"));
+    return st?.suspend === true;
+  } catch {
+    return false;
+  }
+}
+
+// PERF (2026-09-21): assemble read+parsed the per-session state file on EVERY model call.
+// Cache by (path, mtime); the file is written through tryUpdateSessionState (tmp+rename), so a
+// changed mtime is the invalidation signal and a stale read is impossible.
+const sessionStateCache = new Map<string, { mtimeMs: number; state: AstinusSessionState }>();
+const SESSION_STATE_CACHE_MAX = 2000;
+function loadSessionStateCached(sessionKey: string): AstinusSessionState {
+  const path = retainMarkerPath(sessionKey);
+  let mtimeMs = -1;
+  try {
+    mtimeMs = statSync(path).mtimeMs;
+  } catch {
+    /* missing file: loadSessionState returns the default; do not cache a miss */
+    return loadSessionState(sessionKey);
+  }
+  const hit = sessionStateCache.get(path);
+  if (hit && hit.mtimeMs === mtimeMs) return hit.state;
+  const state = loadSessionState(sessionKey);
+  if (sessionStateCache.size >= SESSION_STATE_CACHE_MAX) {
+    const oldest = sessionStateCache.keys().next().value;
+    if (oldest !== undefined) sessionStateCache.delete(oldest);
+  }
+  sessionStateCache.set(path, { mtimeMs, state });
+  return state;
+}
+
+function loadSessionState(sessionKey: string): AstinusSessionState {
+  const base = defaultSessionState();
+  try {
+    const p = JSON.parse(readFileSync(retainMarkerPath(sessionKey), "utf8"));
+    return {
+      ...base,
+      lastRetainedSeq:
+        typeof p?.lastRetainedSeq === "number" ? p.lastRetainedSeq : base.lastRetainedSeq,
+      lastGenerationSeen:
+        typeof p?.lastGenerationSeen === "string" ? p.lastGenerationSeen : base.lastGenerationSeen,
+      lastRetainedAt: typeof p?.lastRetainedAt === "number" ? p.lastRetainedAt : base.lastRetainedAt,
+      chunkHashes: Array.isArray(p?.chunkHashes)
+        ? p.chunkHashes.filter((h: any) => typeof h === "string")
+        : [],
+      topics:
+        p?.topics && typeof p.topics === "object" && !Array.isArray(p.topics) ? p.topics : {},
+      committedKeys: Array.isArray(p?.committedKeys)
+        ? p.committedKeys.filter((k: any) => typeof k === "string")
+        : [],
+      lastCommittedSeq:
+        typeof p?.lastCommittedSeq === "number" ? p.lastCommittedSeq : 0,
+      lastCommittedRange:
+        p?.lastCommittedRange &&
+        typeof p.lastCommittedRange.start === "number" &&
+        typeof p.lastCommittedRange.end === "number"
+          ? { start: p.lastCommittedRange.start, end: p.lastCommittedRange.end }
+          : null,
+      lastCommittedAt: typeof p?.lastCommittedAt === "number" ? p.lastCommittedAt : 0,
+      lastLedgerFailed: p?.lastLedgerFailed === true,
+      pendingRetain: Array.isArray(p?.pendingRetain)
+        ? p.pendingRetain.filter(
+            (r: any) =>
+              r &&
+              typeof r.start === "number" &&
+              typeof r.end === "number" &&
+              Array.isArray(r.messages)
+          )
+        : [],
+    };
+  } catch {
+    return base;
+  }
+}
+/**
+ * Load-modify-write the durable state atomically (tmp + rename).
+ * THROWS on mutate or persist failure: a caller that must be durable (the
+ * engine's commitTurn) needs the failure, never a silent no-op.
+ */
+function updateSessionState(
+  sessionKey: string,
+  mutate: (state: AstinusSessionState) => AstinusSessionState
+): AstinusSessionState {
+  const current = loadSessionState(sessionKey);
+  const next = mutate(current);
+  mkdirSync(retainMarkerDir(), { recursive: true });
+  const capped: AstinusSessionState = {
+    ...next,
+    chunkHashes: next.chunkHashes.slice(-RETAIN_MARKER_MAX_HASHES),
+    committedKeys: next.committedKeys.slice(-ASTINUS_MAX_COMMITTED_KEYS),
+  };
+  const target = retainMarkerPath(sessionKey);
+  // Unique tmp name: two processes must never interleave on one tmp path
+  // (review 2026-09-13, Q2).
+  const tmp = `${target}.${process.pid}.${randomUUID()}.tmp`;
+  writeFileSync(tmp, JSON.stringify(capped, null, 2), "utf8");
+  renameSync(tmp, target);
+  return capped;
+}
+/**
+ * Best-effort variant for the retain loop: a failed marker write must not abort
+ * the retain hook (the next turn re-offers the same delta).
+ */
+function tryUpdateSessionState(
+  sessionKey: string,
+  mutate: (state: AstinusSessionState) => AstinusSessionState
+): void {
+  try {
+    updateSessionState(sessionKey, mutate);
+  } catch (e) {
+    debug(`[Hindsight Hook] session state write failed: ${e}`);
+  }
+}
+/**
+ * Append a committed range, capping the queue. On overflow the OLDEST ranges are
+ * dropped, but never silently: the drop is logged at warn (review 2026-09-13, Q2).
+ */
+function appendPendingRange(
+  queue: AstinusSessionState["pendingRetain"],
+  range: AstinusSessionState["pendingRetain"][number]
+): AstinusSessionState["pendingRetain"] {
+  // Caps-gap review item 2 (Claude, 2026-09-20): stamp each range so the age-based sweep can
+  // drain ranges the commit path will never re-offer.
+  const next = [...queue, { ...range, at: Date.now() }];
+  if (next.length <= ASTINUS_MAX_PENDING_TURNS) return next;
+  const dropped = next.length - ASTINUS_MAX_PENDING_TURNS;
+  log.warn(
+    `[astinus-engine] pendingRetain overflow: dropping ${dropped} oldest committed range(s); retains are not draining`
+  );
+  return next.slice(-ASTINUS_MAX_PENDING_TURNS);
+}
 const DEFAULT_RECALL_TIMEOUT_MS = 10_000;
 
 type SessionIdentityRecord = Pick<
@@ -1538,15 +1812,24 @@ function formatOccurredWindow(
   return "";
 }
 
-export function formatMemories(results: MemoryResult[]): string {
+export function formatMemories(
+  results: MemoryResult[],
+  opts?: { markAsEarlierRecords?: boolean }
+): string {
   if (!results || results.length === 0) return "";
+  const earlierRecord = opts?.markAsEarlierRecords === true;
   return results
     .map((r) => {
       const type = r.type ? ` [${r.type}]` : "";
       const date = r.mentioned_at ? ` (${r.mentioned_at})` : "";
       const occurred = formatOccurredWindow(r.occurred_start, r.occurred_end);
       const doc = r.document_id ? ` [doc:${r.document_id}]` : "";
-      return `- ${r.text}${type}${date}${occurred}${doc}`;
+      // Injected-recall marking (plan v4 hard rule): a recalled item is a record
+      // of something said EARLIER, never the current state of the thing. The
+      // label rides the existing per-item date; only callers rendering into a
+      // live prompt opt in, so other consumers keep the plain format.
+      const staleness = earlierRecord ? " [earlier record — not current state; verify before acting]" : "";
+      return `- ${r.text}${type}${date}${occurred}${doc}${staleness}`;
     })
     .join("\n\n");
 }
@@ -2025,6 +2308,7 @@ export function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
         ? config.retainOverlapTurns
         : 0,
     recallTopK: typeof config.recallTopK === "number" ? config.recallTopK : undefined,
+    recallTopicFilter: config.recallTopicFilter === true,
     recallContextTurns:
       typeof config.recallContextTurns === "number" && config.recallContextTurns >= 1
         ? config.recallContextTurns
@@ -2125,10 +2409,576 @@ export function classifyTurn(transcript: string): { activity: string; topics: st
   return { activity, topics };
 }
 
+/**
+ * Normalize a classifyTurn topic label into a stable bank tag (plan v4 item 3).
+ * Lowercase, collapse non-alphanumerics to single dashes, trim the edges.
+ * Returns null for an empty result so callers can drop it instead of emitting
+ * a bare `topic:` tag.
+ */
+export function topicTag(label: string): string | null {
+  const slug = String(label)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return slug ? `topic:${slug}` : null;
+}
+
+/** Map a classifyTurn topics[] to a de-duplicated `topic:<slug>` tag list. */
+export function topicTags(labels: unknown): string[] {
+  if (!Array.isArray(labels)) return [];
+  const out = new Set<string>();
+  for (const label of labels) {
+    if (typeof label !== "string") continue;
+    const tag = topicTag(label);
+    if (tag) out.add(tag);
+  }
+  return [...out];
+}
+
 // Registration guard: WeakSet keyed by api instance to prevent double-registration
 // on the same api object while allowing fresh registration on new api objects.
 // Does not reintroduce issue #1029 because WeakSet.has() checks object identity,
 // not a module-level boolean.
+// ---------------------------------------------------------------------------
+// Astinus context engine (skeleton - plan build step 2, review Gate 2)
+//
+// Registers the `astinus` context engine with the host. This skeleton is
+// DELIBERATELY inert: it does NOT declare the durable-turn semantics
+// (transcriptSemantics + commitTurn), so the host keeps using the legacy
+// context path for real turns until that contract lands. Nothing here changes
+// model context or the transcript, and the slot stays on legacy by default.
+//
+// What it proves now: registration works and the interface compiles.
+// What it does once the slot is switched on AND commitTurn lands:
+// `ingest` builds the per-session statement<->topic mapping, and `assemble`
+// logs the prune plan it would apply - the dry-run inside the real surface.
+// Kill switch: plugins.slots.contextEngine = "legacy".
+// ENGINE ID = PLUGIN ID ("hindsight-openclaw"), deliberately. The host reads
+// plugins.slots.contextEngine two ways: the plugin loader treats it as the owning
+// PLUGIN id (and `plugins enable` auto-writes the plugin id into the slot for any
+// kind: "context-engine" plugin), while resolveContextEngine looks the same string
+// up as a registered ENGINE id. A different engine id ("astinus", 2026-09-12/13)
+// therefore resolved as "not registered", was quarantined, and fell back to legacy
+// silently. Log prefix and inject dir keep the astinus name; the id must not.
+// ---------------------------------------------------------------------------
+
+type AstinusTopicEntry = {
+  topics: Set<string>;
+  statements: number;
+  lastMessageAt: number;
+};
+
+const astinusSessionMapping = new Map<string, AstinusTopicEntry>();
+const ASTINUS_MAPPING_MAX_SESSIONS = 2000;
+
+/**
+ * Marks index — the fallback assemble reads when the ledger cannot be opened
+ * (plan §6 failure policy: "on failure it uses the in-memory marks index from
+ * the last successful read, or no marks at all on a cold start"). Refilled by
+ * every successful ledger read.
+ */
+const astinusMarksIndex = new Map<string, unknown[]>();
+const ASTINUS_MARKS_INDEX_MAX_SESSIONS = 2000;
+// Step 1 (2026-09-18, wedge response Q3 + design §6): the retain gate must ask "is the engine
+// serving this session RIGHT NOW", not "did it ever commit" (that reading starved t31 for five
+// days and main since noon 09-17). assemble() records its last run per session here; the pass
+// spawn reads the same entry for its pressure inputs (view_tokens / token_budget).
+const astinusLastAssemble = new Map<
+  string,
+  { at: number; viewTokens: number; tokenBudget: number | null; estimator: "host" | "plugin"; windowFirstSeq: number | null }
+>();
+const ASTINUS_SERVING_WINDOW_MS = 10 * 60 * 1000;
+const ASTINUS_SKIP_LOG_INTERVAL_MS = 60 * 60 * 1000;
+// Caps-gap review (Claude, 2026-09-20): item 1 - "serving" means committed RECENTLY, not once;
+// item 2 - a range older than two cadence windows drains regardless (the pressure-watch RED line).
+const ASTINUS_COMMIT_RECENCY_MS = 15 * 60 * 1000;
+const ASTINUS_STUCK_RANGE_MS = 2 * 60 * 60 * 1000;
+const astinusRetainSkipLoggedAt = new Map<string, number>();
+// Q2 fix (Claude 09-18): serving is turn-relative, so the hook needs the previous agent_end time.
+const astinusLastAgentEnd = new Map<string, number>();
+
+function astinusMessageText(message: unknown): string {
+  const content = (message as { content?: unknown } | null | undefined)?.content;
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part) =>
+        part && typeof part === "object" && typeof (part as { text?: unknown }).text === "string"
+          ? ((part as { text: string }).text)
+          : ""
+      )
+      .filter(Boolean)
+      .join("\n");
+  }
+  return "";
+}
+
+function astinusEstimateTokens(messages: unknown[]): number {
+  // Rough char/4 heuristic. A stand-in until the engine owns real accounting.
+  let chars = 0;
+  for (const m of messages) chars += astinusMessageText(m).length + 16;
+  return Math.ceil(chars / 4);
+}
+
+/** The engine id; must equal the plugin id (see the note above the section). */
+const ASTINUS_ENGINE_ID = "hindsight-openclaw";
+
+function registerAstinusContextEngine(api: MoltbotPluginAPI): void {
+  const register = (api as { registerContextEngine?: (id: string, factory: () => unknown) => void })
+    .registerContextEngine;
+  if (typeof register !== "function") {
+    log.info("[astinus-engine] host does not expose registerContextEngine; skipping");
+    return;
+  }
+  try {
+    register(ASTINUS_ENGINE_ID, () => ({
+      info: {
+        id: ASTINUS_ENGINE_ID,
+        name: "Astinus Context Engine",
+        version: "0.2.0-durable-turn",
+        // ownsCompaction false: compaction stays with the runtime.
+        ownsCompaction: false,
+        // Durable-turn contract (Gate 2 decision, 2026-09-12). Declaring the
+        // fence + idempotency lets the host hand the engine the accepted turn
+        // and lets commitTurn own the durable statement<->topic mapping.
+        transcriptSemantics: {
+          currentTurnFence: "before-current-turn-entry-v1",
+          turnAdvancementIdempotency: "atomic-idempotent-v1",
+        },
+        // acceptedHostParams intentionally OMITTED until the host's field names
+        // are read from src/context-engine/ - a wrong name silently drops a
+        // field (review 2026-09-12, Gate 2).
+      },
+      async ingest(params: {
+        sessionKey?: string;
+        sessionId?: string;
+        message?: unknown;
+        isHeartbeat?: boolean;
+      }): Promise<{ ingested: boolean }> {
+        if (params.isHeartbeat) return { ingested: false };
+        const key = params.sessionKey ?? params.sessionId;
+        // No key -> skip: a shared "unknown" bucket would merge every session
+        // into one mapping (review 2026-09-12, Gate 2 minor).
+        if (!key) return { ingested: false };
+        const text = astinusMessageText(params.message);
+        if (!text) return { ingested: false };
+        const entry =
+          astinusSessionMapping.get(key) ??
+          ({ topics: new Set<string>(), statements: 0, lastMessageAt: 0 } as AstinusTopicEntry);
+        for (const tag of topicTags(classifyTurn(text).topics)) entry.topics.add(tag);
+        entry.statements += 1;
+        entry.lastMessageAt = Date.now();
+        astinusSessionMapping.set(key, entry);
+        if (astinusSessionMapping.size > ASTINUS_MAPPING_MAX_SESSIONS) {
+          const oldest = astinusSessionMapping.keys().next().value;
+          if (oldest !== undefined) astinusSessionMapping.delete(oldest);
+        }
+        return { ingested: true };
+      },
+      async assemble(params: {
+        messages?: unknown[];
+        tokenBudget?: number;
+        sessionKey?: string;
+        sessionId?: string;
+      }): Promise<{
+        messages: unknown[];
+        estimatedTokens: number;
+        promptAuthority: "assembled" | "preassembly_may_overflow";
+      }> {
+        const assembleStartedAt = Date.now();
+        const list = Array.isArray(params.messages) ? params.messages : [];
+        // PERF (2026-09-21 saturation): ONE estimator pass per assemble. applyMarks computes the
+        // host-shaped `tokensBefore` over the same list; the pass-through estimate reuses it
+        // instead of a second (class-4) pass, and `tokensAfter` is only recomputed when the
+        // view changed. Under preassembly_may_overflow the host takes max(assembled,
+        // unwindowed), so a host-shaped pass-through estimate is safe (never lower than /4).
+        let estimatedTokens = 0;
+        // 2026-10-07: the assembled window's first seq, captured from applyMarks and carried
+        // in the pass payload (window_first_seq) so proposals stay inside the window.
+        let windowFirstSeq: number | null = null;
+        const key = params.sessionKey ?? params.sessionId;
+        // The durable state file is the SOURCE for the mapping; the in-memory
+        // Map is only a cache (empty after a restart until ingest refills it) -
+        // review 2026-09-13, Q5.5.
+        const state = key ? loadSessionStateCached(key) : null;
+        const topics = state ? Object.keys(state.topics) : [];
+        const statements = state
+          ? Object.values(state.topics).reduce((n, t) => n + (t?.statements ?? 0), 0)
+          : 0;
+        // Read the model's marks from the ledger (plan §8). Best-effort: on any
+        // failure fall back to the cached index, or to no marks on a cold start
+        // (§6 failure policy). Still a pass-through — application is the next
+        // step; this only surfaces what would be applied.
+        let marks: unknown[] = key ? astinusMarksIndex.get(key) ?? [] : [];
+        let marksSource = "cached";
+        if (key) {
+          const res = readMarksCached(key, (m) => log.warn(m));
+          if (res.ok) {
+            marks = res.marks;
+            astinusMarksIndex.set(key, marks);
+            if (astinusMarksIndex.size > ASTINUS_MARKS_INDEX_MAX_SESSIONS) {
+              const oldest = astinusMarksIndex.keys().next().value;
+              if (oldest !== undefined) astinusMarksIndex.delete(oldest);
+            }
+            marksSource = "ledger";
+          } else if (res.reason !== "not-open") {
+            log.warn(
+              `[astinus-engine] assemble: marks unavailable (${res.reason}); using cached index (${marks.length})`
+            );
+          }
+        }
+        const marksApplied = marks.filter(
+          (m) => (m as { applied_at?: unknown } | null)?.applied_at != null
+        ).length;
+        // Dry-run: report the plan. Pass-through - the view is unchanged.
+        // debug (not info): this fires every turn of every session (Q5.3).
+        debug(
+          `[astinus-engine] assemble: ${list.length} msgs` +
+            (params.tokenBudget ? ` / budget ${params.tokenBudget}` : "") +
+            `, topics=[${topics.join(", ")}], statements=${statements}` +
+            `, marks=${marks.length} (${marksApplied} applied, src=${marksSource})` +
+            ` - pass-through (no selection applied)`
+        );
+        // A pass-through that trims nothing must report preassembly_may_overflow,
+        // not "assembled", so the host keeps its pre-prompt overflow safeguard
+        // when the slot goes live (review 2026-09-12, Gate 2). The char/4
+        // estimate only feeds the host's compaction threshold, and the host's own
+        // precheck still runs, so an under-estimate is safe.
+        // Apply the marks to the VIEW (plan §8 + the Sept-12 cache-hit ruling). Invariants are
+        // enforced in code inside applyMarks: never the first user message, tool pairs travel
+        // together, nothing in the preserved tail, the pressure floor, and the 10-turn debounce
+        // unless pressure is critical. Any failure degrades to "less pruned", never an error.
+        const agentId = key && key.startsWith("agent:") ? key.split(":")[1] : "";
+        const hostDbPath = agentId
+          ? `${WORKSPACE_ROOT}\\agents\\${agentId}\\agent\\openclaw-agent.sqlite`
+          : "";
+        let marksInEffect = 0;
+        let admittedIds: Array<number | unknown> = [];
+        let outList = list;
+        let pressure = 0;
+        if (key && hostDbPath && Array.isArray(marks) && typeof params.sessionId === "string" && params.sessionId) {
+          try {
+            const res = applyMarks(list, marks as LedgerMark[], {
+              sessionKey: key,
+              hostDbPath,
+              // B1: transcript rows are keyed by the HOST session UUID, never the session key.
+              sessionId: params.sessionId,
+              tokenBudget: params.tokenBudget ?? 0,
+              // Review answer 1: the admission knobs ride the apply context from plugin config.
+              policy: astinusMarksPolicy(currentPluginConfig),
+              // monotonic counter (lastCommittedSeq) — committedKeys is capped and stops advancing
+              // M1 (Claude, 2026-09-21): the debounce is measured in TURNS, not seqs. This used to
+              // pass state.lastCommittedSeq, and a turn spans 8-45 seqs on a real desk, so a
+              // five-turn debounce expired inside the very next turn. Read the real turn count off
+              // the cached ledger handle; the seq counter is only the cold-handle fallback.
+              turnCounter: readMaxTurnId(key) ?? (state ? state.lastCommittedSeq : 0),
+            });
+            outList = res.messages;
+            estimatedTokens = res.tokensBefore;
+            marksInEffect = res.marksInEffect;
+            admittedIds = res.admitted.map((m) => m.mark_id);
+            pressure = res.tokensBefore > 0 && (params.tokenBudget ?? 0) > 0
+              ? res.tokensBefore / (params.tokenBudget as number)
+              : 0;
+            if (admittedIds.length > 0) {
+              markMarksApplied(
+                key,
+                admittedIds,
+                state?.lastGenerationSeen ?? "",
+                res.tokensBefore,
+                res.tokensAfter
+              );
+            }
+            // Captured UNCONDITIONALLY, outside the log branches (Claude review 2026-10-07, Q1).
+            // It was assigned inside `if (res.changed || marksInEffect > 0)`, which excludes the
+            // `else if (res.skipped.length > 0)` branch below - and that branch IS the production
+            // failure this fix targets ("marks exist, none mapped, no eligible message in view").
+            // So the sessions whose marks are entirely out-of-window were exactly the ones that
+            // reported null, the pass fell back to the compaction bound, and it kept proposing
+            // out-of-window marks. The fix would not have taken effect for its own motivating case.
+            windowFirstSeq = res.windowFirstSeq ?? null;
+            if (res.changed || marksInEffect > 0) {
+              log.info(
+                `astinus view: ${res.messages.length} msgs, ~${res.tokensAfter} tok (from ${res.tokensBefore}; ${marksInEffect} marks in effect, ${admittedIds.length} admitted of ${res.pendingCount} pending; share=${pressure.toFixed(2)})`
+              );
+            } else if (res.skipped.length > 0) {
+              const line = `[astinus-engine] assemble: ${res.skipped.length} mark(s) held - ${res.skipped[0]}`;
+              // Boundary case made visible (Claude's second pass): marks exist and are in
+              // effect, but none mapped to this pass's view (post-compaction, post-/new, or
+              // all inside the preserved tail) - info, not debug, so status.py can see it.
+              if (marksInEffect > 0) log.info(line + ` (${marksInEffect} in effect, none applied)`);
+              else debug(line);
+            }
+          } catch (e) {
+            log.warn(`[astinus-engine] assemble: mark application failed: ${(e as Error).message}`);
+          }
+        }
+        // B2/B4: authority is "assembled" whenever ANY mark is in effect (admitted marks are
+        // re-applied every turn — they ARE the view); the estimate must then be host-shaped,
+        // because it is no longer backstopped by the host's precheck.
+        const authority = marksInEffect > 0 ? "assembled" : "preassembly_may_overflow";
+        // applyMarks did not run (no key / no session id): fall back to one class-4 pass.
+        if (estimatedTokens === 0 && list.length > 0) estimatedTokens = astinusEstimateTokens(list);
+        const finalEstimate =
+          marksInEffect > 0 && outList !== list ? estimateTokensHost(outList) : estimatedTokens;
+        // PERF instrumentation: assemble runs on the gateway's event loop once per MODEL CALL,
+        // and a tool-loop turn on a 1M-token desk makes dozens of calls. Name the cost so a
+        // saturation episode is attributable from one log line (warn above 150 ms).
+        const assembleMs = Date.now() - assembleStartedAt;
+        if (assembleMs > 150) {
+          log.warn(
+            `[astinus-engine] assemble took ${assembleMs}ms: ${list.length} msgs, ~${finalEstimate} tok, marks=${marks.length} (${marksInEffect} in effect)` +
+              (key ? ` session=${key}` : "")
+          );
+        } else if (assembleMs > 50) {
+          debug(`[astinus-engine] assemble took ${assembleMs}ms: ${list.length} msgs, ~${finalEstimate} tok`);
+        }
+        // v4.2 (Claude, verified in the host): under "preassembly_may_overflow" the host's
+        // precheck takes the LARGER of the assembled view and the unwindowed transcript
+        // (preemptive-compaction.ts:405, attempt-history.ts:660), so a pruned view can never
+        // lower the compaction decision. The moment marks actually apply, authority must be
+        // "assembled" — and the estimate must then be honest, because it is no longer
+        // backstopped. Compaction-boundary invariants are structural here: a summary message
+        // carries no transcript seq, so the identity join never marks it, and marks below the
+        // boundary match no in-view message and are skipped.
+        if (key) {
+          // Step 1a/b (2026-09-18): record this session's last assemble - the retain gate's
+          // "serving now" signal and the pass payload's pressure inputs both read it.
+          // m1 (Claude 09-18): touch-on-write so a busy desk is not evicted FIFO by 2000
+          // one-shot sessions - delete first, then re-insert, so the cap behaves LRU here.
+          if (astinusLastAssemble.has(key)) astinusLastAssemble.delete(key);
+          setCappedMapValue(astinusLastAssemble, key, {
+            at: Date.now(),
+            viewTokens: finalEstimate,
+            tokenBudget: typeof params.tokenBudget === "number" ? params.tokenBudget : null,
+            estimator: marksInEffect > 0 ? "host" : "plugin",
+            windowFirstSeq,
+          });
+        }
+        return {
+          messages: outList,
+          estimatedTokens: finalEstimate,
+          promptAuthority: authority as "assembled" | "preassembly_may_overflow",
+        };
+      },
+      // INCIDENT 2026-09-17 00:21 (main desk wedged at 1.31M tokens): with ownsCompaction=false the
+      // host STILL calls the active engine's compact() for /compact and provider overflow
+      // recovery (docs/concepts/context-engine.md "ownsCompaction: false or unset"). Returning
+      // "compacted: false" here made every overflow recovery on a served desk fail
+      // ("auto-compaction failed for ...: astinus skeleton: compaction delegated to the
+      // runtime"), so the session could never shrink and cycled through provider errors. The
+      // documented implementation for a non-owning engine is to hand the request to the
+      // runtime's built-in compaction via delegateCompactionToRuntime (plugin-sdk/core, line
+      // 382 of that doc) - the same bridge the legacy engine uses. Loaded lazily so a resolver
+      // failure degrades to a logged refusal instead of breaking plugin load.
+      async compact(params: unknown): Promise<unknown> {
+        try {
+          const sdkSpecifier = "openclaw/plugin-sdk/core";
+          const sdk = (await import(sdkSpecifier)) as {
+            delegateCompactionToRuntime?: (p: unknown) => Promise<unknown>;
+          };
+          if (typeof sdk.delegateCompactionToRuntime !== "function") {
+            throw new Error("delegateCompactionToRuntime not exported by openclaw/plugin-sdk/core");
+          }
+          const result = await sdk.delegateCompactionToRuntime(params);
+          log.info("[astinus-engine] compact: delegated to the runtime's built-in compaction");
+          return result;
+        } catch (e) {
+          log.warn(
+            `[astinus-engine] compact: runtime delegation failed (${(e as Error)?.message ?? e}); ` +
+              "returning compacted=false - the host will report auto-compaction failed"
+          );
+          return {
+            ok: false,
+            compacted: false,
+            reason: `astinus: runtime compaction delegation failed: ${(e as Error)?.message ?? e}`,
+          };
+        }
+      },
+      // Durable-turn commit (Gate 2 decision): ONE atomic, idempotent write keyed
+      // by advancementKey. Persists the turn's statement<->topic mapping into the
+      // shared per-session state document and records the terminal anchor's
+      // rawSeq + generation and the admission..terminal range - the durable seq
+      // source the retain marker needs. THROWS on any failure so the host retries
+      // the same key; it must never report "committed" for a turn it did not
+      // persist (review 2026-09-13, Q1.2/Q1.3).
+      async commitTurn(params: {
+        advancementKey?: string;
+        messages?: unknown[];
+        sessionKey?: string;
+        sessionId?: string;
+        admission?: { rawSeq?: number; agentId?: string; storePath?: string };
+        terminal?: { rawSeq?: number; generation?: string };
+        isHeartbeat?: boolean;
+      }): Promise<{ status: "committed" | "duplicate" }> {
+        const key = params.sessionKey ?? params.sessionId;
+        const advancementKey =
+          typeof params.advancementKey === "string" ? params.advancementKey : "";
+        if (!key || !advancementKey) {
+          // The host contract requires both; a compliant host cannot reach here.
+          throw new Error("astinus commitTurn: missing session key or advancementKey");
+        }
+        if (loadSessionState(key).committedKeys.includes(advancementKey)) {
+          return { status: "duplicate" };
+        }
+        const messages = Array.isArray(params.messages) ? params.messages : [];
+        const heartbeat = params.isHeartbeat === true;
+        const startSeq =
+          typeof params.admission?.rawSeq === "number" ? params.admission.rawSeq : null;
+        const endSeq = typeof params.terminal?.rawSeq === "number" ? params.terminal.rawSeq : null;
+        const generation =
+          typeof params.terminal?.generation === "string" ? params.terminal.generation : null;
+        // F13: capture the PREVIOUS turn's positions before this commit touches anything, so the
+        // in-process check below compares N-1 rather than the turn it just wrote (which could
+        // never lag by construction, and could only report the failure the first branch already
+        // reports).
+        const prevStateSeq = loadSessionState(key).lastCommittedSeq;
+        const prevLedgerSeq = readMaxTurnSeq(key);
+
+        // 1. Ledger write FIRST - best-effort, never throws (R1). The state-document write
+        //    below remains the sole acknowledgement and the only thing that may throw.
+        const ledgerResult = insertCommittedTurn(
+          {
+            sessionKey: key,
+            agentId:
+              typeof params.admission?.agentId === "string" ? params.admission.agentId : "",
+            hostDbPath:
+              typeof params.admission?.storePath === "string" ? params.admission.storePath : "",
+            sessionId: typeof params.sessionId === "string" ? params.sessionId : key,
+            seqStart: startSeq ?? 0,
+            seqEnd: endSeq ?? 0,
+            generation: generation ?? "",
+            advancementKey,
+            heartbeat,
+          },
+          (m) => log.warn(m)
+        );
+        const now = Date.now();
+        // Only conversational roles feed the mapping and the pending-retain
+        // queue - tool output is noise and would bloat the state file (Q1.7).
+        const conversational = messages
+          .filter((m) => {
+            const role = (m as { role?: string } | null | undefined)?.role;
+            return role === "user" || role === "assistant";
+          })
+          .map((m) => ({
+            role: (m as { role: string }).role,
+            content: astinusMessageText(m),
+          }))
+          .filter((m) => m.content.length > 0);
+        updateSessionState(key, (s) => {
+          const topics = heartbeat ? s.topics : { ...s.topics };
+          if (!heartbeat) {
+            for (const m of conversational) {
+              const text = astinusMessageText(m);
+              if (!text) continue;
+              for (const tag of topicTags(classifyTurn(text).topics)) {
+                const slug = tag.startsWith("topic:") ? tag.slice(6) : tag;
+                const entry =
+                  topics[slug] ?? { firstSeenAt: now, lastSeenAt: now, statements: 0 };
+                entry.statements += 1;
+                entry.lastSeenAt = now;
+                topics[slug] = entry;
+              }
+            }
+          }
+          return {
+            ...s,
+            topics,
+            committedKeys: [...s.committedKeys, advancementKey],
+            lastCommittedSeq: endSeq ?? s.lastCommittedSeq,
+            lastCommittedRange:
+              startSeq !== null && endSeq !== null
+                ? { start: startSeq, end: endSeq }
+                : s.lastCommittedRange,
+            lastGenerationSeen: generation ?? s.lastGenerationSeen,
+            lastCommittedAt: now,
+            lastLedgerFailed: !ledgerResult.ok,
+            // Option (a): record the accepted turn for the retain loop to drain.
+            // Cleared on a successful retain.
+            pendingRetain:
+              heartbeat || startSeq === null || endSeq === null
+                ? s.pendingRetain
+                : appendPendingRange(s.pendingRetain, {
+                    start: startSeq,
+                    end: endSeq,
+                    messages: conversational,
+                  }),
+          };
+        });
+
+        // 3. Spawn the sidecar pass (detached, non-blocking) - only after a successful ledger
+        //    insert, and only for router-served keys (plan v3 §5, R3).
+        if (ledgerResult.ok && !heartbeat) {
+          try {
+            const passScript = `${WORKSPACE_ROOT}\\workspace\\skills\\astinus\\astinus_pass.py`;
+            if (existsSync(passScript)) {
+              // Step 1b (2026-09-18): fill the pressure inputs the pass needs, from the last
+              // assemble for this session. Without them "pressure" in the pass prompt is always
+              // unknown and marks stay 0 - the smart path can never fire (design §6.1).
+              const lastAssemble = astinusLastAssemble.get(key);
+              const passPayload = JSON.stringify({
+                session_key: key,
+                session_id: typeof params.sessionId === "string" ? params.sessionId : key,
+                range: [startSeq ?? 0, endSeq ?? 0],
+                gen: generation ?? "",
+                view_tokens: lastAssemble?.viewTokens ?? null,
+                token_budget: lastAssemble?.tokenBudget ?? null,
+                // Claude Q4 (09-18): the pass must read the estimate against the right scale.
+                estimator: lastAssemble?.estimator ?? "plugin",
+                window_first_seq: lastAssemble?.windowFirstSeq ?? null,
+              });
+              const passChild = spawn("python", [passScript], {
+                detached: true,
+                windowsHide: true,
+                stdio: ["pipe", "ignore", "ignore"],
+              });
+              passChild.stdin?.end(passPayload);
+              passChild.unref();
+            }
+          } catch (e) {
+            log.warn(`[astinus-pass] spawn failed: ${(e as Error).message}`);
+          }
+        }
+
+        // In-process checks (§12.3): the engine-serving and ledger-writer signals
+        // only, as a warn line — so a regression is in the gateway log within one
+        // turn rather than two hours (the 05-06 -> 09-10 lesson).
+        try {
+          if (!ledgerResult.ok) {
+            log.warn(
+              `[astinus-engine] in-process check: ledger writer failed (${ledgerResult.reason ?? "unknown"}) for ${key}`
+            );
+          } else {
+            // F13: compare the PREVIOUS turn (captured before this commit). A ledger whose max
+            // seq_end sits behind the state document's lastCommittedSeq means the previous
+            // turn's ledger row was missed.
+            if (
+              !heartbeat &&
+              prevStateSeq > 0 &&
+              prevLedgerSeq !== null &&
+              prevLedgerSeq < prevStateSeq
+            ) {
+              log.warn(
+                `[astinus-engine] in-process check: engine-serving lag - previous state lastCommittedSeq=${prevStateSeq}, ledger max seq_end=${prevLedgerSeq}`
+              );
+            }
+          }
+        } catch (e) {
+          log.warn(`[astinus-engine] in-process check failed: ${(e as Error).message}`);
+        }
+
+        return { status: "committed" };
+      },
+    }));
+    log.info(
+      `[astinus-engine] context engine registered (id: ${ASTINUS_ENGINE_ID}; inert until plugins.slots.contextEngine names it)`
+    );
+  } catch (e) {
+    log.warn(`[astinus-engine] registration failed: ${(e as Error).message}`);
+  }
+}
+
 const _registeredApis = new WeakSet<MoltbotPluginAPI>();
 
 export default function (api: MoltbotPluginAPI) {
@@ -2155,6 +3005,11 @@ export default function (api: MoltbotPluginAPI) {
 
     // Store config globally for bank ID derivation in hooks
     currentPluginConfig = pluginConfig;
+
+    // Register the (inert) Astinus context engine. Safe no-op until the host
+    // slot is switched on and the durable-turn contract lands.
+    configureSessionLedger(WORKSPACE_ROOT);
+    registerAstinusContextEngine(api);
 
     debug("[Hindsight] Plugin loaded successfully (deferred heavy init to gateway start)");
 
@@ -2601,6 +3456,43 @@ export default function (api: MoltbotPluginAPI) {
           return;
         }
 
+        // Context-pressure suspension (Vern 2026-09-21): over the suspend fraction, stop
+        // adding recall tokens until the desk recedes.
+        if (isRecallSuspended(ctx?.sessionKey)) {
+          debug(
+            `[Hindsight] Skipping recall: context over suspend fraction for ${ctx?.sessionKey}`
+          );
+          return;
+        }
+
+        // Cadence (Vern, order 2026-09-23 as amended; no-cold-start ruling 09-24 14:12):
+        // fire every 2 turns, with the FIRST fire on the second turn - a session on its
+        // first turn holds. A restart mid-session keeps firing: the ledger count is
+        // already past the floor. If this regresses recall latency (the 09-13
+        // shared-server concern), the debounce is the guard: report it, never silently
+        // revert.
+        const cadenceKey =
+          ctx?.sessionKey ??
+          (typeof event?.sessionKey === "string" ? event.sessionKey : undefined);
+        if (typeof cadenceKey === "string" && cadenceKey) {
+          const turnNow = readMaxTurnId(cadenceKey);
+          if (turnNow != null) {
+            // No cold start (Vern, 09-24 14:12): the FIRST fire is the second turn. At
+            // the second turn's assemble the ledger holds one committed turn, so an
+            // entry-less session holds while turnNow < 1: first fire lands on turn 2,
+            // then every 2 turns (2, 4, 6 ...).
+            const lastFired = lastRecallFireTurn.get(cadenceKey);
+            const floor = lastFired != null ? lastFired : -1;
+            if (turnNow - floor < 2) {
+              debug(
+                `[Hindsight] Recall cadence hold: turn ${turnNow}, last fired ${lastFired ?? "never"} (first fire is turn 2; every 2 turns)`
+              );
+              return;
+            }
+            lastRecallFireTurn.set(cadenceKey, turnNow);
+          }
+        }
+
         const sessionKeyForCache =
           ctx?.sessionKey ?? (typeof event?.sessionKey === "string" ? event.sessionKey : undefined);
         const skipTurnReason = sessionKeyForCache
@@ -2667,13 +3559,34 @@ export default function (api: MoltbotPluginAPI) {
           );
         }
         const recallRoles = pluginConfig.recallRoles ?? ["user", "assistant"];
+        // Edit 4 (order 2026-09-23, confirmed by Vern): the query seed is the LEDGER's
+        // newest live topic - the desk's own classification - not words lifted from the
+        // raw message. The raw extraction (validated above) stays as the first-touch
+        // fallback when nothing is classified yet, so a young session fires as today.
+        const edit4Key =
+          ctx?.sessionKey ??
+          (typeof event?.sessionKey === "string" ? event.sessionKey : undefined);
+        const newestLive =
+          typeof edit4Key === "string" && edit4Key
+            ? readNewestLiveTopic(edit4Key)
+            : null;
+        const topicSubstance = newestLive
+          ? `${newestLive.label}${newestLive.digest ? ` - ${newestLive.digest}` : ""}`.trim()
+          : null;
+        const querySeed =
+          topicSubstance && topicSubstance.length >= 8 ? topicSubstance : extracted;
+        if (topicSubstance && topicSubstance.length >= 8) {
+          debug(
+            `[Hindsight] Edit 4: recall query from ledger topic '${newestLive!.slug}' (${topicSubstance.length} chars)`
+          );
+        }
         const composedPrompt = composeRecallQuery(
-          extracted,
+          querySeed,
           sessionMessages,
           recallContextTurns,
           recallRoles
         );
-        let prompt = truncateRecallQuery(composedPrompt, extracted, recallMaxQueryChars);
+        let prompt = truncateRecallQuery(composedPrompt, querySeed, recallMaxQueryChars);
 
         // Final defensive cap
         if (prompt.length > recallMaxQueryChars) {
@@ -2698,35 +3611,240 @@ export default function (api: MoltbotPluginAPI) {
 
         debug(`[Hindsight] Auto-recall for bank ${bankId}, full query:\n---\n${prompt}\n---`);
 
+        // Topic filter (plan v4 item 3): the ledger feeds a SERVER-SIDE tag
+        // filter; the query itself stays substance-first (composeRecallQuery
+        // above). One classification, the same helper the retain side uses.
+        // Topic filter is OFF by default (review 2026-09-12, Gate 1 BLOCK):
+        // Hindsight's tags_match "any" includes UNTAGGED memories but excludes
+        // memories tagged with any other vocabulary, so a hard topic filter
+        // would drop the retain:*/tier:* protected corpus and silently restrict
+        // recall to the untagged minority. Gated behind
+        // pluginConfig.recallTopicFilter (default false).
+        const recallTopicTags = (() => {
+          if (pluginConfig.recallTopicFilter !== true) return [] as string[];
+          try {
+            // Plan SS9.1 (ledger-first): the LIVE topics of THIS session drive the
+            // topic tags - the pass's classifications, newest first, terminal
+            // topics excluded. The query itself stays substance-first
+            // (composeRecallQuery above); the tags ride the Gate 1 merge-not-filter
+            // path (unfiltered primary + topic secondary, merged by id - never a
+            // hard filter). No ledger / no topics yet (young session, cold handle
+            // after a restart) -> the regex classification, exactly as before.
+            const ledgerKey = (resolvedCtxForRecall as any)?.sessionKey;
+            if (typeof ledgerKey === "string" && ledgerKey) {
+              const slugs = readLiveTopics(ledgerKey, 2);
+              if (slugs.length > 0) {
+                debug(
+                  `[Hindsight] recall topic tags from ledger: ${slugs.join(", ")}`
+                );
+                return slugs.map((s) => `topic:${s}`);
+              }
+            }
+            return topicTags(classifyTurn(prompt).topics);
+          } catch {
+            return [] as string[];
+          }
+        })();
+        const recallTimeoutMs = pluginConfig.recallTimeoutMs ?? DEFAULT_RECALL_TIMEOUT_MS;
+        const recallOnce = (opts: {
+          via: "topic" | "unfiltered" | "subject";
+          tags?: string[];
+          tagsMatch?: "any" | "all" | "any_strict" | "all_strict" | "exact";
+          query?: string;
+        }): Promise<RecallResolution> =>
+          client
+            .recall(
+              {
+                query: opts.query ?? prompt,
+                maxTokens: pluginConfig.recallMaxTokens || 1024,
+                budget: pluginConfig.recallBudget,
+                types: pluginConfig.recallTypes,
+                preferObservations: pluginConfig.preferObservations,
+                minScores: pluginConfig.recallMinScores,
+                ...(opts.tags ? { tags: opts.tags, tagsMatch: opts.tagsMatch } : {}),
+              },
+              recallTimeoutMs
+            )
+            .then((response: RecallResponse) => ({ response, via: opts.via }));
+
+        // Merge the topic-filtered hits AHEAD of the unfiltered set (filtered
+        // promoted, de-duplicated by result id). Never a hard filter.
+        const mergeRecall = (
+          unfiltered: RecallResolution,
+          filtered: RecallResolution
+        ): RecallResolution => {
+          const seen = new Set<string>();
+          const merged: RecallResponse["results"] = [];
+          for (const r of filtered.response.results ?? []) {
+            const id = (r as { id?: string }).id;
+            if (id && seen.has(id)) continue;
+            if (id) seen.add(id);
+            merged.push(r);
+          }
+          for (const r of unfiltered.response.results ?? []) {
+            const id = (r as { id?: string }).id;
+            if (id && seen.has(id)) continue;
+            if (id) seen.add(id);
+            merged.push(r);
+          }
+          return {
+            response: { ...unfiltered.response, results: merged },
+            via: "topic+unfiltered",
+          };
+        };
+
+        const resolveRecall = async (): Promise<RecallResolution> => {
+          // Flag off (default): plain substance recall, unchanged behaviour.
+          if (recallTopicTags.length === 0) {
+            return recallOnce({ via: "unfiltered" });
+          }
+          // THIN-SUBJECT PROBE (ruling 2026-09-17): a NEW topic with little retained
+          // content under it may still have subjects whose history lives in the shared
+          // bank - all desks retain to the same bank, so searching a thin topic's
+          // subjects directly surfaces other desks' material about them. Additive lane:
+          // appended AFTER the prompt-driven lanes (M2), never replacing them.
+          const probeKey = (resolvedCtxForRecall as any)?.sessionKey;
+          const thinRows =
+            typeof probeKey === "string" && probeKey
+              ? readThinTopicSubjects(probeKey, 3, 6)
+              : [];
+          // M3: at most 2 topics x 2 subjects, newest first.
+          const pickedProbes: Array<{ topic: string; subject: string; object: string }> =
+            [];
+          const topicCounts = new Map<string, number>();
+          for (const r of thinRows) {
+            const n = topicCounts.get(r.topic) ?? 0;
+            if (n >= 2) continue;
+            if (n === 0 && topicCounts.size >= 2) continue;
+            topicCounts.set(r.topic, n + 1);
+            pickedProbes.push(r);
+          }
+          for (const s of pickedProbes) {
+            log.info(
+              `astinus recall: thin-subject probe - "${s.subject}" (topic ${s.topic})`
+            );
+          }
+          // Probe order (ruling 2026-09-17): the PAIR first, then subject alone.
+          // M1: predicate-alone only when it carries content (>= 4 words) - a bare
+          // "queued" in a shared bank is a noise generator.
+          const probeSubject = async (s: {
+            topic: string;
+            subject: string;
+            object: string;
+          }): Promise<RecallResolution | null> => {
+            const obj = s.object.trim();
+            const forms: Array<{ q: string; kind: string }> = [];
+            // F2 (fold review 2026-09-17): the object is optional - without one the pair
+            // form would be the subject-only query twice, so it is skipped.
+            if (obj) forms.push({ q: `${s.subject} ${obj}`.slice(0, 140), kind: "pair" });
+            forms.push({ q: s.subject, kind: "subject only" });
+            if (obj.split(/\s+/).length >= 4) {
+              forms.push({ q: obj, kind: "object only" });
+            }
+            for (const f of forms) {
+              if (!f.q.trim()) continue;
+              try {
+                const res = await recallOnce({ via: "subject", query: f.q });
+                if (res.response.results && res.response.results.length > 0) {
+                  debug(`[Hindsight] thin-subject probe "${s.subject}" hit on ${f.kind}`);
+                  return res;
+                }
+              } catch {
+                /* try the next form */
+              }
+            }
+            return null;
+          };
+          // M1: ONE deadline for the whole lane - a slow server must not make the
+          // prompt wait; late probes are dropped and the substance lanes carry on.
+          let laneTimer: ReturnType<typeof setTimeout> | undefined;
+          const probeLane = Promise.race([
+            Promise.all(pickedProbes.map(probeSubject)),
+            new Promise<Array<RecallResolution | null>>((resolve) => {
+              laneTimer = setTimeout(() => resolve([]), recallTimeoutMs);
+            }),
+          ]).finally(() => {
+            // m7 (fold review): never leave a dangling 20 s timer behind the lane.
+            if (laneTimer) clearTimeout(laneTimer);
+          });
+          const unfiltered = await recallOnce({ via: "unfiltered" });
+          const filtered = await recallOnce({
+            via: "topic",
+            tags: recallTopicTags,
+            tagsMatch: "any",
+          });
+          const subjectResults = await probeLane;
+          // M2: subject hits ride BEHIND the prompt-driven lanes - one per probe,
+          // two total - so substance keeps the top slots with recallTopK=5.
+          const subjectHits: RecallResponse["results"] = [];
+          for (const res of subjectResults) {
+            if (!res) continue;
+            const first = (res.response.results ?? [])[0];
+            if (first) subjectHits.push(first);
+          }
+          const subjectCapped = subjectHits.slice(0, 2);
+          const secondaryResults: RecallResponse["results"] = [
+            ...(filtered.response.results ?? []),
+          ];
+          if (secondaryResults.length === 0 && subjectCapped.length === 0) {
+            debug(
+              `[Hindsight] topic-filtered recall returned 0 results (${recallTopicTags.join(", ")}) - using unfiltered results`
+            );
+            return unfiltered;
+          }
+          const merged =
+            secondaryResults.length > 0
+              ? mergeRecall(unfiltered, {
+                  response: { ...filtered.response, results: secondaryResults },
+                  via: "topic+unfiltered",
+                })
+              : unfiltered;
+          const seenIds = new Set<string>();
+          for (const r of merged.response.results ?? []) {
+            const id = (r as { id?: string }).id;
+            if (id) seenIds.add(id);
+          }
+          const bridgeHits = subjectCapped.filter((r) => {
+            const id = (r as { id?: string }).id;
+            return !(id && seenIds.has(id));
+          });
+          const mergedList = merged.response.results ?? [];
+          // F1 (fold review 2026-09-17): downstream slices to recallTopK, so appending
+          // bridge hits last meant they were cut on EVERY turn. Reserve their slots
+          // instead - the injected set stays recallTopK total, 3-4 substance + 1-2 bridge.
+          const topK = pluginConfig.recallTopK ?? 0;
+          let finalResults: RecallResponse["results"] = mergedList;
+          if (bridgeHits.length > 0 && topK > 0) {
+            const keep = Math.max(3, topK - bridgeHits.length);
+            finalResults = [...mergedList.slice(0, keep), ...bridgeHits];
+          }
+          return { response: { ...merged.response, results: finalResults }, via: merged.via };
+        };
+
         // Recall with deduplication: reuse in-flight request for same bank
         const normalizedPrompt = prompt.trim().toLowerCase().replace(/\s+/g, " ");
         const queryHash = createHash("sha256").update(normalizedPrompt).digest("hex").slice(0, 16);
         const recallKey = `${bankId}::${queryHash}`;
         const existing = inflightRecalls.get(recallKey);
-        let recallPromise: Promise<RecallResponse>;
+        let recallPromise: Promise<RecallResolution>;
         if (existing) {
           debug(`[Hindsight] Reusing in-flight recall for bank ${bankId}`);
           recallPromise = existing;
         } else {
-          const recallTimeoutMs = pluginConfig.recallTimeoutMs ?? DEFAULT_RECALL_TIMEOUT_MS;
-          recallPromise = client.recall(
-            {
-              query: prompt,
-              maxTokens: pluginConfig.recallMaxTokens || 1024,
-              budget: pluginConfig.recallBudget,
-              types: pluginConfig.recallTypes,
-              preferObservations: pluginConfig.preferObservations,
-              minScores: pluginConfig.recallMinScores,
-            },
-            recallTimeoutMs
-          );
+          recallPromise = resolveRecall();
           inflightRecalls.set(recallKey, recallPromise);
           void recallPromise.catch(() => {}).finally(() => inflightRecalls.delete(recallKey));
         }
 
         const recallStart = pluginConfig.debugPerfTiming ? Date.now() : 0;
-        const response = await recallPromise;
+        const resolution = await recallPromise;
+        const response = resolution.response;
         const recallElapsedMs = pluginConfig.debugPerfTiming ? Date.now() - recallStart : 0;
+        debug(
+          `[Hindsight] Recall served via ${resolution.via} path (topic filter: ${
+            recallTopicTags.length > 0 ? recallTopicTags.join(", ") : "none"
+          })`
+        );
 
         if (!response.results || response.results.length === 0) {
           if (pluginConfig.debugPerfTiming) {
@@ -2734,6 +3852,7 @@ export default function (api: MoltbotPluginAPI) {
               formatHookPerf("before_prompt_build", Date.now() - perfHookStart, {
                 recall_main: `${recallElapsedMs}ms`,
                 source: existing ? "reused" : "fresh",
+                via: resolution.via,
                 results: 0,
               })
             );
@@ -2746,9 +3865,17 @@ export default function (api: MoltbotPluginAPI) {
           `[Hindsight] Raw recall response (${response.results.length} results before topK):\n${response.results.map((r: any, i: number) => `  [${i}] score=${r.score?.toFixed(3) ?? "n/a"} type=${r.type ?? "n/a"}: ${JSON.stringify(r.content ?? r.text ?? r).substring(0, 200)}`).join("\n")}`
         );
 
+        // Order 2026-09-24: recency is the sort key, never a filter - newest first,
+        // so stale-era records lose their slot to fresher ones (era-noise fix).
+        const byRecency = [...response.results].sort(
+          (a: any, b: any) =>
+            String(b.mentioned_at ?? b.occurred_start ?? "").localeCompare(
+              String(a.mentioned_at ?? a.occurred_start ?? "")
+            )
+        );
         const results = pluginConfig.recallTopK
-          ? response.results.slice(0, pluginConfig.recallTopK)
-          : response.results;
+          ? byRecency.slice(0, pluginConfig.recallTopK)
+          : byRecency;
 
         debug(
           `[Hindsight] After topK (${pluginConfig.recallTopK ?? "unlimited"}): ${results.length} results injected`
@@ -2756,7 +3883,7 @@ export default function (api: MoltbotPluginAPI) {
 
         // Format memories as a bullet list (text + type + date + occurred window +
         // [doc:<document_id>], each part present only when the memory carries it)
-        const memoriesFormatted = formatMemories(results);
+        const memoriesFormatted = formatMemories(results, { markAsEarlierRecords: true });
 
         const contextMessage = `<hindsight_memories>
 ${pluginConfig.recallPromptPreamble || DEFAULT_RECALL_PROMPT_PREAMBLE}
@@ -2774,6 +3901,7 @@ ${memoriesFormatted}
             formatHookPerf("before_prompt_build", Date.now() - perfHookStart, {
               recall_main: `${recallElapsedMs}ms`,
               source: existing ? "reused" : "fresh",
+              via: resolution.via,
               results: results.length,
             })
           );
@@ -2961,7 +4089,154 @@ ${memoriesFormatted}
         let messagesToRetain = allMessages;
         let retainFullWindow = false;
 
-        if (retainEveryN > 1) {
+        // Position-based delta selection (plan v4). The durable per-session
+        // state carries the retained position; the context engine's commit
+        // ranges are the delta (the agent_end payload never carries seqs). No
+        // windows, no overlap, no duplicates, restart-safe. retainEveryNTurns
+        // is only a cost gate (how often to commit); correctness lives in the
+        // durable state.
+        let markerAdvance: {
+          sessionKey: string;
+          seq: number;
+          hashes: string[];
+          clearPending?: boolean;
+        } | null = null;
+
+        const markerSessionKey = effectiveCtx?.sessionKey;
+        // One durable read serves both the marker path and the committed-range
+        // path (option a).
+        const sessionStateForRetain = markerSessionKey
+          ? loadSessionState(markerSessionKey)
+          : null;
+        // The engine "serves" a session once it has committed a durable turn.
+        // While it serves, the legacy cadence must never run - it would re-retain
+        // turns the commit-range path already covers (review 2026-09-13, Q1 major).
+        // Q2 fix (Claude 09-18): serving is TURN-relative - an assemble happened after the
+        // previous agent_end for this session. A 10-minute clock expires during long tool turns
+        // (exec with 600s timeouts) and mis-read a serving engine as not-serving; the clock is
+        // now only the first-turn-after-restart fallback (no previous agent_end recorded).
+        const lastAssembledAt = markerSessionKey
+          ? astinusLastAssemble.get(markerSessionKey)?.at
+          : undefined;
+        const prevAgentEndAt = markerSessionKey
+          ? astinusLastAgentEnd.get(markerSessionKey)
+          : undefined;
+        const assembledThisTurn =
+          typeof lastAssembledAt === "number" &&
+          (typeof prevAgentEndAt === "number"
+            ? lastAssembledAt > prevAgentEndAt
+            : Date.now() - lastAssembledAt < ASTINUS_SERVING_WINDOW_MS);
+        // Record THIS turn's end before any early return, so the next turn compares against it.
+        if (markerSessionKey) {
+          setCappedMapValue(astinusLastAgentEnd, markerSessionKey, Date.now());
+        }
+        // Caps-gap review item 1 (Claude, 2026-09-20): recency, not history. The old second
+        // clause was an "ever committed once" flag - permanently true after a single commit - so a
+        // desk whose commits STOPPED (topic:31: zero commits in 2+ hours under constant traffic)
+        // kept holding its pending ranges forever. The engine serves only while it has committed
+        // inside the recency window; otherwise the legacy drain path gets the ranges.
+        const committedRecently =
+          !!sessionStateForRetain &&
+          sessionStateForRetain.lastCommittedAt > 0 &&
+          Date.now() - sessionStateForRetain.lastCommittedAt < ASTINUS_COMMIT_RECENCY_MS;
+        const engineServing =
+          !!sessionStateForRetain && assembledThisTurn && committedRecently;
+        // Plan SS9.3 (retain tags from the ledger): the ranges being drained by
+        // THIS retain, and the tags derived from them. Null = no ledger ranges in
+        // this retain (legacy cadence / seq path) - the regex classification stays
+        // exactly as before.
+        let drainedLedgerRanges: Array<{ start: number; end: number }> | null = null;
+        let ledgerTopicTags: string[] | null = null;
+
+        if (
+          markerSessionKey &&
+          sessionStateForRetain &&
+          sessionStateForRetain.pendingRetain.length > 0
+        ) {
+          // Option (a): the agent_end payload never carries transcript seqs, so
+          // once the context engine is serving turns the durable commit ranges
+          // are the only precise source. Drain them on the same cadence and
+          // advance only on a successful retain (slot-day change).
+          const pendingRanges = sessionStateForRetain.pendingRetain;
+          // Caps-gap review item 2 (Claude, 2026-09-20): the unfoolable backstop. A range older
+          // than ASTINUS_STUCK_RANGE_MS drains no matter what `engineServing` says; ranges written
+          // before this deploy carry no stamp and count as already stuck (they are).
+          const stuckPending = pendingRanges.some(
+            (r) => typeof r.at !== "number" || Date.now() - r.at > ASTINUS_STUCK_RANGE_MS
+          );
+          if (!engineServing || stuckPending) {
+            // Q1 (Claude 09-18): the legacy counter froze while the engine served, so its next
+            // boundary could re-retain turns this drain is about to cover. Reset it for this key -
+            // and likewise when an age-stuck range forces the drain under a nominally-serving engine.
+            turnCountBySession.delete(`${bankId}:${effectiveCtx?.sessionKey || "session"}`);
+          }
+          const pendingMsgs = pendingRanges.flatMap((r) => r.messages);
+          if (pendingMsgs.length === 0) {
+            // Nothing conversational in the pending ranges: clear them without
+            // touching the marker.
+            tryUpdateSessionState(markerSessionKey, (s) => ({ ...s, pendingRetain: [] }));
+            return;
+          }
+          const pendingTurns = pendingMsgs.filter((m: any) => m?.role === "user").length;
+          const pendingEndSeq = Math.max(...pendingRanges.map((r) => r.end));
+          // Holding is only justified while the engine is still committing turns. With the
+          // engine not serving (kill switch, or a caps-blocked desk) these ranges are real,
+          // committed, un-retained conversation that nothing will ever re-offer - drain them
+          // now (Q3 fix, 2026-09-18), then the counter path resumes on the next turn.
+          if (!force && pendingTurns < retainEveryN && engineServing && !stuckPending) {
+            debug(
+              `[Hindsight Hook] commit-range: ${pendingTurns}/${retainEveryN} un-retained turns - holding (${pendingMsgs.length} msgs, ${pendingRanges.length} ranges)`
+            );
+            return;
+          }
+          if (stuckPending && engineServing) {
+            log.info(
+              `[astinus-engine] commit-range: age-stuck range(s) (> ${Math.round(ASTINUS_STUCK_RANGE_MS / 60000)} min) - draining despite engine-serving`
+            );
+          }
+          messagesToRetain = pendingMsgs;
+          retainFullWindow = true;
+          drainedLedgerRanges = pendingRanges;
+          markerAdvance = {
+            sessionKey: markerSessionKey,
+            seq: pendingEndSeq,
+            hashes: pendingMsgs.map((m: any) =>
+              createHash("sha256")
+                .update(
+                  typeof m?.content === "string" ? m.content : JSON.stringify(m?.content ?? "")
+                )
+                .digest("hex")
+            ),
+            clearPending: true,
+          };
+          log.info(
+            `commit-range: retained ${pendingMsgs.length} msgs / ${pendingTurns} turns through seq ${pendingEndSeq}`
+          );
+          debug(
+            `[Hindsight Hook] commit-range: draining ${pendingRanges.length} committed range(s)`
+          );
+        } else if (engineServing) {
+          // Q3 fix: info once per session per hour - this skip was debug-only and stayed
+          // silent while it starved two desks' bank writes for days (09-18 wedge response).
+          const lastSkipLog = markerSessionKey
+            ? astinusRetainSkipLoggedAt.get(markerSessionKey)
+            : undefined;
+          // Q3 (Claude 09-18): cap the map, and the line carries the numbers a reader needs.
+          const skipLine =
+            `[Hindsight Hook] commit-range: engine serving, nothing committed-unretained - skipping retain` +
+            ` (lastAssembledAt=${typeof lastAssembledAt === "number" ? `${Math.round((Date.now() - lastAssembledAt) / 1000)}s` : "n/a"}` +
+            ` pending=${sessionStateForRetain.pendingRetain.length}` +
+            ` lastCommittedSeq=${sessionStateForRetain.lastCommittedSeq})`;
+          if (!lastSkipLog || Date.now() - lastSkipLog > ASTINUS_SKIP_LOG_INTERVAL_MS) {
+            if (markerSessionKey) {
+              setCappedMapValue(astinusRetainSkipLoggedAt, markerSessionKey, Date.now());
+            }
+            log.info(skipLine);
+          } else {
+            debug(skipLine);
+          }
+          return;
+        } else if (retainEveryN > 1) {
           const sessionTrackingKey = `${bankId}:${effectiveCtx?.sessionKey || "session"}`;
           // session_end is a flush, not a turn — don't increment the counter.
           const turnCount = force
@@ -3060,9 +4335,24 @@ ${memoriesFormatted}
           return;
         }
 
+        // ONE classification per retain (plan v4 item 3): the quality gate and
+        // the topic tags read the same result — classifyTurn is a cheap regex
+        // pass, but there is no reason to run it twice.
+        let turnClassification: { activity: string; topics: string[] } | null = null;
+        const getTurnClassification = (): { activity: string; topics: string[] } => {
+          if (!turnClassification) {
+            try {
+              turnClassification = classifyTurn(transcript);
+            } catch {
+              turnClassification = { activity: "general", topics: [] };
+            }
+          }
+          return turnClassification;
+        };
+
         if (pluginConfig.retainQualityGate) {
           try {
-            const { activity, topics } = classifyTurn(transcript);
+            const { activity, topics } = getTurnClassification();
             let skipReason = "";
             if (activity === "chitchat" && topics.length === 0 && transcript.length < 200) skipReason = "short chitchat";
             else if (activity === "memory-meta" && topics.length === 0) skipReason = "memory-meta noise";
@@ -3106,6 +4396,24 @@ ${memoriesFormatted}
             ? await refreshQueueOperationIdCapability(retainGeneration, retainSignal)
             : asyncRetainOperationIdCapability;
         if (!retainLifecycleIsCurrent()) return;
+        // Ledger topics for the drained ranges (plan SS9.3). Computed HERE because
+        // getTurnClassification is defined below this point - calling it inside the
+        // drain branch would hit the temporal dead zone.
+        if (drainedLedgerRanges && markerSessionKey) {
+          const ledgerTopics = readTopicsForRanges(markerSessionKey, drainedLedgerRanges);
+          if (ledgerTopics.uncovered.length > 0) {
+            // R6: ranges the pass has not reached get the regex classification,
+            // written back as source='fallback' so Gate L sees the coverage gap.
+            const regexTopics = getTurnClassification().topics;
+            writeFallbackTopics(markerSessionKey, ledgerTopics.uncovered, regexTopics);
+            ledgerTopicTags = [
+              ...ledgerTopics.slugs.map((s) => `topic:${s}`),
+              ...topicTags(regexTopics),
+            ];
+          } else {
+            ledgerTopicTags = ledgerTopics.slugs.map((s) => `topic:${s}`);
+          }
+        }
         const retainNow = Date.now();
         const retainRequest = buildRetainRequest(
           transcript,
@@ -3118,7 +4426,10 @@ ${memoriesFormatted}
             windowTurns: retainFullWindow
               ? (pluginConfig.retainEveryNTurns ?? 1) + (pluginConfig.retainOverlapTurns ?? 0)
               : undefined,
-            tags: inlineRetainTags,
+            tags: [
+              ...inlineRetainTags,
+              ...(ledgerTopicTags ?? topicTags(getTurnClassification().topics)),
+            ],
             appendSupported: supportsUpdateModeAppend,
             operationId: createAsyncRetainOperationId(),
           }
@@ -3149,6 +4460,29 @@ ${memoriesFormatted}
           debug(
             `[Hindsight] Retained ${messageCount} messages to bank ${bankId} for session ${retainRequest.documentId}`
           );
+
+          // Advance the durable marker (plan v4): the position moves only after
+          // a successful retain, so a crash or a failed send re-offers the same
+          // delta next turn — no duplicates, no gaps.
+          if (markerAdvance) {
+            const advance = markerAdvance;
+            // Advance the durable marker (merge-safe + best-effort). The commit
+            // path owns lastGenerationSeen, so this write does not touch it.
+            tryUpdateSessionState(advance.sessionKey, (s) => ({
+              ...s,
+              lastRetainedSeq: advance.seq,
+              lastRetainedAt: Date.now(),
+              chunkHashes: [...s.chunkHashes, ...advance.hashes],
+              // Clear only the drained ranges (end <= the advanced seq); a turn
+              // committed during the retain RPC must survive (review 2026-09-13, Q1 blocker).
+              pendingRetain: advance.clearPending
+                ? s.pendingRetain.filter((r) => r.end > advance.seq)
+                : s.pendingRetain,
+            }));
+            debug(
+              `[Hindsight Hook] marker advanced to seq ${advance.seq} (+${advance.hashes.length} hashes)`
+            );
+          }
           // After a successful retain, try flushing any queued items
           if (retainQueue) {
             flushRetainQueue(undefined, undefined, undefined, retainGeneration, retainSignal).catch(
@@ -3223,7 +4557,6 @@ ${memoriesFormatted}
     // and never conflicts with them on rebase.
     // ============================================================
     const startupMandatedSessions = new Set<string>();
-    const WORKSPACE_ROOT = "I:\\OpenClaw\\.openclaw";
     // PER-SESSION ENRICH (edit 3/3, v4): module-scope Maps — survives entry-function
     // re-runs through jiti's module cache (the retain counter's pattern). The old
     // single variable was closure-scoped inside the register function and reset
@@ -3232,6 +4565,9 @@ ${memoriesFormatted}
     const astinusActiveSpawns = new Map<number, number>(); // childPid -> startMs
     const ASTINUS_DEBOUNCE_MS = 90_000;
     const ASTINUS_SPAWN_CAP = 6;
+// Plan v4.2 SS9.2: the enrich delta rule's lookback - a topic counts as novel
+// when the newest classified turn introduces one unseen in the last K turns.
+const ASTINUS_DELTA_TURNS = 8;
     const ASTINUS_SPAWN_GC_MS = 120_000;
 
     // ============================================================
@@ -3402,7 +4738,12 @@ ${memoriesFormatted}
         // Inject folder drain: reads workspace/inject/, injects as <injected file>,
         // deletes consumed files.
         const injectDir = `${WORKSPACE_ROOT}\\workspace\\inject`;
-        const injectExists = await access(injectDir).then(() => true).catch(() => false);
+        const injectSuspended = isRecallSuspended(ctx?.sessionKey);
+        if (injectSuspended)
+          debug("[Hindsight customizations] inject drain suspended (context pressure)");
+        const injectExists = injectSuspended
+          ? false
+          : await access(injectDir).then(() => true).catch(() => false);
         if (injectExists) {
           const files = (await readdir(injectDir, { withFileTypes: true })).filter(
             (e) => !e.name.startsWith(".")
@@ -3452,6 +4793,13 @@ ${memoriesFormatted}
               }
               continue; // never readFile a directory entry directly
             }
+            // Double-delivery fix (2026-09-13): astinus-context.md is the
+            // FALLBACK for sessions without a session key. A keyed session gets
+            // its own file under astinus/, so delivering the flat one too would
+            // inject the same content twice (double tokens every turn).
+            if (entry.name === "astinus-context.md" && ctx?.sessionKey) {
+              continue;
+            }
             drained.push(await drainOne(entry.name));
           }
           for (const d of drained) {
@@ -3469,7 +4817,7 @@ ${memoriesFormatted}
         // Heartbeat injection: for heartbeat sessions, inject heartbeat-full.md.
         const sessionKey =
           ctx?.sessionKey || (typeof event?.sessionKey === "string" ? event.sessionKey : "");
-        if (sessionKey.includes(":heartbeat")) {
+        if (sessionKey.includes(":heartbeat") && !isRecallSuspended(sessionKey)) {
           const hbPath = `${WORKSPACE_ROOT}\\workspace\\heartbeat-full.md`;
           if (existsSync(hbPath)) {
             const hbContent = await readFile(hbPath, "utf8");
@@ -3615,6 +4963,10 @@ ${memoriesFormatted}
       try {
         const sessionKey =
           ctx?.sessionKey || (typeof event?.sessionKey === "string" ? event.sessionKey : "");
+        if (isRecallSuspended(sessionKey)) {
+          debug("[Hindsight customizations] enrich suspended (context pressure)");
+          return;
+        }
         // PER-SESSION ENRICH (review finding 3): gate on the CHANNEL segment, not
         // ':main:' — the old test matched the agent-id segment and admitted
         // subagent/cron/heartbeat sessions too (live log counts confirmed).
@@ -3636,6 +4988,26 @@ ${memoriesFormatted}
         if (astinusActiveSpawns.size >= ASTINUS_SPAWN_CAP) return;
         const enrichScript = `${WORKSPACE_ROOT}\\workspace\\skills\\astinus\\enrich.py`;
         if (!existsSync(enrichScript)) return;
+        // DELTA RULE (plan v4.2 SS9.2): enrich fires on topic NOVELTY, not the
+        // clock alone. The ledger's newest classified turn vs the previous K:
+        // skip when every topic is already seen AND the top topic is unchanged.
+        // A skipped check does NOT consume the debounce window (last-spawn is
+        // only stamped on a real spawn). No ledger / no classified turns yet ->
+        // fire, exactly as before (young sessions still get their first enrich).
+        const delta = readTopicDelta(sessionKey, ASTINUS_DELTA_TURNS);
+        if (delta && delta.newest.length > 0) {
+          const novel = delta.newest.filter((t) => !delta.recent.includes(t));
+          const topChanged = delta.prevTop != null && delta.newest[0] !== delta.prevTop;
+          if (novel.length === 0 && !topChanged) {
+            debug(
+              `[Hindsight customizations] enrich skipped: no topic delta (top=${delta.newest[0]}, ${delta.recent.length} recent)`
+            );
+            return;
+          }
+          log.info(
+            `astinus enrich: delta fire (novel: ${novel.join(", ") || "none"}; top ${delta.newest[0]})`
+          );
+        }
         astinusLastSpawnBySession.set(sessionKey, now);
         // Build the JSON payload enrich.py reads on stdin (topics + last turn text).
         let astinusPayload = "{}";
@@ -3675,9 +5047,21 @@ ${memoriesFormatted}
               )
             ).slice(0, 5);
           }
+          // Ledger-first topics (plan SS9.2): when the delta read classified
+          // topics, they lead the payload (labels = slugs dashed back to words);
+          // the regex topics follow, deduped, capped.
+          if (delta && delta.newest.length > 0) {
+            const ledgerTopics = delta.newest.map((s) => s.replace(/-/g, " "));
+            topics = Array.from(new Set([...ledgerTopics, ...topics])).slice(0, 6);
+          }
           astinusPayload = JSON.stringify({
             topics,
-            last_user_message: lastUser.slice(0, 800),
+            // Ruling 2026-09-17: instances ride WITH their topic - the live topics'
+          // subject/predicate roster travels the payload in parallel with recall,
+          // so instance specificity survives the topic zoom-out without
+          // polluting the topic vocabulary.
+          topic_subjects: readTopicSubjects(sessionKey, 12),
+          last_user_message: lastUser.slice(0, 800),
             conversation_summary: `${lastUser.slice(0, 300)}\n---\n${lastAssistant.slice(0, 500)}`.trim(),
             active_tasks: [],
             // PER-SESSION ENRICH (edit 1/3): carry the session identity so enrich.py

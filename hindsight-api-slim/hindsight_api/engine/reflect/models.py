@@ -102,8 +102,35 @@ class StructuredOutputResult(BaseModel):
     structured_output: dict[str, Any] | None = Field(
         default=None, description="Generated structured output, or None if generation failed"
     )
+    error: str | None = Field(
+        default=None,
+        description=(
+            "Why the extraction call produced no structured output, when it failed. None on success. "
+            "Callers cannot otherwise tell a failed extraction from one that had nothing to extract."
+        ),
+    )
     input_tokens: int = Field(default=0, description="Input tokens used")
     output_tokens: int = Field(default=0, description="Visible output tokens used")
+    cached_tokens: int = Field(default=0, description="Cached prefix tokens. Subset of input_tokens.")
+    thoughts_tokens: int = Field(default=0, description="Reasoning/thinking tokens, when reported by the provider")
+
+
+class LengthRewrite(BaseModel):
+    """Outcome of the post-hoc ``max_tokens`` rewrite of a final answer.
+
+    ``applied`` is False when the answer was already inside the budget (or there
+    was no budget), in which case ``markdown``/``structure`` are the inputs
+    unchanged and every token count is zero.
+    """
+
+    applied: bool = Field(description="Whether a rewrite call was actually made")
+    markdown: str = Field(description="The answer text after the rewrite")
+    structure: StructuredDocument | None = Field(
+        default=None, description="The document ``markdown`` renders from, when the answer is a document"
+    )
+    duration_ms: int = Field(default=0, description="Rewrite call duration in milliseconds")
+    input_tokens: int = Field(default=0, description="Input tokens used by the rewrite call")
+    output_tokens: int = Field(default=0, description="Visible output tokens used by the rewrite call")
     cached_tokens: int = Field(default=0, description="Cached prefix tokens. Subset of input_tokens.")
     thoughts_tokens: int = Field(default=0, description="Reasoning/thinking tokens, when reported by the provider")
 
@@ -121,6 +148,14 @@ class ReflectAgentResult(BaseModel):
     )
     structured_output: dict[str, Any] | None = Field(
         default=None, description="Structured output parsed according to provided response_schema"
+    )
+    structured_output_error: str | None = Field(
+        default=None,
+        description=(
+            "Why the structured-output extraction failed, when a response_schema was given and the "
+            "extraction call errored or returned unparseable output. None when it succeeded or when "
+            "no schema was requested."
+        ),
     )
     iterations: int = Field(default=0, description="Number of iterations taken")
     tools_called: int = Field(default=0, description="Total number of tool calls made")

@@ -9,7 +9,7 @@ description: "One Hindsight memory plugin for coding agents — per-repo memory 
 
 Long-term project memory for **coding agents**, backed by [Hindsight](https://vectorize.io/hindsight).
 One package, several agents: a shared reflect-and-inject core with a thin entry point per agent
-(**opencode**, **opencode 2**, **Kilo CLI**, **Cline CLI**, **pi**, **Prime Agent**, **DeepSeek Harness**, **Claude Code**, **Codex CLI**, **DeepAgents Dcode**, **Antigravity CLI**, **Cursor CLI**, **GitHub Copilot CLI**, **Devin CLI**, **Grok Build**). Ingestion is fully
+(**Claude Code**, **Codex CLI**, **DeepAgents Dcode**, **opencode**, **opencode 2**, **Kilo CLI**, **Cursor CLI**, **GitHub Copilot CLI**, **Grok Build**, **Qwen Code**, **Factory Droid**, **ZCode**, **Antigravity CLI**, **Devin CLI**, **Cline CLI**, **pi**, **Prime Agent**, **DeepSeek Harness**). Ingestion is fully
 automatic — there is no setup command: a repo's git history and conversations flow into its memory
 bank in the background as you work.
 
@@ -28,6 +28,7 @@ npx @vectorize-io/hindsight-coding-agents install all          # every detected 
 npx @vectorize-io/hindsight-coding-agents install claude-code  # or just one
 npx @vectorize-io/hindsight-coding-agents uninstall all        # removes exactly what install added
 npx @vectorize-io/hindsight-coding-agents update               # refresh the runtime only, no rewiring
+npx @vectorize-io/hindsight-coding-agents stats                # how often each agent uses Hindsight
 ```
 
 `install` takes an explicit target — `all`, or one or more harness names. A bare
@@ -156,6 +157,45 @@ Native hooks in `~/.qwen/settings.json`, plus MCP and the companion skill.
 > Recall fires on genuine submissions only — `UserPromptSubmit` also fires on tool-result
 > continuations, so interactive sessions recall once per prompt while headless (`qwen -p`),
 > `serve`, SDK and ACP sessions seed and retain but do not recall.
+
+#### <img src="/img/harness/factory-droid.svg" alt="" width="20" height="20" /> Factory Droid
+
+```bash
+npx @vectorize-io/hindsight-coding-agents install factory-droid
+```
+
+4 hook registrations in `~/.factory/hooks.json` (user scope), including a cancellation-safe
+`Notification` write-back, plus a stdio MCP registration under
+`mcpServers.hindsight` in `~/.factory/mcp.json`, and the companion skill in `~/.factory/skills`.
+The installer touches only JSON files - no Droid CLI round-trip - and refuses to overwrite a
+user-managed MCP server already named `hindsight`. Droid's hook protocol matches Claude Code's
+(`session_id`/`transcript_path`/`cwd` in, `hookSpecificOutput.additionalContext` out). Recall and
+injection use the same protocol; write-back also handles Droid's cancellation notification because
+Droid does not emit `Stop` after a cancelled turn.
+
+#### <img src="/img/harness/zcode.svg" alt="" width="20" height="20" /> ZCode
+
+```bash
+npx @vectorize-io/hindsight-coding-agents install zcode
+```
+
+Three hook registrations plus a stdio MCP server under `mcp.servers.hindsight`, both in ZCode's own
+CLI config `~/.zcode/cli/config.json` - never your real Claude Code settings, even though ZCode
+embeds the Claude Code agent runtime and speaks its hook protocol. The companion skill goes to
+`~/.zcode/skills`. Config hooks ship **disabled**, so the installer also sets `hooks.enabled` to
+`true`; `uninstall` removes the whole block again when nothing else is registered there, and
+refuses to touch an MCP server named `hindsight` that it did not write.
+
+> ZCode's hook `timeoutMs` is in **milliseconds** (installed values `30000/30000/60000`), and
+> `hooks.maxOutputBytes` caps what a hook may print - anything larger is dropped, injection and
+> all. The installer seeds it at `32768` only when your config does not already set one.
+>
+> ZCode keeps no durable session transcript: `Stop` carries the reply plus a temp, assistant-only
+> file it deletes as soon as the hook returns, and no user prompt at all. So this is the one agent
+> whose conversation the plugin journals itself - the prompt hook records what you asked, the
+> `Stop` hook records the reply - and the write-back then behaves like every other agent's,
+> appending each new turn to the same session document. `--import-conversations` is therefore not
+> available for ZCode: there is no past history on disk to backfill from.
 
 #### <img src="/img/harness/antigravity-cli.png" alt="" width="20" height="20" /> Antigravity CLI
 
@@ -397,8 +437,8 @@ as `HINDSIGHT_MAX_PARALLEL_RETAINS` for containers and CI.
 
 `HINDSIGHT_CONFIG` moves the file itself — point it at another path for a container or a test
 harness where `$HOME` is not the right anchor. It is still exactly one file; only its location
-changes. (The other variables that are not settings are `HINDSIGHT_LOG_FILE`, `HINDSIGHT_DIAG_FILE`
-and `HINDSIGHT_LOG_LEVEL` — see Diagnostics & logging.)
+changes. (The other variables that are not settings are `HINDSIGHT_LOG_FILE`, `HINDSIGHT_DIAG_FILE`,
+`HINDSIGHT_USAGE_FILE` and `HINDSIGHT_LOG_LEVEL` — see Diagnostics & logging.)
 
 ### When a change takes effect
 
@@ -480,20 +520,20 @@ hook by Codex...), so one shared config serves several agents side by side:
 | `manageBankConfig`      | `true`                               | let the plugin shape the bank's own configuration — the retain strategies it writes under, the `knowledge` entity-label group, and, on a bank that has none, the missions. Writing is strictly **additive**: it adds what the bank does not define and never overwrites what is there, so your control-plane edits survive. Set `false` to keep it out of the bank config entirely — see **A bank you shape yourself** below                                                                                                                                                                                                                                                                 |
 | `observationScopes`     | `"shared"`                           | how consolidation groups observations: `"shared"` (default) = ONE global scope per bank, so every agent on a repo builds one set of beliefs; also `"combined"` (the server default), `"per_tag"`, `"all_combinations"`, `[["t"]]`; `"per_source"` adds a scope per `source:` kind alongside the global one, so commit knowledge and conversation knowledge consolidate apart                                                                                                                                                                                                                                                                                                                 |
 | `disabled`              | `false`                              | hard off-switch (inert plugin/hook — a no-memory baseline)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| `reflectTimeoutMs`      | `120000`                             | **automatic** session-reflect timeout (hook harnesses additionally cap it at 25s to fit the host's hook window); on timeout the session runs without reflect (recorded)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `reflectTimeoutMs`      | `120000`                             | **automatic** session-reflect timeout (hook harnesses additionally cap it at 20s to fit the host's hook window); on timeout or a 5xx the hook falls back to knowledge-page search, then to a raw recall of observations (recorded)                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `reflectToolTimeoutMs`  | `330000`                             | timeout for the agent-invoked `hindsight_reflect` tool — a call the agent waits on, whose high-budget synthesis on a populated bank runs for minutes. Defaults above the server's own reflect wall timeout (`HINDSIGHT_API_REFLECT_WALL_TIMEOUT`, 300s) so the server decides when to give up. Unset, it inherits an explicitly raised `reflectTimeoutMs`, but a short one never lowers it                                                                                                                                                                                                                                                                                                   |
 | `reflectBudget`         | `"high"`                             | reflect budget for the `hindsight_reflect` tool: `"low"`, `"mid"` or `"high"`. Drop it on a large bank where high-budget synthesis exceeds the server's wall timeout. The automatic session-start reflect always uses `"low"` to fit its hook window and is unaffected                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `autoReflect`           | `true`                               | inject a one-time reflect synthesis on the session's **first prompt**. `false` = tool-only reflect: nothing is injected; the agent searches knowledge pages first and reflects only when they are too shallow                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `pageRefreshEveryTurns` | `10`                                 | refetch the knowledge pages and re-inject the page roster + tool guide every N user turns                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| `pageTriggerType`       | `"auto-refresh"`                     | when NEW knowledge pages refresh, i.e. what keeping them current costs — `"auto-refresh"` after every consolidation that produced new material, `"cron"` on `pageTriggerCron` only, `"manual"` never on their own. Auto-refresh is the most current and the most expensive: one synthesis per page per consolidation. Maps to the page's `trigger.refresh_after_consolidation` in the Hindsight API (`true` for auto-refresh, `false` for manual)                                                                                                                                                                                                                                            |
-| `pageTriggerCron`       | —                                    | schedule for `pageTriggerType: "cron"` — UTC, standard 5-field cron, e.g. `"0 3 * * *"`. Sets the page's `trigger.refresh_cron`, which the API treats as mutually exclusive with `refresh_after_consolidation`; a scheduled refresh is skipped when nothing changed                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `pageTriggerType`       | `"cron"`                             | when NEW knowledge pages refresh, i.e. what keeping them current costs — `"cron"` (default) on `pageTriggerCron` only and only when actually stale, `"auto-refresh"` after every consolidation that produced new material, `"manual"` never on their own. Auto-refresh is the most current and by far the most expensive: one synthesis per page per consolidation. Maps to the page's `trigger.refresh_cron`, or `trigger.refresh_after_consolidation` in the Hindsight API (`true` for auto-refresh, `false` for manual)                                                                                                                                                                   |
+| `pageTriggerCron`       | `"H * * * *"`                        | schedule for `pageTriggerType: "cron"` — UTC, standard 5-field cron, e.g. `"0 3 * * *"`. The default is hourly, each page on its own hashed minute. Sets the page's `trigger.refresh_cron`, which the API treats as mutually exclusive with `refresh_after_consolidation`; a scheduled refresh is skipped when nothing changed. Write a field as `H` to give each page its own value there — see **Spreading refreshes with `H`** below                                                                                                                                                                                                                                                      |
 | `autoSeed`              | `true`                               | SessionStart: auto-seed a cold repo's bank from git history                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `seedLimit`             | `300`                                | auto-seed: most-recent-N-commits cap                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `codebaseSurvey`        | `true`                               | SessionStart: headless survey of a cold repo's structure, run under the current harness's own CLI (claude/codex/antigravity/opencode), falling back to any available agent                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `surveyModel`           | `haiku`                              | model for the survey — Claude recipe only (`claude -p --model`); other agents use their configured default                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `surveyBudgetUsd`       | `2`                                  | survey spend cap — Claude recipe only (`claude -p --max-budget-usd`); other agents rely on their read-only sandbox                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `surveyRefreshCommits`  | `20`                                 | re-run the survey at SessionStart once this many commits have accrued since the last one, so the structural pages track an architecture that keeps moving (`0` = survey a cold repo only, never again)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| `retainSessions`        | `true`                               | session write-back, honored by every harness: hook harnesses write the transcript on Stop, plugin harnesses (opencode, opencode 2, Kilo) upsert it every turn plus an idle flush that captures the reply the per-turn pass can't see. Set `false` — globally, per harness, or per bank — to stop writing transcripts (the background history import stops with it) while recall, git ingest and the memory tools keep working                                                                                                                                                                                                                                                                |
+| `retainSessions`        | `true`                               | session write-back, honored by every harness: hook harnesses write the transcript on Stop, Factory Droid also writes on its cancellation notification, and plugin harnesses (opencode, opencode 2, Kilo) upsert it every turn plus an idle flush that captures the reply the per-turn pass can't see. Set `false` - globally, per harness, or per bank - to stop writing transcripts (the background history import stops with it) while recall, git ingest and the memory tools keep working                                                                                                                                                                                                |
 | `maxParallelRetains`    | `10`                                 | cap on concurrent retain-related requests: drain()'s per-op polls plus deepen's chat/git retain pools. The API rate-limits bursts, not single requests — if you see 429s, lower this rather than raising it                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `logLevel`              | `"info"`                             | plugin-log verbosity (`"debug"` \| `"info"` \| `"warn"` \| `"error"`); `HINDSIGHT_LOG_LEVEL` env overrides                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `autoUpdate`            | `true`                               | keep the installed runtime current by itself: once a day a session start asks npm for the published version and, when it is newer, re-stages `~/.hindsight/coding-agents` in the background. It rewires no host config, so a release adding a **new** hook entry point still needs a manual `install`. Set `false` to pin the installed version; `disabled` stops it too, since an inert plugin should stay inert. Only ever replaces a runtime installed the documented way, via `npx` — a copy installed with `npm i -g`, vendored as a project dependency, or built from a checkout is left to whoever manages it (update those the way you installed them), and it needs `npx` on `PATH` |
@@ -501,16 +541,50 @@ hook by Codex...), so one shared config serves several agents side by side:
 | `harnesses.<name>`      | —                                    | per-harness override of any field above                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `harness`               | `opencode`                           | **deepen engine only**: which session format `--conversations` is read as                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 
+By default a page refreshes **hourly, staggered**: `pageTriggerCron` is `"H * * * *"`, so every
+page gets its own minute of the hour (see below) and a tick with nothing new to fold in is skipped
+server-side. That keeps pages within an hour of the repo without paying auto-refresh's price — one
+LLM synthesis per page per consolidation, on a repo that consolidates all day. Set
+`pageTriggerType: "auto-refresh"` to go back to refreshing on every consolidation.
+
 `pageTriggerType`/`pageTriggerCron` decide only **when** a page refreshes. **How** it refreshes
 belongs to the server: Hindsight creates a knowledge page with a delta refresh (each pass edits the
 page instead of rebuilding it) that doesn't reflect over sibling pages, and these settings merge
 over those defaults rather than replacing them.
 
-**These settings apply to pages created from here on.** Changing them does not migrate the pages a
-repo already has: a page keeps the trigger it was created with, so a bank seeded before you set
-`"manual"` keeps refreshing on every consolidation. To move an existing page, change its trigger
-through the API (`PATCH /knowledge-base/nodes/{id}`), an SDK, or the control plane — or delete it
-and let the next session seed it again.
+### Spreading refreshes with `H`
+
+One `pageTriggerCron` is shared by every page in every repo you point this plugin at. So a literal
+`"0 3 * * *"` does not schedule _a_ refresh at 03:00 — it schedules **all** of them at 03:00, five
+pages per bank, on the same worker pool that serves retain. A session ingesting at 03:0x queues
+behind the pile, and moving the hour just moves the pile.
+
+Write a field as `H` and it is replaced, per page, by a value hashed from the bank id and the page
+name. Each page gets its own slot, the same slot on every run:
+
+| `pageTriggerCron`  | what each page gets                                    |
+| ------------------ | ------------------------------------------------------ |
+| `"H H * * *"`      | once a day, at its own minute and hour                 |
+| `"H * * * *"`      | once an hour, at its own minute                        |
+| `"H 3 * * *"`      | daily at 03:MM — spread inside the hour you chose      |
+| `"H H(0-5) * * *"` | daily, spread across 00:00–05:59 only                  |
+| `"0 3 * * *"`      | no `H`, no hashing — exactly what it says, all at once |
+
+`H` is [Jenkins' syntax](https://www.jenkins.io/doc/book/pipeline/syntax/#cron-syntax) for the same
+problem. It never reaches the API: the plugin resolves it to an ordinary cron expression
+(`"41 17 * * *"`) when it creates the page, so the schedule you see in the control plane is a plain
+one you can edit. Hashing spreads pages out, it does not partition them — two pages can still land
+on the same minute, just not all of them.
+
+**These settings apply to the pages a repo already has, too.** Every session compares each page
+this plugin created — the seeded taxonomy and every captured initiative — against the config and
+re-syncs the ones that differ, so a bank seeded before this default changed moves onto the hourly
+schedule by itself, and a page you retriggered by hand in the control plane is put back on the
+configured policy the next time an agent runs. The config
+file is the source of truth for these pages: to give one a different schedule, change
+`pageTriggerType`/`pageTriggerCron` (per bank, if it is only that repo) rather than editing the
+page. Only the fields this plugin states are touched — a page's `mode`, its excluded siblings and
+its minimum refresh interval are left exactly as they are.
 
 ### A bank you shape yourself — `manageBankConfig`
 
@@ -701,16 +775,18 @@ they stay where they were built, and new work accrues under the new setting.
 
 ## Diagnostics & logging
 
-Two files, two audiences:
+All logs live in `~/.hindsight/coding-agents-logs/` (owner-only). Each file rotates to `<file>.1`
+at 10 MB.
 
-**Leveled plugin log** (humans debugging): `$TMPDIR/hindsight-coding-agent/plugin.log` (override
+**Leveled plugin log** (humans debugging): `~/.hindsight/coding-agents-logs/plugin.log` (override
 `HINDSIGHT_LOG_FILE`) — timestamped `LEVEL [scope] message` lines from every component, including
 the ingestion engine. Level defaults to `info`; set `"logLevel": "debug"` in config or
 `HINDSIGHT_LOG_LEVEL=debug` for ad-hoc debugging (at `debug`, every diag event below is mirrored
 here too, so one file tells the whole story).
 
 **Structured diag events** (machines/harnesses): every reflect and page-fetch outcome is appended
-as a JSON line to `/tmp/hindsight-plugin.log` (override with `HINDSIGHT_DIAG_FILE`):
+as a JSON line to `~/.hindsight/coding-agents-logs/diag.jsonl` (override with
+`HINDSIGHT_DIAG_FILE`):
 
 ```json
 {
@@ -724,8 +800,22 @@ as a JSON line to `/tmp/hindsight-plugin.log` (override with `HINDSIGHT_DIAG_FIL
 ```
 
 `reflect_failed` / `pages_failed` record the error; if you're comparing memory-on vs memory-off,
-check this file — a run whose reflects failed is a no-memory run. Seed starts are logged as
+check this file — a run whose reflects failed is a no-memory run. When the failure was a timeout or
+a 5xx, the hook falls back to knowledge-page search and, if no page matches, to a raw recall of the
+bank's observations: `reflect_fallback_pages` / `reflect_fallback_observations` record what each
+step returned (`*_failed` when it errored). Seed starts are logged as
 `seed_started`.
+
+**Tool usage** (is the agent using Hindsight?): one JSON line per finished user turn in
+`~/.hindsight/coding-agents-logs/usage.jsonl` (override `HINDSIGHT_USAGE_FILE`) — the `hindsight_*`
+tools the agent called during that turn, and whether its reply credited Hindsight memory ("From
+Hindsight memory"). The credit rate counts only turns that called a retrieval tool (search, list,
+read, reflect); saving a document is not expected to be credited. Recorded when the session is written back, so a scope with
+`retainSessions: false` records none. It never leaves your machine. Summarize it per agent with:
+
+```bash
+npx @vectorize-io/hindsight-coding-agents stats
+```
 
 ### Is the memory ready yet?
 

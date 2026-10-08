@@ -99,6 +99,7 @@ class BankTemplatesApi:
 
         _response_types_map: Dict[str, Optional[str]] = {
             '200': "BankTemplateManifest",
+            '404': None,
             '422': "HTTPValidationError",
         }
         response_data = await self.api_client.call_api(
@@ -171,6 +172,7 @@ class BankTemplatesApi:
 
         _response_types_map: Dict[str, Optional[str]] = {
             '200': "BankTemplateManifest",
+            '404': None,
             '422': "HTTPValidationError",
         }
         response_data = await self.api_client.call_api(
@@ -243,6 +245,7 @@ class BankTemplatesApi:
 
         _response_types_map: Dict[str, Optional[str]] = {
             '200': "BankTemplateManifest",
+            '404': None,
             '422': "HTTPValidationError",
         }
         response_data = await self.api_client.call_api(
@@ -567,6 +570,7 @@ class BankTemplatesApi:
     async def import_bank_template(
         self,
         bank_id: StrictStr,
+        bank_template_manifest: BankTemplateManifest,
         dry_run: Annotated[Optional[StrictBool], Field(description="Validate only, do not apply changes")] = None,
         authorization: Optional[StrictStr] = None,
         _request_timeout: Union[
@@ -588,6 +592,8 @@ class BankTemplatesApi:
 
         :param bank_id: (required)
         :type bank_id: str
+        :param bank_template_manifest: (required)
+        :type bank_template_manifest: BankTemplateManifest
         :param dry_run: Validate only, do not apply changes
         :type dry_run: bool
         :param authorization:
@@ -616,6 +622,7 @@ class BankTemplatesApi:
 
         _param = self._import_bank_template_serialize(
             bank_id=bank_id,
+            bank_template_manifest=bank_template_manifest,
             dry_run=dry_run,
             authorization=authorization,
             _request_auth=_request_auth,
@@ -643,6 +650,7 @@ class BankTemplatesApi:
     async def import_bank_template_with_http_info(
         self,
         bank_id: StrictStr,
+        bank_template_manifest: BankTemplateManifest,
         dry_run: Annotated[Optional[StrictBool], Field(description="Validate only, do not apply changes")] = None,
         authorization: Optional[StrictStr] = None,
         _request_timeout: Union[
@@ -664,6 +672,8 @@ class BankTemplatesApi:
 
         :param bank_id: (required)
         :type bank_id: str
+        :param bank_template_manifest: (required)
+        :type bank_template_manifest: BankTemplateManifest
         :param dry_run: Validate only, do not apply changes
         :type dry_run: bool
         :param authorization:
@@ -692,6 +702,7 @@ class BankTemplatesApi:
 
         _param = self._import_bank_template_serialize(
             bank_id=bank_id,
+            bank_template_manifest=bank_template_manifest,
             dry_run=dry_run,
             authorization=authorization,
             _request_auth=_request_auth,
@@ -719,6 +730,7 @@ class BankTemplatesApi:
     async def import_bank_template_without_preload_content(
         self,
         bank_id: StrictStr,
+        bank_template_manifest: BankTemplateManifest,
         dry_run: Annotated[Optional[StrictBool], Field(description="Validate only, do not apply changes")] = None,
         authorization: Optional[StrictStr] = None,
         _request_timeout: Union[
@@ -740,6 +752,8 @@ class BankTemplatesApi:
 
         :param bank_id: (required)
         :type bank_id: str
+        :param bank_template_manifest: (required)
+        :type bank_template_manifest: BankTemplateManifest
         :param dry_run: Validate only, do not apply changes
         :type dry_run: bool
         :param authorization:
@@ -768,6 +782,7 @@ class BankTemplatesApi:
 
         _param = self._import_bank_template_serialize(
             bank_id=bank_id,
+            bank_template_manifest=bank_template_manifest,
             dry_run=dry_run,
             authorization=authorization,
             _request_auth=_request_auth,
@@ -790,6 +805,7 @@ class BankTemplatesApi:
     def _import_bank_template_serialize(
         self,
         bank_id,
+        bank_template_manifest,
         dry_run,
         authorization,
         _request_auth,
@@ -825,6 +841,8 @@ class BankTemplatesApi:
             _header_params['authorization'] = authorization
         # process the form parameters
         # process the body parameter
+        if bank_template_manifest is not None:
+            _body_params = bank_template_manifest
 
 
         # set the HTTP header `Accept`
@@ -835,6 +853,19 @@ class BankTemplatesApi:
                 ]
             )
 
+        # set the HTTP header `Content-Type`
+        if _content_type:
+            _header_params['Content-Type'] = _content_type
+        else:
+            _default_content_type = (
+                self.api_client.select_header_content_type(
+                    [
+                        'application/json'
+                    ]
+                )
+            )
+            if _default_content_type is not None:
+                _header_params['Content-Type'] = _default_content_type
 
         # authentication setting
         _auth_settings: List[str] = [

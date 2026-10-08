@@ -174,13 +174,32 @@ class ExtractedFact(BaseModel):
     entities: list[str] = Field(
         default_factory=list, description="Raw (unresolved) entity names mentioned in the fact."
     )
+    chunk_index: int | None = Field(
+        default=None,
+        description="Index into `chunks` of the chunk this fact came from; null if it could not be attributed.",
+    )
+
+
+class ExtractionChunk(BaseModel):
+    """One chunk the extractor was handed, and how much it yielded."""
+
+    text: str = Field(description="The chunk as the extractor saw it.")
+    fact_count: int = Field(description="How many facts came out of this chunk.")
 
 
 class DryRunExtractionResult(BaseModel):
-    """Result of dry-run fact extraction: candidate facts plus aggregated LLM token usage."""
+    """Result of dry-run fact extraction: candidate facts, the chunks they came from,
+    and aggregated LLM token usage."""
 
     facts: list[ExtractedFact] = Field(
         default_factory=list, description="Candidate facts the retain step would extract."
+    )
+    chunks: list[ExtractionChunk] = Field(
+        default_factory=list,
+        description=(
+            "The chunks the input was cut into before extraction. Already computed on every "
+            "path; returned because `retain_chunk_size` is otherwise a number with no visible effect."
+        ),
     )
     usage: TokenUsage = Field(
         default_factory=TokenUsage, description="Aggregated token usage across the extraction LLM calls."
@@ -387,6 +406,11 @@ class MemoryFact(BaseModel):
         None,
         description="Recall scores from each pipeline stage (final/reranker/semantic/keyword). Not returned for source facts.",
     )
+    # Internal, never serialised: the short ids of the attachments this fact was drawn
+    # from, when the memories store returned them on the row. ``None`` means "not
+    # carried", and the HTTP layer then reads them from `memory_units` instead; a list
+    # (possibly empty) is resolved as-is, so a store that owns its rows is never asked twice.
+    attachment_ids: list[str] | None = Field(None, exclude=True)
 
 
 class ChunkInfo(BaseModel):
@@ -530,6 +554,14 @@ class ReflectResult(BaseModel):
     structured_output: dict[str, Any] | None = Field(
         default=None,
         description="Structured output parsed according to the provided response schema. Only present when response_schema was provided.",
+    )
+    structured_output_error: str | None = Field(
+        default=None,
+        description=(
+            "Why structured output could not be produced, when a response_schema was provided and the "
+            "extraction call failed. Absent when extraction succeeded, so a null structured_output "
+            "without this field means the answer held nothing matching the schema."
+        ),
     )
     usage: TokenUsage | None = Field(
         default=None,

@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from typing import Any, Literal
 
 from dotenv import find_dotenv, load_dotenv
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from ._pg_search import normalize_pg_search_tokenizer
 from ._vector_index import validate_extension
@@ -37,8 +38,18 @@ def load_dotenv_for_entrypoint() -> None:
     is authoritative over the ambient process environment). Because a library
     import never reaches this code path, that precedence no longer leaks into
     embedders.
+
+    The cache clear matters as much as the load. ``HindsightConfig`` is built once and
+    cached for the process, and an entry point imports its whole module graph before
+    ``main()`` reaches this call — so a module that reads the config at import scope
+    (``llm_wrapper`` sizes its semaphores there, for one) has already frozen a config
+    built from an environment the ``.env`` had not been applied to. Leaving that in
+    place makes the discovered ``.env`` silently ineffective for every later reader.
+    Clearing here means the next read rebuilds against the environment this function
+    just finished assembling.
     """
     load_dotenv(find_dotenv(usecwd=True), override=True)
+    clear_config_cache()
 
 
 class ConfigFieldAccessError(AttributeError):
@@ -332,6 +343,22 @@ def _parse_boolean_env(env_name: str, default: bool) -> bool:
     raise ValueError(f"Invalid {env_name} value {raw!r}: expected true, false, 1, or 0")
 
 
+def _parse_float_env(env_name: str, default: float) -> float:
+    """Parse a float environment variable, falling back on an unusable value.
+
+    Deliberately lenient: these tune a refresh loop, and a typo that halted start-up
+    would be a worse outcome than one that runs on the documented default and says so.
+    """
+    raw = os.getenv(env_name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Ignoring non-numeric %s; using %s", env_name, default)
+        return default
+
+
 def _parse_tristate_bool(env_name: str, raw: str | None) -> bool | None:
     """Parse a boolean env var whose *absence* is meaningful, not just a default.
 
@@ -471,6 +498,7 @@ ENV_EMBEDDINGS_GEMINI_API_KEY = "HINDSIGHT_API_EMBEDDINGS_GEMINI_API_KEY"
 ENV_EMBEDDINGS_GEMINI_MODEL = "HINDSIGHT_API_EMBEDDINGS_GEMINI_MODEL"
 ENV_EMBEDDINGS_GEMINI_OUTPUT_DIMENSIONALITY = "HINDSIGHT_API_EMBEDDINGS_GEMINI_OUTPUT_DIMENSIONALITY"
 ENV_EMBEDDINGS_GEMINI_FORCE_IPV4 = "HINDSIGHT_API_EMBEDDINGS_GEMINI_FORCE_IPV4"
+ENV_EMBEDDINGS_GEMINI_BATCH_SIZE = "HINDSIGHT_API_EMBEDDINGS_GEMINI_BATCH_SIZE"
 ENV_EMBEDDINGS_VERTEXAI_PROJECT_ID = "HINDSIGHT_API_EMBEDDINGS_VERTEXAI_PROJECT_ID"
 ENV_EMBEDDINGS_VERTEXAI_REGION = "HINDSIGHT_API_EMBEDDINGS_VERTEXAI_REGION"
 ENV_EMBEDDINGS_VERTEXAI_SERVICE_ACCOUNT_KEY = "HINDSIGHT_API_EMBEDDINGS_VERTEXAI_SERVICE_ACCOUNT_KEY"
@@ -611,15 +639,18 @@ ENV_BASE_PATH = "HINDSIGHT_API_BASE_PATH"
 ENV_LOG_LEVEL = "HINDSIGHT_API_LOG_LEVEL"
 ENV_LOG_FORMAT = "HINDSIGHT_API_LOG_FORMAT"
 ENV_LOG_JSON_FIELDS = "HINDSIGHT_API_LOG_JSON_FIELDS"
-# Event loops per process. >1 only pays off on a free-threaded build, where the loops
-# execute Python in parallel rather than taking turns; see hindsight_api/multi_loop.py.
-ENV_EVENT_LOOPS = "HINDSIGHT_API_EVENT_LOOPS"
 ENV_WORKERS = "HINDSIGHT_API_WORKERS"
 ENV_ACCESS_LOG = "HINDSIGHT_API_ACCESS_LOG"
+# Path the daemon redirects its stdio to. Set per-profile by hindsight-embed so
+# concurrent profiles do not interleave into one log.
+ENV_DAEMON_LOG = "HINDSIGHT_API_DAEMON_LOG"
+# JSON: {"every": <seconds>, "top": <frames>, "mode": "cprofile"}. Absent = profiling off.
+ENV_PROFILE = "HINDSIGHT_API_PROFILE"
 ENV_MCP_ENABLED = "HINDSIGHT_API_MCP_ENABLED"
 ENV_MCP_ENABLED_TOOLS = "HINDSIGHT_API_MCP_ENABLED_TOOLS"
 ENV_MCP_STATELESS = "HINDSIGHT_API_MCP_STATELESS"
 ENV_MCP_INSTRUCTIONS = "HINDSIGHT_API_MCP_INSTRUCTIONS"
+ENV_MCP_AUTH_TOKEN = "HINDSIGHT_API_MCP_AUTH_TOKEN"
 ENV_ENABLE_BANK_CONFIG_API = "HINDSIGHT_API_ENABLE_BANK_CONFIG_API"
 ENV_ENABLE_BANK_LLM_HEALTH = "HINDSIGHT_API_ENABLE_BANK_LLM_HEALTH"
 ENV_ENABLE_DRY_RUN_EXTRACT = "HINDSIGHT_API_ENABLE_DRY_RUN_EXTRACT"
@@ -628,7 +659,10 @@ ENV_GRAPH_RETRIEVER = "HINDSIGHT_API_GRAPH_RETRIEVER"
 ENV_RECALL_MAX_CONCURRENT = "HINDSIGHT_API_RECALL_MAX_CONCURRENT"
 ENV_RECALL_CONNECTION_BUDGET = "HINDSIGHT_API_RECALL_CONNECTION_BUDGET"
 ENV_RECALL_MAX_QUERY_TOKENS = "HINDSIGHT_API_RECALL_MAX_QUERY_TOKENS"
-ENV_MENTAL_MODEL_REFRESH_CONCURRENCY = "HINDSIGHT_API_MENTAL_MODEL_REFRESH_CONCURRENCY"
+ENV_RECALL_DIAGNOSTIC_PHASES = "HINDSIGHT_API_RECALL_DIAGNOSTIC_PHASES"
+ENV_RECALL_PHASE_SAMPLE_EVERY = "HINDSIGHT_API_RECALL_PHASE_SAMPLE_EVERY"
+ENV_GZIP_MIN_SIZE = "HINDSIGHT_API_GZIP_MIN_SIZE"
+ENV_LOOP_LAG_REPORT_SECONDS = "HINDSIGHT_API_LOOP_LAG_REPORT_SECONDS"
 ENV_LINK_EXPANSION_PER_ENTITY_LIMIT = "HINDSIGHT_API_LINK_EXPANSION_PER_ENTITY_LIMIT"
 ENV_LINK_EXPANSION_TIMEOUT = "HINDSIGHT_API_LINK_EXPANSION_TIMEOUT"
 ENV_RETAIN_BATCH_DOCUMENT_WRITES = "HINDSIGHT_API_RETAIN_BATCH_DOCUMENT_WRITES"
@@ -662,6 +696,16 @@ ENV_DB_ACQUIRE_WARN_THRESHOLD_MS = "HINDSIGHT_API_DB_ACQUIRE_WARN_THRESHOLD_MS"
 # CODEX_HOME for the primary LLM; indexed members set their own
 # (HINDSIGHT_API_<OP>LLM_<n>_CODEX_HOME) so a chain can span two profiles.
 ENV_LLM_CODEX_HOME = "HINDSIGHT_API_LLM_CODEX_HOME"
+
+# xai-oauth provider. The token store is written by the `login` entrypoint and read on
+# every call; the rest exist so a deployment can point at a different OAuth app.
+ENV_XAI_OAUTH_TOKEN_PATH = "HINDSIGHT_API_XAI_OAUTH_TOKEN_PATH"
+ENV_XAI_OAUTH_CLIENT_ID = "HINDSIGHT_API_XAI_OAUTH_CLIENT_ID"
+ENV_XAI_OAUTH_SCOPE = "HINDSIGHT_API_XAI_OAUTH_SCOPE"
+ENV_XAI_OAUTH_REFRESH_TIMEOUT_SECONDS = "HINDSIGHT_API_XAI_OAUTH_REFRESH_TIMEOUT_SECONDS"
+ENV_XAI_OAUTH_REFRESH_SKEW_SECONDS = "HINDSIGHT_API_XAI_OAUTH_REFRESH_SKEW_SECONDS"
+ENV_XAI_OAUTH_BASE_URL = "HINDSIGHT_API_XAI_OAUTH_BASE_URL"
+ENV_XAI_OAUTH_DEBUG_HEADERS = "HINDSIGHT_API_XAI_OAUTH_DEBUG_HEADERS"
 
 # Vertex AI configuration
 ENV_LLM_VERTEXAI_PROJECT_ID = "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID"
@@ -715,6 +759,10 @@ ENV_RETAIN_MAX_ATTACHMENTS_PER_CHUNK = "HINDSIGHT_API_RETAIN_MAX_ATTACHMENTS_PER
 
 # File storage configuration
 ENV_FILE_STORAGE_TYPE = "HINDSIGHT_API_FILE_STORAGE_TYPE"
+# "module.path:ClassName" naming a FileStorage implementation. Every other
+# HINDSIGHT_API_FILE_STORAGE_* variable is handed to it as a lowercased config dict,
+# so those stay dynamic and are read from the environment by the storage factory.
+ENV_FILE_STORAGE_EXTENSION = "HINDSIGHT_API_FILE_STORAGE_EXTENSION"
 ENV_FILE_STORAGE_S3_BUCKET = "HINDSIGHT_API_FILE_STORAGE_S3_BUCKET"
 ENV_FILE_STORAGE_S3_REGION = "HINDSIGHT_API_FILE_STORAGE_S3_REGION"
 ENV_FILE_STORAGE_S3_ENDPOINT = "HINDSIGHT_API_FILE_STORAGE_S3_ENDPOINT"
@@ -775,7 +823,6 @@ ENV_MENTAL_MODEL_MIN_REFRESH_INTERVAL_SECONDS = "HINDSIGHT_API_MENTAL_MODEL_MIN_
 ENV_WEBHOOK_URL = "HINDSIGHT_API_WEBHOOK_URL"
 ENV_WEBHOOK_SECRET = "HINDSIGHT_API_WEBHOOK_SECRET"
 ENV_WEBHOOK_EVENT_TYPES = "HINDSIGHT_API_WEBHOOK_EVENT_TYPES"
-ENV_WEBHOOK_DELIVERY_POLL_INTERVAL_SECONDS = "HINDSIGHT_API_WEBHOOK_DELIVERY_POLL_INTERVAL_SECONDS"
 # SSRF hardening for outbound webhook delivery. Private/loopback/link-local
 # destinations are blocked by default; list hosts or IP/CIDRs here to re-permit
 # them (e.g. "127.0.0.1" for local testing, or an internal receiver).
@@ -798,10 +845,9 @@ ENV_SKIP_LLM_VERIFICATION = "HINDSIGHT_API_SKIP_LLM_VERIFICATION"
 
 # Database migrations
 ENV_RUN_MIGRATIONS_ON_STARTUP = "HINDSIGHT_API_RUN_MIGRATIONS_ON_STARTUP"
-# Whether migrations run in a subprocess instead of in the calling process.
-# "auto" (default) isolates only on a free-threaded interpreter, where alembic's
-# psycopg2 would otherwise re-enable the GIL for the life of the process; "true"
-# and "false" force it either way. See migrations._should_isolate_migrations.
+# Whether migrations run in a subprocess instead of in the calling process, keeping
+# alembic's import graph and its psycopg2 sync engine out of a long-lived server.
+# "false" (the default) runs them in-process. See migrations._should_isolate_migrations.
 ENV_MIGRATION_ISOLATION = "HINDSIGHT_API_MIGRATION_ISOLATION"
 ENV_MIGRATION_CONCURRENCY = "HINDSIGHT_API_MIGRATION_CONCURRENCY"
 
@@ -830,6 +876,8 @@ ENV_WORKER_MAX_RETRIES = "HINDSIGHT_API_WORKER_MAX_RETRIES"
 ENV_WORKER_TASK_RETRY_BACKOFF_SECONDS = "HINDSIGHT_API_WORKER_TASK_RETRY_BACKOFF_SECONDS"
 ENV_WORKER_HTTP_PORT = "HINDSIGHT_API_WORKER_HTTP_PORT"
 ENV_WORKER_MAX_SLOTS = "HINDSIGHT_API_WORKER_MAX_SLOTS"
+# How long a task shed for store backpressure is held before it is retried.
+ENV_BACKPRESSURE_DEFER_SECONDS = "HINDSIGHT_API_BACKPRESSURE_DEFER_SECONDS"
 ENV_OPERATION_RETENTION_DAYS = "HINDSIGHT_API_OPERATION_RETENTION_DAYS"
 ENV_OPERATION_CLEANUP_BATCH_SIZE = "HINDSIGHT_API_OPERATION_CLEANUP_BATCH_SIZE"
 
@@ -1166,6 +1214,7 @@ DEFAULT_RERANKER_RETRY_BUDGET = 10.0
 DEFAULT_EMBEDDINGS_GEMINI_MODEL = "gemini-embedding-001"
 DEFAULT_EMBEDDINGS_GEMINI_OUTPUT_DIMENSIONALITY = 768
 DEFAULT_EMBEDDINGS_GEMINI_FORCE_IPV4 = False
+DEFAULT_EMBEDDINGS_GEMINI_BATCH_SIZE = 100
 DEFAULT_EMBEDDING_DIMENSION = 384
 
 DEFAULT_RERANKER_PROVIDER = "local"
@@ -1367,11 +1416,14 @@ DEFAULT_RERANKER_LITELLM_MAX_TOKENS_PER_DOC: int | None = None
 # LiteLLM SDK defaults
 DEFAULT_EMBEDDINGS_LITELLM_SDK_MODEL = "cohere/embed-english-v3.0"
 DEFAULT_EMBEDDINGS_LITELLM_SDK_ENCODING_FORMAT = "float"
-# Opt-in per-text input truncation (tokens, see ENV_TOKENIZER_ENCODING). Off by default;
-# set to the embedding model's real input limit (e.g. 8192 for Bedrock Titan V2, or a
-# llama.cpp server's context) to keep oversized content from permanently failing the
-# embed call. Applies to every embeddings provider. See #2501.
-DEFAULT_EMBEDDINGS_MAX_INPUT_TOKENS: int | None = None
+# Per-text input truncation (tokens, see ENV_TOKENIZER_ENCODING), applied to every
+# embeddings provider before the text leaves the process. 8192 is the input limit of
+# essentially every remote embedding model in use (OpenAI text-embedding-3-*, Bedrock
+# Titan V2, Cohere v3, a stock llama.cpp context), and those reject an oversized input
+# with a permanent 400 instead of truncating it server-side the way SentenceTransformers
+# does — which failed the owning task for good (#2501, #4165). Set the env var to the
+# model's real limit if it differs, or to 0 to send text uncapped.
+DEFAULT_EMBEDDINGS_MAX_INPUT_TOKENS: int | None = 8192
 DEFAULT_RERANKER_LITELLM_SDK_MODEL = "cohere/rerank-english-v3.0"
 
 # Vocabulary used for every token count and chunk boundary in the engine. Server-level:
@@ -1387,9 +1439,18 @@ DEFAULT_PORT = 8888
 DEFAULT_BASE_PATH = ""  # Empty string = root path
 DEFAULT_LOG_LEVEL = "info"
 DEFAULT_LOG_FORMAT = "text"  # Options: "text", "json"
-DEFAULT_EVENT_LOOPS = 1
 DEFAULT_WORKERS = 1
 DEFAULT_ACCESS_LOG = False
+DEFAULT_XAI_OAUTH_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
+DEFAULT_XAI_OAUTH_SCOPE = "openid profile email offline_access grok-cli:access api:access"
+DEFAULT_XAI_OAUTH_REFRESH_SKEW_SECONDS = 60.0
+DEFAULT_XAI_OAUTH_REFRESH_TIMEOUT_SECONDS = 20.0
+DEFAULT_XAI_OAUTH_BASE_URL = "https://api.x.ai/v1"
+DEFAULT_XAI_OAUTH_DEBUG_HEADERS = False
+# Long enough that a fold has a real chance to drain the backlog — retrying into a
+# still-full store just sheds again and burns the claim — and short enough that a
+# cleared backlog is not left waiting. Deferrals do not count against max_retries.
+DEFAULT_BACKPRESSURE_DEFER_SECONDS = 120
 DEFAULT_MCP_ENABLED = True
 DEFAULT_MCP_ENABLED_TOOLS: list[str] | None = None  # None = all tools enabled
 DEFAULT_MCP_STATELESS = False  # False = stateful (supports SSE/GET); True = stateless (POST-only)
@@ -1407,7 +1468,10 @@ DEFAULT_GRAPH_RETRIEVER = "link_expansion"
 DEFAULT_RECALL_MAX_CONCURRENT = 32  # Max concurrent recall operations per worker
 DEFAULT_RECALL_CONNECTION_BUDGET = 4  # Max concurrent DB connections per recall operation
 DEFAULT_RECALL_MAX_QUERY_TOKENS = 500  # Maximum tokens allowed in recall query
-DEFAULT_MENTAL_MODEL_REFRESH_CONCURRENCY = 8  # Max concurrent mental model refreshes
+DEFAULT_RECALL_DIAGNOSTIC_PHASES = True  # Record the subset (diagnostic=true) recall phase metrics
+DEFAULT_RECALL_PHASE_SAMPLE_EVERY = 1  # Record 1 in N recall-phase observations; 1 records every one
+DEFAULT_GZIP_MIN_SIZE = 1024  # Min response bytes to gzip; negative disables compression
+DEFAULT_LOOP_LAG_REPORT_SECONDS = 0.0  # Event-loop lag probe report interval; 0 disables it
 DEFAULT_LINK_EXPANSION_PER_ENTITY_LIMIT = 200  # Max target units per entity in graph expansion
 DEFAULT_LINK_EXPANSION_TIMEOUT = 10.0  # Timeout (seconds) for entity expansion query
 # The bank's own row (name/disposition/mission) and its config, cached per process so a
@@ -1559,12 +1623,9 @@ DEFAULT_OBSERVATION_SCOPE_LIMITS: list | None = None
 
 # Database migrations
 DEFAULT_RUN_MIGRATIONS_ON_STARTUP = True
-# "auto" | "true" | "false" — see ENV_MIGRATION_ISOLATION. Spelled as a tri-state
-# boolean rather than always/never so it reads like every other on/off flag here:
-# the question the value answers is "isolate the migration?", and "auto" is the
-# third answer, "let the interpreter decide".
-DEFAULT_MIGRATION_ISOLATION = "auto"
-MIGRATION_ISOLATION_CHOICES = ("auto", "true", "false")
+# "true" | "false" — see ENV_MIGRATION_ISOLATION.
+DEFAULT_MIGRATION_ISOLATION = "false"
+MIGRATION_ISOLATION_CHOICES = ("true", "false")
 # Number of tenant schemas to migrate concurrently. Each schema runs in its own
 # process (Alembic's command.upgrade() is not thread-safe); within a schema the
 # work is always sequential. 1 = fully sequential (the safe default).
@@ -1589,9 +1650,12 @@ DEFAULT_DB_MAX_PARALLEL_WORKERS_PER_GATHER: int | None = None
 # search_path) is re-applied on every pool acquire, not just when a connection is
 # first opened.
 #
-# True (default) is the correct setting for a plain asyncpg pool: releasing a
-# connection runs RESET ALL, which wipes every SET the init callback applied, so
-# without the re-apply a reused connection silently runs with server defaults.
+# True (default) is the correct setting behind a transaction-mode pooler, where an
+# acquire may be linked to a server connection that never saw the init callback.
+# On a direct connection it is now redundant: the pool no longer sends asyncpg's
+# release-time RESET ALL (see engine/db/postgresql.py), so the GUCs the callback
+# applied survive into the next acquire. Kept on by default because the pooled
+# topology is the one that breaks without it.
 #
 # Set False only when those settings are already pinned server-side — ALTER ROLE
 # / ALTER DATABASE ... SET — because RESET ALL then restores them to exactly the
@@ -1852,7 +1916,6 @@ EMBEDDING_DIMENSION = DEFAULT_EMBEDDING_DIMENSION
 DEFAULT_WEBHOOK_URL = None  # None = no global webhook configured
 DEFAULT_WEBHOOK_SECRET = None  # None = no signing
 DEFAULT_WEBHOOK_EVENT_TYPES = "consolidation.completed"  # Comma-separated; default = all supported events
-DEFAULT_WEBHOOK_DELIVERY_POLL_INTERVAL_SECONDS = 30  # How often to poll for pending deliveries
 DEFAULT_WEBHOOK_ALLOWED_HOSTS: list[str] = []  # Empty = public destinations only (private ranges blocked)
 DEFAULT_WEBHOOK_EXPOSE_RESPONSE_BODY = False  # Don't return raw upstream bodies to API callers
 
@@ -2209,30 +2272,86 @@ class LLMMemberConfig:
 # Valid multi-LLM strategy modes.
 LLM_STRATEGY_FAILOVER = "failover"
 LLM_STRATEGY_ROUND_ROBIN = "round-robin"
-_VALID_LLM_STRATEGY_MODES = (LLM_STRATEGY_FAILOVER, LLM_STRATEGY_ROUND_ROBIN)
+LLM_STRATEGY_METADATA = "metadata"
+_VALID_LLM_STRATEGY_MODES = (LLM_STRATEGY_FAILOVER, LLM_STRATEGY_ROUND_ROBIN, LLM_STRATEGY_METADATA)
 
 
-@dataclass
-class LLMStrategyConfig:
+class LLMMetadataRoute(BaseModel):
+    """Send a retain item whose ``metadata[key] == value`` to member ``member``.
+
+    Matching is on the string form of the item's value, because retain metadata
+    is free-form JSON and a route read from an env var is always a string.
+
+    Strict and closed on purpose: this is parsed straight from operator-supplied
+    JSON, where ``{"member": true}`` is a typo rather than member 1, and a
+    misspelled key (``"membr"``) must fail loudly instead of leaving the route
+    pointed at the default member.
+    """
+
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    key: str = Field(min_length=1)
+    value: str
+    member: int = Field(ge=0)
+
+
+class LLMStrategyConfig(BaseModel):
     """How to route a request across the members of a multi-LLM chain.
 
-    ``mode`` is "failover" (try members in order) or "round-robin" (rotate the
-    starting member per request, then fall through the rest on error). ``weights``
-    is round-robin only: positive integers, one per member (primary first), giving
-    an unbalanced rotation; ``None`` means uniform.
+    ``mode`` is "failover" (try members in order), "round-robin" (rotate the
+    starting member per request, then fall through the rest on error) or
+    "metadata" (pick the member from the retained item's own metadata).
+    ``weights`` is round-robin only: positive integers, one per member (primary
+    first), giving an unbalanced rotation; ``None`` means uniform. ``routes`` is
+    metadata only: the first route matching an item wins, and an item matching
+    none uses the primary.
     """
+
+    model_config = ConfigDict(strict=True, extra="forbid")
 
     mode: str
     weights: list[int] | None = None
+    routes: list[LLMMetadataRoute] | None = None
+
+    @field_validator("mode")
+    @classmethod
+    def _validate_mode(cls, mode: str) -> str:
+        if mode not in _VALID_LLM_STRATEGY_MODES:
+            raise ValueError(
+                f"Invalid LLM strategy mode {mode!r}. Must be one of: {', '.join(_VALID_LLM_STRATEGY_MODES)}."
+            )
+        return mode
+
+    @model_validator(mode="after")
+    def _validate_mode_specific_fields(self) -> "LLMStrategyConfig":
+        """``weights`` and ``routes`` each belong to exactly one mode.
+
+        Rejecting the wrong pairing matters more than it looks: a ``routes`` list
+        under "failover" would otherwise be accepted and never consulted, which
+        reads as the routes silently not working.
+        """
+        if self.weights is not None:
+            if self.mode != LLM_STRATEGY_ROUND_ROBIN:
+                raise ValueError(f"LLM strategy 'weights' is only valid with mode '{LLM_STRATEGY_ROUND_ROBIN}'.")
+            if not self.weights or any(weight <= 0 for weight in self.weights):
+                raise ValueError("LLM strategy 'weights' must be a non-empty list of positive integers.")
+
+        if self.mode == LLM_STRATEGY_METADATA:
+            if not self.routes:
+                raise ValueError(f"LLM strategy 'routes' must be a non-empty list with mode '{LLM_STRATEGY_METADATA}'.")
+        elif self.routes is not None:
+            raise ValueError(f"LLM strategy 'routes' is only valid with mode '{LLM_STRATEGY_METADATA}'.")
+        return self
 
 
 def _parse_llm_strategy(raw: str | None) -> LLMStrategyConfig | None:
     """Parse a multi-LLM strategy from a JSON env var.
 
-    Returns ``None`` when unset. The value must be a JSON object with a ``mode``
-    of "failover" or "round-robin"; ``weights`` (round-robin only) must be a list
-    of positive ints. Raises ``ValueError`` on any malformed input so
-    misconfiguration fails fast at startup rather than silently degrading.
+    Returns ``None`` when unset. Shape and per-field rules live on
+    :class:`LLMStrategyConfig` / :class:`LLMMetadataRoute`, so this only decodes
+    the JSON and restates pydantic's complaint in terms of the env var. Any
+    malformed input raises ``ValueError`` so misconfiguration fails fast at
+    startup rather than silently degrading.
     """
     text = (raw or "").strip()
     if not text:
@@ -2244,18 +2363,27 @@ def _parse_llm_strategy(raw: str | None) -> LLMStrategyConfig | None:
     if not isinstance(parsed, dict):
         raise ValueError(f"Invalid LLM strategy: expected a JSON object, got {type(parsed).__name__}")
 
-    mode = parsed.get("mode")
-    if mode not in _VALID_LLM_STRATEGY_MODES:
-        raise ValueError(f"Invalid LLM strategy mode {mode!r}. Must be one of: {', '.join(_VALID_LLM_STRATEGY_MODES)}.")
+    try:
+        return LLMStrategyConfig.model_validate(parsed)
+    except ValidationError as e:
+        raise ValueError(f"Invalid {ENV_LLM_STRATEGY}: {_format_validation_error(e)}") from e
 
-    weights = parsed.get("weights")
-    if weights is not None:
-        if mode != LLM_STRATEGY_ROUND_ROBIN:
-            raise ValueError(f"LLM strategy 'weights' is only valid with mode '{LLM_STRATEGY_ROUND_ROBIN}'.")
-        if not isinstance(weights, list) or not weights or not all(isinstance(w, int) and w > 0 for w in weights):
-            raise ValueError("LLM strategy 'weights' must be a non-empty list of positive integers.")
 
-    return LLMStrategyConfig(mode=mode, weights=weights)
+def _format_validation_error(error: ValidationError) -> str:
+    """Flatten a ``ValidationError`` into one operator-readable line.
+
+    The default rendering spans several lines and names the model, neither of
+    which helps someone reading a startup crash caused by an env var. Keep the
+    field path (``routes.0.member``) — with nested routes it is the only thing
+    that says *which* entry is wrong.
+    """
+    details = []
+    for detail in error.errors():
+        location = ".".join(str(part) for part in detail["loc"])
+        # Messages raised by our own validators arrive prefixed by pydantic.
+        message = detail["msg"].removeprefix("Value error, ")
+        details.append(f"{location}: {message}" if location else message)
+    return "; ".join(details)
 
 
 def _parse_llm_members(prefix: str) -> list[LLMMemberConfig]:
@@ -2267,7 +2395,7 @@ def _parse_llm_members(prefix: str) -> list[LLMMemberConfig]:
     stops at the first index whose ``_PROVIDER`` is unset (so indices must be
     contiguous from 1). ``MODEL`` defaults to the provider's default model.
     """
-    from .engine.llm_wrapper import requires_api_key
+    from .engine.provider_auth import requires_api_key
 
     members: list[LLMMemberConfig] = []
     index = 1
@@ -2773,6 +2901,8 @@ class HindsightConfig:
     embeddings_onnx_batch_size: int
     embeddings_onnx_cpu_mem_arena: bool
     embeddings_tei_url: str | None
+    embeddings_openai_api_key: str | None
+    embeddings_openai_model: str
     embeddings_openai_base_url: str | None
     embeddings_cohere_api_key: str | None
     embeddings_cohere_model: str
@@ -2868,10 +2998,29 @@ class HindsightConfig:
     reranker_google_timeout: float
 
     # Server
-    host: str
+    # None when unset. The bind default is applied by the CLI, which also needs to
+    # tell "operator chose a host" from "took the default" — daemon mode narrows an
+    # unstated host to loopback but must honour one the operator actually set.
+    host: str | None
     port: int
     base_path: str
     log_level: str
+    workers: int
+    access_log: bool
+    daemon_log: str | None  # None = ~/.hindsight/daemon.log
+    profile: str | None  # Raw JSON; parsed by hindsight_api.profiling
+    mcp_auth_token: str | None
+    file_storage_extension: str | None  # "module.path:ClassName"
+    backpressure_defer_seconds: int
+    xai_oauth_token_path: str | None  # None = ~/.hindsight/xai_oauth.json
+    xai_oauth_client_id: str
+    xai_oauth_scope: str
+    xai_oauth_refresh_timeout_seconds: float
+    xai_oauth_refresh_skew_seconds: float
+    # None when unset: the provider only treats this as a deployment-wide override of the
+    # caller's base_url when the operator actually set it.
+    xai_oauth_base_url: str | None
+    xai_oauth_debug_headers: bool
     log_format: str
     log_json_fields: list[str] | None  # None = all fields; explicit list = allowlist
     mcp_enabled: bool
@@ -2893,7 +3042,10 @@ class HindsightConfig:
     recall_max_concurrent: int
     recall_connection_budget: int
     recall_max_query_tokens: int
-    mental_model_refresh_concurrency: int
+    recall_diagnostic_phases: bool
+    recall_phase_sample_every: int
+    gzip_min_size: int
+    loop_lag_report_seconds: float
     link_expansion_per_entity_limit: int
     link_expansion_timeout: float
     retain_batch_document_writes: bool
@@ -3070,7 +3222,10 @@ class HindsightConfig:
     otel_traces_enabled: bool
     otel_exporter_otlp_endpoint: str | None
     otel_exporter_otlp_headers: str | None
-    otel_service_name: str
+    # None when unset, so a caller can tell "operator chose a name" from "nobody said".
+    # The API default is applied at the point of use (see tracing.initialize_tracing_from_config),
+    # which is also where a per-process default like "hindsight-worker" gets its chance.
+    otel_service_name: str | None
     otel_deployment_environment: str
     metrics_include_bank_id: bool
     metrics_backlog_enabled: bool
@@ -3119,13 +3274,13 @@ class HindsightConfig:
     webhook_url: str | None  # Global webhook URL (None = disabled)
     webhook_secret: str | None  # HMAC signing secret (None = unsigned)
     webhook_event_types: list[str]  # Event types to deliver globally
-    webhook_delivery_poll_interval_seconds: int  # How often the delivery worker polls
 
     # Defaulted fields (source-compatible additions — existing direct constructor callers keep working).
     # Keep at the end of the dataclass; Python forbids non-default fields after default fields.
     embeddings_openai_batch_size: int = DEFAULT_EMBEDDINGS_OPENAI_BATCH_SIZE
     embeddings_tei_batch_size: int = DEFAULT_EMBEDDINGS_TEI_BATCH_SIZE
     embeddings_max_concurrent_requests: int = DEFAULT_EMBEDDINGS_MAX_CONCURRENT_REQUESTS
+    embeddings_gemini_batch_size: int = DEFAULT_EMBEDDINGS_GEMINI_BATCH_SIZE
     embeddings_openai_dimensions: int | None = None
     embeddings_query_prefix: str = DEFAULT_EMBEDDINGS_QUERY_PREFIX
     embeddings_passage_prefix: str = DEFAULT_EMBEDDINGS_PASSAGE_PREFIX
@@ -3238,6 +3393,7 @@ class HindsightConfig:
         "reranker_google_service_account_key",
         # Embeddings API keys
         "embeddings_gemini_api_key",
+        "embeddings_openai_api_key",
         "embeddings_zeroentropy_api_key",
         # File storage credentials
         "file_storage_s3_access_key_id",
@@ -3249,6 +3405,13 @@ class HindsightConfig:
         "file_parser_markitdown_ocr_base_url",
         "file_parser_iris_token",
         "file_parser_llama_parse_api_key",
+        # Legacy MCP bearer token, checked ahead of the tenant extension's own auth.
+        "mcp_auth_token",
+        # xai-oauth: the client id and the token-store path both describe how this
+        # deployment authenticates, and the store path points at a file holding a grant.
+        "xai_oauth_client_id",
+        "xai_oauth_token_path",
+        "xai_oauth_base_url",
     }
 
     # CONFIGURABLE_FIELDS: Safe behavioral settings that can be customized per-tenant/bank
@@ -3879,7 +4042,9 @@ class HindsightConfig:
             # Embeddings
             embeddings_provider=os.getenv(ENV_EMBEDDINGS_PROVIDER, DEFAULT_EMBEDDINGS_PROVIDER),
             # Generic name, falling back to the deprecated LiteLLM-SDK-specific alias.
-            embeddings_max_input_tokens=int(v)
+            # 0 (or any non-positive value) means "no cap" — the only way to opt out
+            # now that the default is a real limit rather than None.
+            embeddings_max_input_tokens=(int(v) if int(v) > 0 else None)
             if (
                 v := os.getenv(ENV_EMBEDDINGS_MAX_INPUT_TOKENS)
                 or os.getenv(ENV_EMBEDDINGS_LITELLM_SDK_MAX_INPUT_TOKENS)
@@ -3938,6 +4103,10 @@ class HindsightConfig:
             ).lower()
             == "true",
             embeddings_tei_url=os.getenv(ENV_EMBEDDINGS_TEI_URL),
+            # Falls back to the shared LLM key, the way every other OpenAI-compatible
+            # embeddings provider here does: one key configured once covers both.
+            embeddings_openai_api_key=(os.getenv(ENV_EMBEDDINGS_OPENAI_API_KEY) or os.getenv(ENV_LLM_API_KEY)),
+            embeddings_openai_model=os.getenv(ENV_EMBEDDINGS_OPENAI_MODEL, DEFAULT_EMBEDDINGS_OPENAI_MODEL),
             embeddings_openai_base_url=os.getenv(ENV_EMBEDDINGS_OPENAI_BASE_URL) or None,
             embeddings_openai_batch_size=_parse_positive_int(
                 ENV_EMBEDDINGS_OPENAI_BATCH_SIZE,
@@ -4083,6 +4252,11 @@ class HindsightConfig:
                 str(DEFAULT_EMBEDDINGS_GEMINI_FORCE_IPV4),
             ).lower()
             in ("true", "1"),
+            embeddings_gemini_batch_size=_parse_positive_int(
+                ENV_EMBEDDINGS_GEMINI_BATCH_SIZE,
+                os.getenv(ENV_EMBEDDINGS_GEMINI_BATCH_SIZE),
+                DEFAULT_EMBEDDINGS_GEMINI_BATCH_SIZE,
+            ),
             embeddings_vertexai_project_id=os.getenv(ENV_EMBEDDINGS_VERTEXAI_PROJECT_ID)
             or os.getenv(ENV_LLM_VERTEXAI_PROJECT_ID),
             embeddings_vertexai_region=os.getenv(ENV_EMBEDDINGS_VERTEXAI_REGION) or os.getenv(ENV_LLM_VERTEXAI_REGION),
@@ -4235,10 +4409,33 @@ class HindsightConfig:
             reranker_google_timeout=float(os.getenv(ENV_RERANKER_GOOGLE_TIMEOUT, str(DEFAULT_RERANKER_GOOGLE_TIMEOUT))),
             reranker_members=_parse_reranker_members(),
             # Server
-            host=os.getenv(ENV_HOST, DEFAULT_HOST),
+            host=os.getenv(ENV_HOST) or None,
             port=int(os.getenv(ENV_PORT, DEFAULT_PORT)),
             base_path=os.getenv(ENV_BASE_PATH, DEFAULT_BASE_PATH),
             log_level=os.getenv(ENV_LOG_LEVEL, DEFAULT_LOG_LEVEL),
+            workers=int(os.getenv(ENV_WORKERS, str(DEFAULT_WORKERS))),
+            # "yes"/"on" have always been accepted here; keep the vocabulary rather than
+            # turn a working deployment's value into a start-up error.
+            access_log=os.getenv(ENV_ACCESS_LOG, "").lower() in ("1", "true", "yes", "on") or DEFAULT_ACCESS_LOG,
+            daemon_log=os.getenv(ENV_DAEMON_LOG) or None,
+            profile=os.getenv(ENV_PROFILE, "").strip() or None,
+            mcp_auth_token=os.getenv(ENV_MCP_AUTH_TOKEN) or None,
+            file_storage_extension=os.getenv(ENV_FILE_STORAGE_EXTENSION) or None,
+            backpressure_defer_seconds=int(
+                os.getenv(ENV_BACKPRESSURE_DEFER_SECONDS, str(DEFAULT_BACKPRESSURE_DEFER_SECONDS))
+            ),
+            xai_oauth_token_path=os.getenv(ENV_XAI_OAUTH_TOKEN_PATH, "").strip() or None,
+            xai_oauth_client_id=os.getenv(ENV_XAI_OAUTH_CLIENT_ID, "").strip() or DEFAULT_XAI_OAUTH_CLIENT_ID,
+            xai_oauth_scope=os.getenv(ENV_XAI_OAUTH_SCOPE, "").strip() or DEFAULT_XAI_OAUTH_SCOPE,
+            xai_oauth_refresh_timeout_seconds=_parse_float_env(
+                ENV_XAI_OAUTH_REFRESH_TIMEOUT_SECONDS, DEFAULT_XAI_OAUTH_REFRESH_TIMEOUT_SECONDS
+            ),
+            xai_oauth_refresh_skew_seconds=_parse_float_env(
+                ENV_XAI_OAUTH_REFRESH_SKEW_SECONDS, DEFAULT_XAI_OAUTH_REFRESH_SKEW_SECONDS
+            ),
+            xai_oauth_base_url=(os.getenv(ENV_XAI_OAUTH_BASE_URL, "").strip() or None),
+            xai_oauth_debug_headers=os.getenv(ENV_XAI_OAUTH_DEBUG_HEADERS, str(DEFAULT_XAI_OAUTH_DEBUG_HEADERS)).lower()
+            == "true",
             log_format=os.getenv(ENV_LOG_FORMAT, DEFAULT_LOG_FORMAT).lower(),
             log_json_fields=_parse_str_list(os.getenv(ENV_LOG_JSON_FIELDS, "")) or None,
             mcp_enabled=os.getenv(ENV_MCP_ENABLED, str(DEFAULT_MCP_ENABLED)).lower() == "true",
@@ -4263,9 +4460,15 @@ class HindsightConfig:
                 os.getenv(ENV_RECALL_CONNECTION_BUDGET, str(DEFAULT_RECALL_CONNECTION_BUDGET))
             ),
             recall_max_query_tokens=int(os.getenv(ENV_RECALL_MAX_QUERY_TOKENS, str(DEFAULT_RECALL_MAX_QUERY_TOKENS))),
-            mental_model_refresh_concurrency=int(
-                os.getenv(ENV_MENTAL_MODEL_REFRESH_CONCURRENCY, str(DEFAULT_MENTAL_MODEL_REFRESH_CONCURRENCY))
+            recall_diagnostic_phases=os.getenv(
+                ENV_RECALL_DIAGNOSTIC_PHASES, str(DEFAULT_RECALL_DIAGNOSTIC_PHASES)
+            ).lower()
+            in ("true", "1", "yes"),
+            recall_phase_sample_every=max(
+                1, int(os.getenv(ENV_RECALL_PHASE_SAMPLE_EVERY, str(DEFAULT_RECALL_PHASE_SAMPLE_EVERY)))
             ),
+            gzip_min_size=int(os.getenv(ENV_GZIP_MIN_SIZE, str(DEFAULT_GZIP_MIN_SIZE))),
+            loop_lag_report_seconds=float(os.getenv(ENV_LOOP_LAG_REPORT_SECONDS, str(DEFAULT_LOOP_LAG_REPORT_SECONDS))),
             link_expansion_per_entity_limit=int(
                 os.getenv(ENV_LINK_EXPANSION_PER_ENTITY_LIMIT, str(DEFAULT_LINK_EXPANSION_PER_ENTITY_LIMIT))
             ),
@@ -4615,7 +4818,7 @@ class HindsightConfig:
             in ("true", "1", "yes"),
             otel_exporter_otlp_endpoint=os.getenv(ENV_OTEL_EXPORTER_OTLP_ENDPOINT) or None,
             otel_exporter_otlp_headers=os.getenv(ENV_OTEL_EXPORTER_OTLP_HEADERS) or None,
-            otel_service_name=os.getenv(ENV_OTEL_SERVICE_NAME, DEFAULT_OTEL_SERVICE_NAME),
+            otel_service_name=os.getenv(ENV_OTEL_SERVICE_NAME) or None,
             otel_deployment_environment=os.getenv(ENV_OTEL_DEPLOYMENT_ENVIRONMENT, DEFAULT_OTEL_DEPLOYMENT_ENVIRONMENT),
             metrics_include_bank_id=os.getenv(ENV_METRICS_INCLUDE_BANK_ID, str(DEFAULT_METRICS_INCLUDE_BANK_ID)).lower()
             in ("true", "1", "yes"),
@@ -4701,12 +4904,6 @@ class HindsightConfig:
                 for t in os.getenv(ENV_WEBHOOK_EVENT_TYPES, DEFAULT_WEBHOOK_EVENT_TYPES).split(",")
                 if t.strip()
             ],
-            webhook_delivery_poll_interval_seconds=int(
-                os.getenv(
-                    ENV_WEBHOOK_DELIVERY_POLL_INTERVAL_SECONDS,
-                    str(DEFAULT_WEBHOOK_DELIVERY_POLL_INTERVAL_SECONDS),
-                )
-            ),
             webhook_allowed_hosts=[h.strip() for h in os.getenv(ENV_WEBHOOK_ALLOWED_HOSTS, "").split(",") if h.strip()],
             webhook_expose_response_body=_parse_boolean_env(
                 ENV_WEBHOOK_EXPOSE_RESPONSE_BODY, DEFAULT_WEBHOOK_EXPOSE_RESPONSE_BODY
@@ -4808,7 +5005,7 @@ _config_cache: HindsightConfig | None = None
 
 
 def _parse_migration_isolation() -> str:
-    """Validate HINDSIGHT_API_MIGRATION_ISOLATION, defaulting to "auto".
+    """Validate HINDSIGHT_API_MIGRATION_ISOLATION, defaulting to "false".
 
     Rejects an unknown value rather than silently falling back: getting this wrong
     means migrations quietly run in the wrong process, which is invisible until

@@ -9,6 +9,7 @@ import type { HindsightClient } from "./hindsight";
 import { buildRetain, runRetainHook } from "./retain-hook";
 import { memoryCursorStore, type RetainCursorStore } from "./retain-cursor";
 import { dcodeAssistantText } from "./transcript-dcode";
+import { memoryUsageCursorStore } from "./usage";
 
 /** The Stop event `runRetainHook` reads from fd 0; every other read stays real. */
 let stdin = "";
@@ -39,6 +40,52 @@ beforeEach(() => {
 
 afterEach(() => {
   rmSync(root, { recursive: true, force: true });
+});
+
+describe("buildRetain usage stats", () => {
+  it("records the Hindsight calls and credit of a real Claude Code transcript", async () => {
+    // The raw host format end to end: tool_use blocks through readClaudeTranscript's action turns.
+    const usageFile = join(root, "usage.jsonl");
+    vi.stubEnv("HINDSIGHT_USAGE_FILE", usageFile);
+    const msg = (type: string, content: unknown) =>
+      JSON.stringify({ type, message: { role: type, content } });
+    writeFileSync(
+      file,
+      [
+        msg("user", "how do we round?"),
+        msg("assistant", [
+          {
+            type: "tool_use",
+            name: "mcp__hindsight__hindsight_search_knowledge_pages",
+            input: { query: "rounding" },
+          },
+          { type: "tool_use", name: "Grep", input: { pattern: "round" } },
+        ]),
+        msg("user", [{ type: "tool_result", content: "page kp-1" }]),
+        msg("assistant", [{ type: "text", text: "> 🧠 **From Hindsight memory** — half up" }]),
+      ].join("\n")
+    );
+    try {
+      await buildRetain({
+        harness: "claude-code",
+        sessionId: "sess-usage",
+        transcriptPath: file,
+        bankId: "bank-1",
+        usageCursors: memoryUsageCursorStore(),
+        client: { retain: vi.fn().mockResolvedValue(undefined) } as unknown as HindsightClient,
+      });
+      expect(JSON.parse(readFileSync(usageFile, "utf8"))).toMatchObject({
+        harness: "claude-code",
+        session: "sess-usage",
+        bank: "bank-1",
+        turn: 1,
+        calls: ["hindsight_search_knowledge_pages"],
+        credited: true,
+      });
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
 });
 
 describe("buildRetain", () => {
@@ -324,7 +371,7 @@ describe("buildRetain — incremental write-back across Stop hooks", () => {
     expect(JSON.parse(rewritten[1])).toMatchObject({ content: "summary of the work so far" });
   });
 
-  it("a failed write is not silently skipped by the next one — it replaces", async () => {
+  it("a failed write is not silently skipped by the next one — it is replayed", async () => {
     const { retain, client } = stubClient();
     const cursors = memoryCursorStore();
     writeFileSync(file, [line(0), line(1)].join("\n"));
@@ -333,14 +380,21 @@ describe("buildRetain — incremental write-back across Stop hooks", () => {
     retain.mockRejectedValueOnce(new Error("server unreachable"));
     writeFileSync(file, [line(0), line(1), line(2)].join("\n"));
     await stop(client, cursors); // buildRetain swallows the failure by design
+    const failed = retain.mock.calls[1];
 
     writeFileSync(file, [line(0), line(1), line(2), line(3)].join("\n"));
     await stop(client, cursors);
 
-    expect(retain).toHaveBeenCalledTimes(3);
-    expect(retain.mock.calls[2][5].updateMode).toBeUndefined();
-    // Everything the failed append would have carried is back in the replaced document.
-    expect((retain.mock.calls[2][0] as string).split("\n")).toHaveLength(5);
+    // The next Stop replays the failed slice verbatim and then appends the new one. Neither is a
+    // replace: an outage costs one retried append, not a full re-extraction per Stop (#3989).
+    expect(retain).toHaveBeenCalledTimes(4);
+    expect(retain.mock.calls[2][0]).toBe(failed[0]);
+    expect(retain.mock.calls[2][5].operationId).toBe(failed[5].operationId);
+    expect(retain.mock.calls.slice(1).map((c) => c[5].updateMode)).toEqual([
+      "append",
+      "append",
+      "append",
+    ]);
   });
 });
 
@@ -400,6 +454,23 @@ describe("runRetainHook honors retainSessions", () => {
   it("writes the transcript back by default", async () => {
     const { retain, makeClient } = stubClient();
     await runRetainHook(spec, makeClient);
+    expect(retain).toHaveBeenCalledTimes(1);
+  });
+
+  it("applies an event gate before building a client", async () => {
+    const { retain, makeClient } = stubClient();
+    const notificationSpec = {
+      ...spec,
+      accept: (ev: Record<string, unknown>) => ev.notification_type === "idle_prompt",
+    };
+
+    stdin = JSON.stringify({ ...event(), notification_type: "permission_prompt" });
+    await runRetainHook(notificationSpec, makeClient);
+    expect(retain).not.toHaveBeenCalled();
+    expect(makeClient).not.toHaveBeenCalled();
+
+    stdin = JSON.stringify({ ...event(), notification_type: "idle_prompt" });
+    await runRetainHook(notificationSpec, makeClient);
     expect(retain).toHaveBeenCalledTimes(1);
   });
 

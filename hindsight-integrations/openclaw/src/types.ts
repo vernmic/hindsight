@@ -134,6 +134,7 @@ export interface PluginConfig {
   retainEveryNTurns?: number; // Retain every Nth turn (1 = every turn, default: 1). Values > 1 enable chunked retention.
   retainOverlapTurns?: number; // Extra prior turns included when chunked retention fires (default: 0). Window = retainEveryNTurns + retainOverlapTurns.
   recallTopK?: number; // Max number of memories to inject. Default: unlimited
+  recallTopicFilter?: boolean; // EXPERIMENTAL (default false): merge a topic-tagged recall ahead of unfiltered results. Never a hard filter - see openclaw.plugin.json.
   recallContextTurns?: number; // Number of user turns to include in recall query context. Default: 1 (latest only)
   recallTimeoutMs?: number; // Timeout for auto-recall in milliseconds. Default: 10000
   recallMaxQueryChars?: number; // Max chars for composed recall query. Default: 800
@@ -142,7 +143,7 @@ export interface PluginConfig {
   ignoreSessionPatterns?: string[]; // Session key glob patterns to skip entirely (no recall, no retain). E.g. ["agent:main:**", "agent:*:cron:**"]
   statelessSessionPatterns?: string[]; // Session key glob patterns for read-only sessions (recall allowed, retain skipped). E.g. ["agent:*:subagent:**"]
   skipStatelessSessions?: boolean; // When true (default), stateless sessions also skip recall. When false, they recall but never retain.
-  skipRetainSessionPatterns?: string[]; // Bare tokens (e.g. "heartbeat") auto-wrapped as glob patterns "**:token**". Use glob syntax for custom patterns. Default: [] (no retain skipping unless configured). Sessions matching these patterns skip retain but still allow recall.
+  skipRetainSessionPatterns?: string[]; // Bare tokens (e.g. "heartbeat") auto-wrapped as glob patterns "**:token**". Use glob syntax for custom patterns. Defaults: ["heartbeat", "cron", "subagent"]. Sessions matching these patterns skip retain but still allow recall.
   retainQualityGate?: boolean; // When true, skip retain for low-signal turns (chitchat, memory-meta, procedural/narrative noise, pure tool calls) via a lightweight regex classifier. Default: false (disabled).
   debug?: boolean; // Enable debug logging (default: false)
   logLevel?: "off" | "error" | "warning" | "info" | "debug"; // Console log verbosity (default: 'info').
@@ -167,6 +168,14 @@ export interface PluginConfig {
    * diagnose latency without patching the dist. Default: false.
    */
   debugPerfTiming?: boolean;
+  /**
+   * Marks admission policy (Vern 2026-09-21): the engine admits a SHARE of the pending marks, in
+   * priority order (pressure, then topic dormancy, then statement age), on a turn cadence.
+   * Declared in openclaw.plugin.json as `astinusMarks`. Kept on ONE line on purpose:
+   * manifest.test.ts extracts PluginConfig keys per line, so a nested block would read as four
+   * extra top-level fields and fail the schema-parity assertion.
+   */
+  astinusMarks?: { minPressure?: number; admitShare?: boolean; debounceTurns?: number; criticalPressure?: number };
 }
 
 export interface ServiceConfig {

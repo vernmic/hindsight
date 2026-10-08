@@ -16,8 +16,8 @@ from pydantic import validate_call, Field, StrictFloat, StrictStr, StrictInt
 from typing import Any, Dict, List, Optional, Tuple, Union
 from typing_extensions import Annotated
 
-from pydantic import Field, StrictStr, field_validator
-from typing import Any, List, Optional
+from pydantic import Field, StrictBytes, StrictStr, field_validator
+from typing import Any, List, Optional, Tuple, Union
 from typing_extensions import Annotated
 from hindsight_client_api.models.clear_memory_observations_response import ClearMemoryObservationsResponse
 from hindsight_client_api.models.delete_response import DeleteResponse
@@ -965,7 +965,7 @@ class MemoryApi:
         _content_type: Optional[StrictStr] = None,
         _headers: Optional[Dict[StrictStr, Any]] = None,
         _host_index: Annotated[StrictInt, Field(ge=0, le=0)] = 0,
-    ) -> object:
+    ) -> bytearray:
         """Fetch an attachment retained inline with a document
 
         Serve the bytes of an attachment retained as inline content. The id is the one inside a placeholder token, and is returned on `attachments[].url` by recall and by the document/chunk/memory reads — so an agent can show or reason over the original behind an attachment-derived fact.  Bytes are served with the Content-Type the caller declared at retain. Access is authorized against the bank; a missing attachment and an invisible bank both return 404, so the endpoint cannot be used to probe what a bank holds.
@@ -1009,7 +1009,7 @@ class MemoryApi:
         )
 
         _response_types_map: Dict[str, Optional[str]] = {
-            '200': "object",
+            '200': "bytearray",
             '422': "HTTPValidationError",
         }
         response_data = await self.api_client.call_api(
@@ -1041,7 +1041,7 @@ class MemoryApi:
         _content_type: Optional[StrictStr] = None,
         _headers: Optional[Dict[StrictStr, Any]] = None,
         _host_index: Annotated[StrictInt, Field(ge=0, le=0)] = 0,
-    ) -> ApiResponse[object]:
+    ) -> ApiResponse[bytearray]:
         """Fetch an attachment retained inline with a document
 
         Serve the bytes of an attachment retained as inline content. The id is the one inside a placeholder token, and is returned on `attachments[].url` by recall and by the document/chunk/memory reads — so an agent can show or reason over the original behind an attachment-derived fact.  Bytes are served with the Content-Type the caller declared at retain. Access is authorized against the bank; a missing attachment and an invisible bank both return 404, so the endpoint cannot be used to probe what a bank holds.
@@ -1085,7 +1085,7 @@ class MemoryApi:
         )
 
         _response_types_map: Dict[str, Optional[str]] = {
-            '200': "object",
+            '200': "bytearray",
             '422': "HTTPValidationError",
         }
         response_data = await self.api_client.call_api(
@@ -1161,7 +1161,7 @@ class MemoryApi:
         )
 
         _response_types_map: Dict[str, Optional[str]] = {
-            '200': "object",
+            '200': "bytearray",
             '422': "HTTPValidationError",
         }
         response_data = await self.api_client.call_api(
@@ -1213,8 +1213,8 @@ class MemoryApi:
         if 'Accept' not in _header_params:
             _header_params['Accept'] = self.api_client.select_header_accept(
                 [
-                    'application/json', 
-                    'application/octet-stream'
+                    'application/octet-stream', 
+                    'application/json'
                 ]
             )
 
@@ -1328,6 +1328,7 @@ class MemoryApi:
 
         _response_types_map: Dict[str, Optional[str]] = {
             '200': "GraphDataResponse",
+            '404': None,
             '422': "HTTPValidationError",
         }
         response_data = await self.api_client.call_api(
@@ -1428,6 +1429,7 @@ class MemoryApi:
 
         _response_types_map: Dict[str, Optional[str]] = {
             '200': "GraphDataResponse",
+            '404': None,
             '422': "HTTPValidationError",
         }
         response_data = await self.api_client.call_api(
@@ -1528,6 +1530,7 @@ class MemoryApi:
 
         _response_types_map: Dict[str, Optional[str]] = {
             '200': "GraphDataResponse",
+            '404': None,
             '422': "HTTPValidationError",
         }
         response_data = await self.api_client.call_api(
@@ -2324,6 +2327,7 @@ class MemoryApi:
 
         _response_types_map: Dict[str, Optional[str]] = {
             '200': "ListMemoryUnitsResponse",
+            '404': None,
             '422': "HTTPValidationError",
         }
         response_data = await self.api_client.call_api(
@@ -2436,6 +2440,7 @@ class MemoryApi:
 
         _response_types_map: Dict[str, Optional[str]] = {
             '200': "ListMemoryUnitsResponse",
+            '404': None,
             '422': "HTTPValidationError",
         }
         response_data = await self.api_client.call_api(
@@ -2548,6 +2553,7 @@ class MemoryApi:
 
         _response_types_map: Dict[str, Optional[str]] = {
             '200': "ListMemoryUnitsResponse",
+            '404': None,
             '422': "HTTPValidationError",
         }
         response_data = await self.api_client.call_api(
@@ -2741,6 +2747,7 @@ class MemoryApi:
 
         _response_types_map: Dict[str, Optional[str]] = {
             '200': "ObservationScopesResponse",
+            '404': None,
             '422': "HTTPValidationError",
         }
         response_data = await self.api_client.call_api(
@@ -2821,6 +2828,7 @@ class MemoryApi:
 
         _response_types_map: Dict[str, Optional[str]] = {
             '200': "ObservationScopesResponse",
+            '404': None,
             '422': "HTTPValidationError",
         }
         response_data = await self.api_client.call_api(
@@ -2901,6 +2909,7 @@ class MemoryApi:
 
         _response_types_map: Dict[str, Optional[str]] = {
             '200': "ObservationScopesResponse",
+            '404': None,
             '422': "HTTPValidationError",
         }
         response_data = await self.api_client.call_api(
@@ -3061,6 +3070,7 @@ class MemoryApi:
 
         _response_types_map: Dict[str, Optional[str]] = {
             '200': "ListTagsResponse",
+            '404': None,
             '422': "HTTPValidationError",
         }
         response_data = await self.api_client.call_api(
@@ -3149,6 +3159,7 @@ class MemoryApi:
 
         _response_types_map: Dict[str, Optional[str]] = {
             '200': "ListTagsResponse",
+            '404': None,
             '422': "HTTPValidationError",
         }
         response_data = await self.api_client.call_api(
@@ -3237,6 +3248,7 @@ class MemoryApi:
 
         _response_types_map: Dict[str, Optional[str]] = {
             '200': "ListTagsResponse",
+            '404': None,
             '422': "HTTPValidationError",
         }
         response_data = await self.api_client.call_api(

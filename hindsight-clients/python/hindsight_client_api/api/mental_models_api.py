@@ -1839,7 +1839,7 @@ class MentalModelsApi:
         bank_id: StrictStr,
         tags: Annotated[Optional[List[StrictStr]], Field(description="Filter by tags")] = None,
         tags_match: Annotated[Optional[StrictStr], Field(description="How to match tags")] = None,
-        detail: Annotated[Optional[StrictStr], Field(description="Detail level: 'metadata' (names/tags only), 'content' (adds content/config), 'full' (includes reflect_response)")] = None,
+        detail: Annotated[Optional[StrictStr], Field(description="Detail level: 'metadata' (names/tags/staleness — the default), 'content' (adds content/config), 'full' (includes reflect_response). Content is opt-in: it is returned only when explicitly requested.")] = None,
         limit: Optional[Annotated[int, Field(le=1000, strict=True, ge=1)]] = None,
         offset: Optional[Annotated[int, Field(strict=True, ge=0)]] = None,
         authorization: Optional[StrictStr] = None,
@@ -1866,7 +1866,7 @@ class MentalModelsApi:
         :type tags: List[str]
         :param tags_match: How to match tags
         :type tags_match: str
-        :param detail: Detail level: 'metadata' (names/tags only), 'content' (adds content/config), 'full' (includes reflect_response)
+        :param detail: Detail level: 'metadata' (names/tags/staleness — the default), 'content' (adds content/config), 'full' (includes reflect_response). Content is opt-in: it is returned only when explicitly requested.
         :type detail: str
         :param limit:
         :type limit: int
@@ -1912,6 +1912,7 @@ class MentalModelsApi:
 
         _response_types_map: Dict[str, Optional[str]] = {
             '200': "MentalModelListResponse",
+            '404': None,
             '422': "HTTPValidationError",
         }
         response_data = await self.api_client.call_api(
@@ -1931,7 +1932,7 @@ class MentalModelsApi:
         bank_id: StrictStr,
         tags: Annotated[Optional[List[StrictStr]], Field(description="Filter by tags")] = None,
         tags_match: Annotated[Optional[StrictStr], Field(description="How to match tags")] = None,
-        detail: Annotated[Optional[StrictStr], Field(description="Detail level: 'metadata' (names/tags only), 'content' (adds content/config), 'full' (includes reflect_response)")] = None,
+        detail: Annotated[Optional[StrictStr], Field(description="Detail level: 'metadata' (names/tags/staleness — the default), 'content' (adds content/config), 'full' (includes reflect_response). Content is opt-in: it is returned only when explicitly requested.")] = None,
         limit: Optional[Annotated[int, Field(le=1000, strict=True, ge=1)]] = None,
         offset: Optional[Annotated[int, Field(strict=True, ge=0)]] = None,
         authorization: Optional[StrictStr] = None,
@@ -1958,7 +1959,7 @@ class MentalModelsApi:
         :type tags: List[str]
         :param tags_match: How to match tags
         :type tags_match: str
-        :param detail: Detail level: 'metadata' (names/tags only), 'content' (adds content/config), 'full' (includes reflect_response)
+        :param detail: Detail level: 'metadata' (names/tags/staleness — the default), 'content' (adds content/config), 'full' (includes reflect_response). Content is opt-in: it is returned only when explicitly requested.
         :type detail: str
         :param limit:
         :type limit: int
@@ -2004,6 +2005,7 @@ class MentalModelsApi:
 
         _response_types_map: Dict[str, Optional[str]] = {
             '200': "MentalModelListResponse",
+            '404': None,
             '422': "HTTPValidationError",
         }
         response_data = await self.api_client.call_api(
@@ -2023,7 +2025,7 @@ class MentalModelsApi:
         bank_id: StrictStr,
         tags: Annotated[Optional[List[StrictStr]], Field(description="Filter by tags")] = None,
         tags_match: Annotated[Optional[StrictStr], Field(description="How to match tags")] = None,
-        detail: Annotated[Optional[StrictStr], Field(description="Detail level: 'metadata' (names/tags only), 'content' (adds content/config), 'full' (includes reflect_response)")] = None,
+        detail: Annotated[Optional[StrictStr], Field(description="Detail level: 'metadata' (names/tags/staleness — the default), 'content' (adds content/config), 'full' (includes reflect_response). Content is opt-in: it is returned only when explicitly requested.")] = None,
         limit: Optional[Annotated[int, Field(le=1000, strict=True, ge=1)]] = None,
         offset: Optional[Annotated[int, Field(strict=True, ge=0)]] = None,
         authorization: Optional[StrictStr] = None,
@@ -2050,7 +2052,7 @@ class MentalModelsApi:
         :type tags: List[str]
         :param tags_match: How to match tags
         :type tags_match: str
-        :param detail: Detail level: 'metadata' (names/tags only), 'content' (adds content/config), 'full' (includes reflect_response)
+        :param detail: Detail level: 'metadata' (names/tags/staleness — the default), 'content' (adds content/config), 'full' (includes reflect_response). Content is opt-in: it is returned only when explicitly requested.
         :type detail: str
         :param limit:
         :type limit: int
@@ -2096,6 +2098,7 @@ class MentalModelsApi:
 
         _response_types_map: Dict[str, Optional[str]] = {
             '200': "MentalModelListResponse",
+            '404': None,
             '422': "HTTPValidationError",
         }
         response_data = await self.api_client.call_api(
