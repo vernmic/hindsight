@@ -18,8 +18,7 @@ submission packet proposes a new feature request for the cap, and evidence on
 instead of a duplicate proposal. Hermes host proposals overlap
 [PR 84412](https://github.com/NousResearch/hermes-agent/pull/84412) and
 [PR 57703](https://github.com/NousResearch/hermes-agent/pull/57703); alignment is
-requested before a current-main host port. Public maintainer messages await
-operator review; no acceptance or approval is implied.
+requested before a current-main host port. Vern approved all four texts on October 8. The two Hermes comments are posted and verified: [Hermes PR 84412](https://github.com/NousResearch/hermes-agent/pull/84412#issuecomment-6055478808); [Hermes PR 57703](https://github.com/NousResearch/hermes-agent/pull/57703#issuecomment-6055483018). The Hindsight feature request and extraction comment remain approved but unposted: the connector returned HTTP 403 and browser sign-in is required. No upstream acceptance is claimed.
 
 The local workspace owns the review packet and detailed test receipts under
 reports/upstream-contribution-review-20261008.md and
