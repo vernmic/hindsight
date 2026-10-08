@@ -133,6 +133,7 @@ export interface PluginConfig {
   recallRoles?: Array<"user" | "assistant" | "system" | "tool">; // Roles to include when composing contextual recall query. Default: ['user', 'assistant']
   retainEveryNTurns?: number; // Retain every Nth turn (1 = every turn, default: 1). Values > 1 enable chunked retention.
   retainOverlapTurns?: number; // Extra prior turns included when chunked retention fires (default: 0). Window = retainEveryNTurns + retainOverlapTurns.
+  retainSegmentUnitThreshold?: number; // Session document roll (change 2, 2026-09-25): units per segment before the next retain opens a new document id. Default: 50.
   recallTopK?: number; // Max number of memories to inject. Default: unlimited
   recallTopicFilter?: boolean; // EXPERIMENTAL (default false): merge a topic-tagged recall ahead of unfiltered results. Never a hard filter - see openclaw.plugin.json.
   recallContextTurns?: number; // Number of user turns to include in recall query context. Default: 1 (latest only)
