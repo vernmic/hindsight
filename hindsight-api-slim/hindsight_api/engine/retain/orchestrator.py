@@ -1996,6 +1996,7 @@ async def retain_batch(
     # The same hash is what serializes appends on a store that owns its documents: there is no row
     # to lock, so the store's write is a compare-and-set on it (``_append_expectation``).
     append_base_hash: str | None = None
+    append_base_text: str | None = None  # the stored body an append extends (tag carry)
     is_append = update_mode == "append" and bool(effective_doc_id) and is_first_batch
 
     if is_append:
@@ -2009,6 +2010,7 @@ async def retain_batch(
                 conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=effective_doc_id
             )
         existing_text = base.original_text if base else None
+        append_base_text = existing_text or None
         append_base_hash = base.content_hash if base else _APPEND_BASE_ABSENT
         # The stored document's attachment names, carried onto the prepended base below. A
         # store-owned record's metadata is REPLACED on every write, so an append that did not
@@ -2271,6 +2273,7 @@ async def retain_batch(
             attachment_loader=attachment_loader,
             fact_filter=fact_filter,
             vlm_config=vlm_config,
+            append_base_text=append_base_text,
         )
     await _record_retain_event(
         pool, bank_id, effective_doc_id, update_mode, force_reextract, operation_id, result, stream_changes
@@ -2699,9 +2702,15 @@ async def _streaming_retain_batch(
     attachment_loader: "RetainAttachmentLoader | None" = None,
     fact_filter: "RetainFactFilter | None" = None,
     vlm_config: "LLMConfig | None" = None,
+    append_base_text: str | None = None,
 ) -> RetainBatchResult:
     """
     Process a large document in streaming mini-batches to bound memory usage.
+
+    ``append_base_text`` is the stored body an append extends. When set, the outgoing units'
+    tags are snapshotted inside the first write transaction, just before they are deleted, and
+    carried onto the re-extracted units (``append_tag_carry``): an append that reaches this
+    full path must not lose the tags earlier units carried.
 
     Instead of extracting facts from ALL chunks at once (which can OOM for 17k+
     chunk documents), this splits the pre-chunked content into batches of
@@ -2748,6 +2757,11 @@ async def _streaming_retain_batch(
         combined_content = full_document_body
     else:
         combined_content = "\n".join([c.get("content", "") for c in contents_dicts])
+    append_new_spans = None
+    if append_base_text:
+        from .append_tag_carry import new_chunk_spans
+
+        append_new_spans = new_chunk_spans(append_base_text, combined_content or "", all_pre_chunks)
     # Memory: contents_dicts content strings are now captured in combined_content.
     # Clear them from the dicts to release the per-item copies (can be multi-MB each).
     for d in contents_dicts:
@@ -2895,6 +2909,30 @@ async def _streaming_retain_batch(
 
     # Track whether document tracking has been done (by the first batch)
     doc_tracking_done = [False]
+    # Set inside the first write transaction of an append (see `_capture_append_carry`).
+    append_carry: list = [None]
+
+    async def _capture_append_carry(conn) -> None:
+        if not append_base_text or append_carry[0] is not None:
+            return
+        from ..memories import get_memories as _get_memories_carry
+        from .append_tag_carry import AppendTagCarry
+
+        snapshot = await _get_memories_carry().append_tag_snapshot(
+            conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=effective_doc_id
+        )
+        append_carry[0] = AppendTagCarry(
+            base_text=append_base_text,
+            new_spans=append_new_spans,
+            snapshot=snapshot,
+            label_tag_keys=label_tag_keys(getattr(config, "entity_labels", None)),
+        )
+        if snapshot.units:
+            log_buffer.append(
+                f"[append] full re-extraction: carrying tags of {len(snapshot.units)} earlier unit(s) "
+                f"onto the re-extracted units"
+            )
+
     # Whether the document's prior version has actually been REPLACED. Distinct from
     # `doc_tracking_done`, which records that tracking completed and is set even when a batch wrote
     # zero units — there `provider.retain` was never called and no replace was issued, so reusing
@@ -3303,6 +3341,7 @@ async def _streaming_retain_batch(
                                 preserve_tag_prefixes=getattr(config, "retain_preserve_tag_prefixes", None),
                             )
                         else:
+                            await _capture_append_carry(conn)
                             # A 0-fact re-ingest still deletes the outgoing memories, in the same
                             # transaction as the document row.
                             await fact_storage.handle_document_tracking(
@@ -3521,6 +3560,8 @@ async def _streaming_retain_batch(
                                 f"(recovery, preserving existing chunks)"
                             )
                         else:
+                            # Before the delete: an append's re-extracted units inherit these tags.
+                            await _capture_append_carry(conn)
                             await fact_storage.handle_document_tracking(
                                 conn,
                                 bank_id,
@@ -3620,6 +3661,21 @@ async def _streaming_retain_batch(
                             chunk_id = chunk_id_map.get(fact.chunk_index)
                             if chunk_id:
                                 processed_fact.chunk_id = chunk_id
+                    # An append re-extracting the whole document: carry the earlier units' tags.
+                    carry = append_carry[0]
+                    if carry is not None and carry.has_units:
+                        carried = carry.assign(
+                            [
+                                (
+                                    pf.fact_text,
+                                    None if f.chunk_index is None else f.chunk_index - chunk_index_offset,
+                                    pf.tags,
+                                )
+                                for f, pf in zip(batch_extracted, batch_processed)
+                            ]
+                        )
+                        for pf, tags in zip(batch_processed, carried):
+                            pf.tags = tags
 
                     # Insert facts and links — skip semantic links entirely in streaming
                     # mode; they are created in a single final ANN pass after all batches.
