@@ -3755,6 +3755,39 @@ class MemoriesExtension(Extension, ABC):
         await self.delete_document(conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=document_id)
         return None
 
+    async def append_tag_snapshot(self, *, conn, fq_table, bank_id: str, document_id: str):
+        """The outgoing document's ``experience``/``world`` units (text, fact type, tags, chunk index)
+        and chunk texts, read just before an append's full re-extraction deletes them, so the new
+        units can inherit their tags (``retain.append_tag_carry``). This default has no chunk
+        texts: it reads the units through :meth:`scan_memories` and takes the chunk index from the
+        ``{bank}_{document}_{index}`` chunk id."""
+        from ..retain.append_tag_carry import OldDocumentSnapshot, OldUnit
+
+        snap = OldDocumentSnapshot()
+        token = ""
+        while True:
+            page = await self.scan_memories(
+                conn=conn,
+                fq_table=fq_table,
+                bank_id=bank_id,
+                fact_types=["experience", "world"],
+                document_id=document_id,
+                limit=1000,
+                page_token=token,
+            )
+            for m in page.memories:
+                idx = None
+                tail = (m.chunk_id or "").rsplit("_", 1)[-1]
+                if tail.isdigit():
+                    idx = int(tail)
+                snap.units.append(
+                    OldUnit(text=m.text, fact_type=m.fact_type, tags=tuple(m.tags or []), chunk_index=idx)
+                )
+            token = page.next_page_token
+            if not token:
+                break
+        return snap
+
     async def document_tags(self, *, conn, fq_table, bank_id: str, document_id: str) -> list[str] | None:
         """The tags currently stored on the document, or ``None`` when it does not exist.
 
