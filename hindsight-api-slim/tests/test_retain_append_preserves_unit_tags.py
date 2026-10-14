@@ -101,9 +101,7 @@ async def test_append_keeps_each_survivor_exact_tag_set(memory, request_context,
         assert len(first) >= 2, first
 
         # Each unit gets its own, different classification on top of the document tag.
-        annotated = {
-            uid: ["topic:one", *_ANNOTATIONS[i % len(_ANNOTATIONS)]] for i, uid in enumerate(sorted(first))
-        }
+        annotated = {uid: ["topic:one", *_ANNOTATIONS[i % len(_ANNOTATIONS)]] for i, uid in enumerate(sorted(first))}
         await _annotate(memory, annotated)
         before = await _units(memory, bank_id, doc, request_context)
         assert before == {uid: set(t) for uid, t in annotated.items()}
