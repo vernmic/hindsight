@@ -960,6 +960,11 @@ ENV_CONSOLIDATION_SOURCE_FACTS_MAX_TOKENS_PER_OBSERVATION = (
 ENV_CONSOLIDATION_RECALL_BUDGET = "HINDSIGHT_API_CONSOLIDATION_RECALL_BUDGET"
 ENV_CONSOLIDATION_MAX_ATTEMPTS = "HINDSIGHT_API_CONSOLIDATION_MAX_ATTEMPTS"
 ENV_CONSOLIDATION_USE_DECISION_MODEL = "HINDSIGHT_API_CONSOLIDATION_USE_DECISION_MODEL"
+ENV_CONSOLIDATION_PRESERVE_TAG_PREFIXES = "HINDSIGHT_API_CONSOLIDATION_PRESERVE_TAG_PREFIXES"
+# Opt-in (default off) tag-prefix preservation for retain document-level tag writes
+# (update_memory_units_metadata_and_tags blanket write + documents upsert).
+# Same grammar as the consolidation list (JSON array or comma-separated).
+ENV_RETAIN_PRESERVE_TAG_PREFIXES = "HINDSIGHT_API_RETAIN_PRESERVE_TAG_PREFIXES"
 ENV_OBSERVATIONS_MISSION = "HINDSIGHT_API_OBSERVATIONS_MISSION"
 ENV_MAX_OBSERVATIONS_PER_SCOPE = "HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE"
 ENV_OBSERVATION_SCOPE_LIMITS = "HINDSIGHT_API_OBSERVATION_SCOPE_LIMITS"
@@ -1973,6 +1978,16 @@ DEFAULT_CONSOLIDATION_SOURCE_FACTS_MAX_TOKENS = (
 DEFAULT_CONSOLIDATION_SOURCE_FACTS_MAX_TOKENS_PER_OBSERVATION = (
     256  # Max tokens of source facts per observation in consolidation prompt (-1 = unlimited)
 )
+# Opt-in (default off) tag-prefix preservation. When set to a non-empty list of prefixes,
+# consolidation unions the tags of the sources it folds into a surviving observation onto
+# that survivor, but only for tags whose value starts with one of these prefixes. Default
+# None/empty leaves consolidation byte-identical to today (no tag union).
+DEFAULT_CONSOLIDATION_PRESERVE_TAG_PREFIXES: list[str] | None = None
+# Opt-in (default off) for the retain path: blanket document-tags writes union the tags
+# already on the row whose value starts with one of these prefixes instead of replacing
+# them, so a re-ingest/delta retain cannot strip e.g. retain:* markers. Default
+# None/empty leaves retain byte-identical to today (no tag union).
+DEFAULT_RETAIN_PRESERVE_TAG_PREFIXES: list[str] | None = None
 DEFAULT_OBSERVATIONS_MISSION = None  # Declarative spec of what observations are for this bank
 DEFAULT_MAX_OBSERVATIONS_PER_SCOPE = -1  # Max observations per tag scope (-1 = unlimited)
 # DEPRECATED — use DEFAULT_CONSOLIDATION_STRATEGIES below, which carries the
@@ -2580,6 +2595,48 @@ def _parse_bank_priority(raw: str) -> dict[str, int]:
             raise ValueError(f"Priority must be >= 1, got {priority} in entry '{entry}'")
         result[pattern] = priority
     return result
+
+
+def _parse_preserve_tag_prefixes(raw: str | None) -> list[str] | None:
+    """Parse ``HINDSIGHT_API_CONSOLIDATION_PRESERVE_TAG_PREFIXES`` into a list of prefixes.
+
+    Accepts a JSON array (``["retain:", "pin:"]``) or a comma-separated list
+    (``retain:,pin:``). Blank/unset returns the default (None = feature off). An
+    empty list is preserved as an explicit off. Prefixes are stripped of surrounding
+    whitespace; empty entries are dropped.
+    """
+    if raw is None:
+        return DEFAULT_CONSOLIDATION_PRESERVE_TAG_PREFIXES
+    text = raw.strip()
+    if not text:
+        return DEFAULT_CONSOLIDATION_PRESERVE_TAG_PREFIXES
+    if text.startswith("["):
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f"Invalid {ENV_CONSOLIDATION_PRESERVE_TAG_PREFIXES}: expected a JSON array of strings, "
+                f"got invalid JSON: {e}"
+            ) from e
+        if not isinstance(parsed, list):
+            raise ValueError(
+                f"Invalid {ENV_CONSOLIDATION_PRESERVE_TAG_PREFIXES}: expected a JSON array of strings, "
+                f"got {type(parsed).__name__}"
+            )
+        return [str(p).strip() for p in parsed if str(p).strip()]
+    return [part.strip() for part in text.split(",") if part.strip()]
+
+
+def _parse_retain_preserve_tag_prefixes(raw: str | None) -> list[str] | None:
+    """Parse ``HINDSIGHT_API_RETAIN_PRESERVE_TAG_PREFIXES`` into a list of prefixes.
+
+    Same grammar as ``HINDSIGHT_API_CONSOLIDATION_PRESERVE_TAG_PREFIXES`` (JSON array
+    or comma-separated list). Blank/unset returns the retain default (None = feature
+    off); non-blank input is delegated to the shared parser.
+    """
+    if raw is None or not raw.strip():
+        return DEFAULT_RETAIN_PRESERVE_TAG_PREFIXES
+    return _parse_preserve_tag_prefixes(raw)
 
 
 def _get_default_model_for_provider(provider: str) -> str:
@@ -3750,6 +3807,11 @@ class HindsightConfig:
     consolidation_source_facts_max_tokens: int
     consolidation_source_facts_max_tokens_per_observation: int
     consolidation_max_attempts: int
+    # Opt-in (default off) prefixes whose tags are preserved when consolidation folds
+    # duplicate sources into a surviving observation. None/empty = today's behavior.
+    consolidation_preserve_tag_prefixes: list[str] | None
+    # Opt-in (default off) prefixes whose tags survive retain document-level tag writes.
+    retain_preserve_tag_prefixes: list[str] | None
     observations_mission: str | None
     max_observations_per_scope: int
     # Per-scope observation caps overriding max_observations_per_scope.
@@ -4165,6 +4227,8 @@ class HindsightConfig:
         "consolidation_max_memories_per_round",
         "consolidation_source_facts_max_tokens",
         "consolidation_source_facts_max_tokens_per_observation",
+        "consolidation_preserve_tag_prefixes",
+        "retain_preserve_tag_prefixes",
         "observations_mission",
         "max_observations_per_scope",
         "observation_scope_limits",
@@ -5527,6 +5591,12 @@ class HindsightConfig:
             ),
             consolidation_max_attempts=int(
                 os.getenv(ENV_CONSOLIDATION_MAX_ATTEMPTS, str(DEFAULT_CONSOLIDATION_MAX_ATTEMPTS))
+            ),
+            consolidation_preserve_tag_prefixes=_parse_preserve_tag_prefixes(
+                os.getenv(ENV_CONSOLIDATION_PRESERVE_TAG_PREFIXES)
+            ),
+            retain_preserve_tag_prefixes=_parse_retain_preserve_tag_prefixes(
+                os.getenv(ENV_RETAIN_PRESERVE_TAG_PREFIXES)
             ),
             observations_mission=os.getenv(ENV_OBSERVATIONS_MISSION) or DEFAULT_OBSERVATIONS_MISSION,
             max_observations_per_scope=int(

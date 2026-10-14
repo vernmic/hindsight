@@ -147,6 +147,14 @@ class BankTemplateConfig(BaseModel):
             "A list of tag lists may use globs, e.g. [['topic:*']] scopes each memory by its own topic tags."
         ),
     )
+    consolidation_preserve_tag_prefixes: list[str] | None = Field(
+        default=None,
+        description="Preserve tags matching these literal prefixes on consolidation fold survivors (off by default)",
+    )
+    retain_preserve_tag_prefixes: list[str] | None = Field(
+        default=None,
+        description="Preserve tags matching these literal prefixes during retain tag rewrites (off by default)",
+    )
     consolidation_strategies: list[ConsolidationStrategySpec] | None = Field(
         default=None,
         description=(

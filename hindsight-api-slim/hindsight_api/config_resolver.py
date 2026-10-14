@@ -793,6 +793,31 @@ def _configurable_field_types() -> dict[str, tuple[type, ...]]:
     return field_types
 
 
+@lru_cache(maxsize=1)
+def _configurable_field_element_types() -> dict[str, tuple[type, ...]]:
+    """Element-type contract for list-typed configurable fields.
+
+    ``_configurable_field_types`` checks that a value IS a list; this adds what the
+    list must CONTAIN, read from the declared annotation (``list[str]`` -> ``str``,
+    ``list[int]`` -> ``int``). Fields whose element type is not reducible to runtime
+    classes are omitted, which callers read as "no element contract".
+    """
+    configurable = HindsightConfig.get_configurable_fields()
+    element_types: dict[str, tuple[type, ...]] = {}
+    for field in fields(HindsightConfig):
+        if field.name not in configurable:
+            continue
+        for candidate in (field.type,) + get_args(field.type):
+            if get_origin(candidate) is list:
+                args = get_args(candidate)
+                if args:
+                    resolved = _runtime_types(args[0])
+                    if resolved:
+                        element_types[field.name] = resolved
+                break
+    return element_types
+
+
 def _value_matches_type(value: Any, allowed: tuple[type, ...]) -> bool:
     """Whether ``value`` satisfies a field's declared type contract."""
     if isinstance(value, bool):
@@ -886,6 +911,18 @@ def _validate_config_value_types(updates: dict[str, Any]) -> None:
             continue
         if not _value_matches_type(value, allowed):
             raise ValueError(f"{key} must be {_describe_types(allowed)}, got {type(value).__name__}")
+        # A list-typed field also declares what its elements are: a list of the wrong
+        # element type passes the container check but wedges consumers exactly as a
+        # wrong-shaped scalar would (Opus review follow-up 1, 2026-09-12).
+        if isinstance(value, list) and value and list in allowed:
+            element_allowed = _configurable_field_element_types().get(key, ())
+            if element_allowed:
+                bad = next((v for v in value if not _value_matches_type(v, element_allowed)), None)
+                if bad is not None:
+                    raise ValueError(
+                        f"{key} must be a list of {_describe_types(element_allowed)}; "
+                        f"got element type {type(bad).__name__}"
+                    )
 
 
 def _coerce_stored_bank_overrides(bank_id: str, overrides: dict[str, Any], where: str = "") -> dict[str, Any]:
