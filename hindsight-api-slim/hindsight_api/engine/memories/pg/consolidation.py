@@ -301,7 +301,8 @@ async def fold_observation_into_twin(
         bank_id=bank_id,
         survivor_id=twin_id,
         absorbed_ids=live_u_sources,
-        absorbed_extra_tags=list(updated_row["tags"] or []),
+        # Only read when the gate is on: the column is selected either way.
+        absorbed_extra_tags=list(updated_row["tags"] or []) if preserve_tag_prefixes else None,
         prefixes=preserve_tag_prefixes,
     )
     tags_clause = ",\n                tags = $7::varchar[]" if new_tags is not None else ""
