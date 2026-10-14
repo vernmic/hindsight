@@ -1415,6 +1415,7 @@ async def _delta_store_owned_write(
                     # update_mode="append" only adds: survivors keep their own tags.
                     append=_is_append_submission(contents_dicts),
                     ops=pool.ops,
+                    preserve_tag_prefixes=getattr(config, "retain_preserve_tag_prefixes", None),
                 )
 
     log_buffer.append(f"DELTA RETAIN COMPLETE (store-owned): {len(processed_facts)} new units")
@@ -3295,6 +3296,7 @@ async def _streaming_retain_batch(
                                 merged_tags,
                                 store_document_text=config.store_document_text,
                                 attachment_filenames=_attachment_filenames_for(contents),
+                                preserve_tag_prefixes=getattr(config, "retain_preserve_tag_prefixes", None),
                             )
                         else:
                             # A 0-fact re-ingest still deletes the outgoing memories, in the same
@@ -3310,6 +3312,7 @@ async def _streaming_retain_batch(
                                 ops=pool.ops,
                                 store_document_text=config.store_document_text,
                                 attachment_filenames=_attachment_filenames_for(contents),
+                                preserve_tag_prefixes=getattr(config, "retain_preserve_tag_prefixes", None),
                             )
                         doc_tracking_done[0] = True
                         # Memory: combined_content has been persisted; release
@@ -3507,6 +3510,7 @@ async def _streaming_retain_batch(
                                 merged_tags,
                                 store_document_text=config.store_document_text,
                                 attachment_filenames=_attachment_filenames_for(contents),
+                                preserve_tag_prefixes=getattr(config, "retain_preserve_tag_prefixes", None),
                             )
                             log_buffer.append(
                                 f"[streaming] Document {effective_doc_id} updated "
@@ -3524,6 +3528,7 @@ async def _streaming_retain_batch(
                                 ops=pool.ops,
                                 store_document_text=config.store_document_text,
                                 attachment_filenames=_attachment_filenames_for(contents),
+                                preserve_tag_prefixes=getattr(config, "retain_preserve_tag_prefixes", None),
                             )
                             log_buffer.append(f"[streaming] Document {effective_doc_id} tracked (full content)")
                             document_cleared = True
@@ -3792,6 +3797,7 @@ async def _streaming_retain_batch(
                                 merged_tags,
                                 store_document_text=config.store_document_text,
                                 attachment_filenames=_attachment_filenames_for(contents),
+                                preserve_tag_prefixes=getattr(config, "retain_preserve_tag_prefixes", None),
                             )
                         else:
                             # A no-facts re-ingest still deletes the outgoing memories, in the same
@@ -3807,6 +3813,7 @@ async def _streaming_retain_batch(
                                 ops=pool.ops,
                                 store_document_text=config.store_document_text,
                                 attachment_filenames=_attachment_filenames_for(contents),
+                                preserve_tag_prefixes=getattr(config, "retain_preserve_tag_prefixes", None),
                             )
                         doc_tracking_done[0] = True
                         # Memory: combined_content has been persisted and won't be
@@ -4447,6 +4454,7 @@ async def _try_delta_retain(
                     merged_tags,
                     store_document_text=config.store_document_text,
                     attachment_filenames=_attachment_filenames_for(contents),
+                    preserve_tag_prefixes=getattr(config, "retain_preserve_tag_prefixes", None),
                 )
                 # Re-store the document's bodies in the store's document store with the
                 # FULL new chunk set — put_document dedups by content hash, so unchanged chunks and
@@ -4495,6 +4503,7 @@ async def _try_delta_retain(
                     previous_document_tags=doc_tags_at_load,
                     append=_is_append_submission(contents_dicts),
                     ops=pool.ops,
+                    preserve_tag_prefixes=getattr(config, "retain_preserve_tag_prefixes", None),
                 )
                 log_buffer.append(
                     f"  Updated tags and metadata on {updated_count} existing memory units "
@@ -4682,6 +4691,7 @@ async def _delta_metadata_only(
                     previous_document_tags=previous_document_tags,
                     append=_is_append_submission(contents_dicts),
                     ops=pool.ops,
+                    preserve_tag_prefixes=getattr(config, "retain_preserve_tag_prefixes", None),
                 )
         if outbox_callback is not None:
             # The outbox is still SQL for every deployment, so it keeps its own connection.
@@ -4721,6 +4731,7 @@ async def _delta_metadata_only(
                     merged_tags,
                     store_document_text=config.store_document_text,
                     attachment_filenames=_attachment_filenames_for(contents),
+                    preserve_tag_prefixes=getattr(config, "retain_preserve_tag_prefixes", None),
                 )
                 await fact_storage.update_memory_units_metadata_and_tags(
                     conn,
@@ -4733,6 +4744,7 @@ async def _delta_metadata_only(
                     previous_document_tags=previous_document_tags,
                     append=_is_append_submission(contents_dicts),
                     ops=pool.ops,
+                    preserve_tag_prefixes=getattr(config, "retain_preserve_tag_prefixes", None),
                 )
                 if outbox_callback is not None:
                     await outbox_callback(conn)
