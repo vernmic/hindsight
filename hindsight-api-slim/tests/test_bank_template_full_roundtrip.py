@@ -99,6 +99,8 @@ _SAMPLE_VALUES: dict[str, Any] = {
     "consolidation_llm_batch_size": 11,
     "consolidation_source_facts_max_tokens": 2048,
     "consolidation_source_facts_max_tokens_per_observation": 256,
+    "consolidation_preserve_tag_prefixes": ["retain:"],
+    "retain_preserve_tag_prefixes": ["retain:"],
     "max_observations_per_scope": 13,
     "observation_scope_limits": [{"scope": ["run_*"], "limit": 2}],
     "default_observation_scopes": [["topic:*", "user:*"]],
