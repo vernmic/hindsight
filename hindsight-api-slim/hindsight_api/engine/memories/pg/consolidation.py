@@ -147,6 +147,47 @@ async def count_observations_with_tags(*, conn, fq_table: Callable[[str], str], 
     )
 
 
+async def _preserved_fold_tags(
+    *,
+    conn,
+    fq_table: Callable[[str], str],
+    bank_id: str,
+    survivor_id: str,
+    absorbed_ids: list[uuid.UUID],
+    absorbed_extra_tags: list[str] | None,
+    prefixes: list[str] | None,
+) -> list[str] | None:
+    """The survivor's tags with the absorbed rows' protected tags unioned in; None for no change.
+
+    ``consolidation_preserve_tag_prefixes``: a fold absorbs source facts (and, on the update
+    fold, a whole observation) into a surviving observation, and their protection tags
+    (``retain:permanent``...) must not die with them. Only tags under the configured prefixes
+    move (literal prefix match, see ``protected_tags``), so a source's scope tags never leak onto
+    an observation of another scope. The source lookup is bank-scoped. The survivor row is
+    locked (``FOR NO KEY UPDATE``) after the sources, keeping the sources-before-observation
+    lock order, so a concurrent retag cannot be lost between this read and the fold.
+    """
+    from ...retain.fact_storage import _union_tags, protected_tags
+
+    if not [p for p in (prefixes or []) if p]:
+        return None
+    rows = await conn.fetch(
+        f"SELECT tags FROM {fq_table('memory_units')} WHERE id = ANY($1::uuid[]) AND bank_id = $2",
+        absorbed_ids,
+        bank_id,
+    )
+    extra: set[str] = set(protected_tags(absorbed_extra_tags, prefixes))
+    for r in rows:
+        extra.update(protected_tags(list(r["tags"] or []), prefixes))
+    if not extra:
+        return None
+    current = await lock_observation_tags(conn=conn, fq_table=fq_table, bank_id=bank_id, observation_id=survivor_id)
+    if current is None:
+        return None
+    merged = _union_tags(current, sorted(extra))
+    return None if merged == current else merged
+
+
 async def fold_sources_into_observation(
     *,
     conn,
@@ -156,13 +197,30 @@ async def fold_sources_into_observation(
     merged_text: str,
     source_memory_ids: list[uuid.UUID],
     bounds: _TemporalBounds,
+    bank_id: str | None = None,
+    preserve_tag_prefixes: list[str] | None = None,
 ) -> bool:
     """Fold ``source_memory_ids`` and ``merged_text`` into the observation, widening its dates.
 
     Keeps the observation's existing embedding (the merged text is >= threshold similar, so it
     stays representative and avoids a re-embed + a dialect-specific vector UPDATE). False when
     the row vanished or was rewritten since ``expected_text`` was read.
+
+    With ``preserve_tag_prefixes`` (and ``bank_id``), the sources' tags under those prefixes are
+    unioned onto the observation's tags; unset leaves the statement as it was.
     """
+    new_tags = None
+    if bank_id is not None:
+        new_tags = await _preserved_fold_tags(
+            conn=conn,
+            fq_table=fq_table,
+            bank_id=bank_id,
+            survivor_id=observation_id,
+            absorbed_ids=source_memory_ids,
+            absorbed_extra_tags=None,
+            prefixes=preserve_tag_prefixes,
+        )
+    tags_clause = ",\n                tags = $9::varchar[]" if new_tags is not None else ""
     # RETURNING-gate on the twin's probe-time text so a concurrent
     # survivor rewrite during the connection-free LLM window can't be clobbered.
     search_vector_clause = _search_vector_clause("$1")
@@ -176,7 +234,7 @@ async def fold_sources_into_observation(
                 occurred_start = LEAST(occurred_start, COALESCE($6, occurred_start)),
                 occurred_end = GREATEST(occurred_end, COALESCE($7, occurred_end)),
                 mentioned_at = GREATEST(mentioned_at, COALESCE($8, mentioned_at)),
-                updated_at = now(){search_vector_clause}
+                updated_at = now(){tags_clause}{search_vector_clause}
             WHERE id = $3::uuid AND text = $4
             RETURNING id
             """,
@@ -188,6 +246,7 @@ async def fold_sources_into_observation(
         bounds.occurred_start,
         bounds.occurred_end,
         bounds.mentioned_at,
+        *([new_tags] if new_tags is not None else []),
     )
     return folded is not None
 
@@ -202,11 +261,15 @@ async def fold_observation_into_twin(
     twin_id: str,
     twin_text: str,
     merged_text: str,
+    preserve_tag_prefixes: list[str] | None = None,
 ) -> bool:
     """Fold the observation's live sources and dates into its twin, with ``merged_text``.
 
     False when there is nothing to fold (the observation or all its sources are gone) or either
     row was rewritten since it was read. The caller deletes the folded observation.
+
+    With ``preserve_tag_prefixes``, the protected tags of the folded observation (which the
+    caller deletes) and of its live sources are unioned onto the twin's tags.
     """
     # Snapshot the updated row's sources with a PLAIN read (no FOR UPDATE). Lock order
     # must be sources-before-observation: the liveness check below takes
@@ -216,7 +279,7 @@ async def fold_observation_into_twin(
     # here (FOR UPDATE) would invert that against the invalidation path and deadlock.
     updated_row = await conn.fetchrow(
         f"""
-            SELECT source_memory_ids
+            SELECT source_memory_ids, tags
             FROM {fq_table("memory_units")}
             WHERE id = $1::uuid AND text = $2
             """,
@@ -232,6 +295,16 @@ async def fold_observation_into_twin(
     live_u_sources = [mid for mid in sources if str(mid) in live]
     if not live_u_sources:
         return False
+    new_tags = await _preserved_fold_tags(
+        conn=conn,
+        fq_table=fq_table,
+        bank_id=bank_id,
+        survivor_id=twin_id,
+        absorbed_ids=live_u_sources,
+        absorbed_extra_tags=list(updated_row["tags"] or []),
+        prefixes=preserve_tag_prefixes,
+    )
+    tags_clause = ",\n                tags = $7::varchar[]" if new_tags is not None else ""
     # RETURNING-gate on both rows' probe-time text so a survivor/updated rewrite during
     # the connection-free LLM window can't be clobbered or fold a stale row.
     search_vector_clause = _search_vector_clause("$1")
@@ -249,7 +322,7 @@ async def fold_observation_into_twin(
                 occurred_start = LEAST(t.occurred_start, COALESCE(u.occurred_start, t.occurred_start)),
                 occurred_end = GREATEST(t.occurred_end, COALESCE(u.occurred_end, t.occurred_end)),
                 mentioned_at = GREATEST(t.mentioned_at, COALESCE(u.mentioned_at, t.mentioned_at)),
-                updated_at = now(){search_vector_clause}
+                updated_at = now(){tags_clause}{search_vector_clause}
             FROM {fq_table("memory_units")} u
             WHERE t.id = $2::uuid AND u.id = $3::uuid AND t.text = $4 AND u.text = $5
             RETURNING t.id
@@ -260,6 +333,7 @@ async def fold_observation_into_twin(
         twin_text,
         observation_text,
         live_u_sources,
+        *([new_tags] if new_tags is not None else []),
     )
     # None: twin or updated row vanished during the LLM window — the caller keeps the
     # updated row as a distinct observation instead of deleting it unfolded.
