@@ -157,7 +157,7 @@ async def _seed(memory, bank_id, doc, request_context):
 @pytest.mark.asyncio
 @pytest.mark.timeout(600)
 @pytest.mark.parametrize("gate", [["retain:"], None], ids=["gate_on", "gate_off"])
-async def test_replace_rerentain_survivors_keep_only_their_own_protected_tags(memory, request_context, gate):
+async def test_replace_reretain_survivors_keep_only_their_own_protected_tags(memory, request_context, gate):
     bank_id = await _bank(memory, request_context, "delta", gate=gate)
     doc = "doc"
     try:
