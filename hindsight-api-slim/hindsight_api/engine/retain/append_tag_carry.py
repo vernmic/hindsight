@@ -9,41 +9,33 @@ classification (``retain:*``, ``kind:*``, ``tier:*`` ... written by a tagger aft
 would be lost.
 
 :class:`AppendTagCarry` is built inside the write transaction, from a snapshot of the outgoing
-units taken just before they are deleted, and assigns each re-extracted unit its tags:
+units taken just before they are deleted, and assigns each re-extracted unit its tags. The rule
+is precision first: a re-extracted unit inherits ONLY the tags of the one old unit it replaces,
+and a unit with no confident match keeps exactly what extraction gave it (the request's tags,
+none when the request omitted them or sent ``[]``). Earlier units' tags are never unioned onto
+other units: spreading one fact's ``retain:permanent`` / ``kind:decision`` / ``task:`` labels to
+its siblings or to genuinely new facts corrupts maintenance protection and filtered recall.
 
-1. **Exact text** (whitespace-normalised, case-sensitive): a new unit whose text equals one or
-   more old units' text takes those units' tags.
+1. **Exact text** (whitespace-normalised, case-sensitive): a new unit whose text equals an old
+   unit's text takes that unit's tags (several identical old units: only when they agree).
 2. **Genuinely new text**: a unit extracted from a chunk that lies wholly after the pre-append
    text keeps the request's tags only.
-3. **Pre-append text**: the old units of the old chunk(s) that overlap the new chunk's span
-   (positions in the pre-append text) are the candidates. The candidate with the clearly best
-   word overlap (Jaccard >= 0.5; ties all count) gives its tags; otherwise the union of all
-   candidates' tags is used, so a tag is never lost but may be shared by siblings of one old
-   chunk.
-4. **Straddling chunk** (holds both pre-append and appended text) with no clear text match:
-   the request's tags plus the candidates' union, since the unit may stem from either part.
-5. **Position unknown** (a chunk not found verbatim in the text, e.g. a JSON-array merge whose
-   body is not a plain prefix extension): the best Jaccard match over all old units if one
-   clears 0.5, else the request's tags plus the union of every old unit's tags, the
-   conservative choice: no earlier tag is lost.
-6. **Orphans** (:meth:`AppendTagCarry.assign`, per batch): an old unit overlapping a new chunk
-   that no re-extracted unit matched (its content was folded into a sibling, e.g. one new chunk
-   now spans two old ones) hands its tags to every unit of that new chunk, so the document as a
-   whole keeps every tag.
+3. **Similar text**: otherwise the old unit with the best word overlap (Jaccard >= 0.5) gives
+   its tags. Candidates are the old units of the overlapping old chunk(s) when positions are
+   known, else every old unit (e.g. a JSON-array merge whose body is not a plain prefix
+   extension). A tie between old units with different tags is ambiguous: no carry.
+4. **Anything else** keeps the request's tags only.
 
 Inherited tags exclude entity-label projections (``label_tag_keys``): those are derived from
 the unit's own entities, so the new unit keeps the label tags its fresh extraction produced.
 Unconditional: it is append semantics, like the delta-path survivor guarantee.
 
-Limits: the mapping is heuristic where one old chunk produced several differently-tagged
-units and the re-extracted text matches none of them clearly (they then share the union), and
-orphan tags spread to every unit of the new chunk. Tags may over-spread within the overlapping
-old/new chunks; they never reach units of genuinely new text or of unrelated chunks, and none
-is dropped. A crash between streaming batches (after the old units are deleted) loses the
-snapshot for later batches, as the replace itself does. Old observations are invalidated by
-the normal document-replace path and re-consolidated from the new units.
-Store-owned banks (no SQL chunk rows) only get exact-text and Jaccard matching plus the
-conservative union.
+Limits: an old unit whose re-extracted text drifts below the similarity threshold (or whose
+content is folded into a sibling) loses its unit-only tags; a tagger re-classifies the new
+unit. That is the deliberate trade against over-spreading. A crash between streaming batches
+(after the old units are deleted) loses the snapshot for later batches, as the replace itself
+does. Old observations are invalidated by the normal document-replace path and re-consolidated
+from the new units.
 """
 
 from __future__ import annotations
@@ -182,38 +174,32 @@ class AppendTagCarry:
         found = [u for u in self._units if u.chunk_index in chunks]
         return found or list(self._units)
 
+    def _agreed(self, units: Sequence[OldUnit]) -> list[OldUnit]:
+        """``units`` when their inheritable tags agree (one unambiguous source), else []."""
+        if not units:
+            return []
+        first = set(self._inheritable(units[:1]))
+        return list(units) if all(set(self._inheritable([u])) == first for u in units[1:]) else []
+
     def _match(self, fact_text: str, chunk_position: int | None, current: list[str]):
-        """``(tags, matched old units, candidate old units)`` for one re-extracted unit."""
+        """``(tags, matched old units)`` for one re-extracted unit (rules 1-4)."""
         own_labels = self._split_labels(current)
-
-        def _old(units: Sequence[OldUnit]) -> list[str]:
-            return _union([self._inheritable(units), own_labels])
-
         span = None
         if chunk_position is not None and 0 <= chunk_position < len(self._new_spans):
             span = self._new_spans[chunk_position]
-        if span is not None and span[0] >= self._base_len:
-            candidates: list[OldUnit] = []
-        elif span is not None:
-            candidates = self._candidates(span)
-        else:
-            candidates = list(self._units)
 
-        exact = self._by_text.get(_norm(fact_text))
-        if exact:
-            return _old(exact), exact, candidates
-        if span is not None and span[0] >= self._base_len:
-            return current, [], candidates  # genuinely new text
-        best = self._best(fact_text, candidates)
-        if best:
-            return _old(best), best, candidates
-        if span is None or span[1] > self._base_len:
-            # Position unknown, or the chunk also holds appended text: it may stem from either.
-            return _union([current, self._inheritable(candidates)]), list(candidates), candidates
-        return _old(candidates), list(candidates), candidates
+        hit = self._agreed(self._by_text.get(_norm(fact_text)) or [])
+        if not hit:
+            if span is not None and span[0] >= self._base_len:
+                return current, []  # genuinely new text
+            candidates = self._candidates(span) if span is not None else list(self._units)
+            hit = self._agreed(self._best(fact_text, candidates))
+        if not hit:
+            return current, []
+        return _union([self._inheritable(hit), own_labels]), hit
 
     def tags_for(self, fact_text: str, chunk_position: int | None, current_tags: Sequence[str]) -> list[str]:
-        """The tags one re-extracted unit should carry (rules 1-5 of the module docstring).
+        """The tags one re-extracted unit should carry (rules 1-4 of the module docstring).
 
         ``chunk_position`` indexes the new chunks; ``current_tags`` is what extraction gave it
         (the request's tags plus its own label projection).
@@ -224,31 +210,7 @@ class AppendTagCarry:
         return self._match(fact_text, chunk_position, current)[0]
 
     def assign(self, facts: Sequence[tuple[str, int | None, Sequence[str]]]) -> list[list[str]]:
-        """Tags for a batch of re-extracted units ``(text, chunk position, current tags)``.
-
-        Per :meth:`tags_for`, plus rule 6: an old unit that is a candidate of a new chunk but that
-        none of the batch's units matched (the re-extraction folded its content into a sibling,
-        e.g. one new chunk now spans two old ones) is an orphan; its tags go to every unit of
-        the new chunk(s) it overlaps, so the document never loses a tag. A batch holds whole
-        chunks, so a chunk's units are always judged together.
-        """
-        if not self._units:
-            return [list(c or []) for _, _, c in facts]
-        results = []
-        matched: set[int] = set()
-        by_chunk: dict[int | None, list[int]] = {}
-        chunk_candidates: dict[int | None, list[OldUnit]] = {}
-        for i, (text, pos, current) in enumerate(facts):
-            tags, hit, candidates = self._match(text, pos, list(current or []))
-            results.append(tags)
-            matched.update(id(u) for u in hit)
-            by_chunk.setdefault(pos, []).append(i)
-            chunk_candidates[pos] = candidates
-        for pos, members in by_chunk.items():
-            orphans = [u for u in chunk_candidates[pos] if id(u) not in matched]
-            if not orphans or pos is None:
-                continue
-            extra = self._inheritable(orphans)
-            for i in members:
-                results[i] = _union([results[i], extra])
-        return results
+        """Tags for a batch of re-extracted units ``(text, chunk position, current tags)``, each
+        judged independently by :meth:`tags_for`. No orphan spreading: an old unit no new unit
+        matched hands its tags to nobody."""
+        return [self.tags_for(text, pos, current) for text, pos, current in facts]
