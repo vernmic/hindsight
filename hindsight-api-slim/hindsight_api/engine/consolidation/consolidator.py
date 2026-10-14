@@ -364,6 +364,18 @@ async def _dedup_adjudicate(
     return _DedupOutcome(best_id=best_id, merged_text=merged_text, should_merge=True, best_text=best_text)
 
 
+def _preserve_tag_prefixes(config: Any) -> list[str] | None:
+    """The bank's ``consolidation_preserve_tag_prefixes`` (None/empty = off).
+
+    When set, a dedup fold unions the tags under these prefixes from the rows it absorbs onto
+    the surviving observation (existing tags never removed, nothing outside the prefixes moves).
+    """
+    prefixes = getattr(config, "consolidation_preserve_tag_prefixes", None)
+    if not prefixes:
+        return None
+    return [str(p) for p in prefixes if str(p)] or None
+
+
 async def _apply_dedup_create_fold(
     conn,
     memory_engine: "MemoryEngine",
@@ -371,6 +383,8 @@ async def _apply_dedup_create_fold(
     outcome: _DedupOutcome,
     create_source_ids: list[uuid.UUID],
     source_bounds: _TemporalBounds,
+    *,
+    preserve_tag_prefixes: list[str] | None = None,
 ) -> str | None:
     """Fold a CREATE the adjudicator called a duplicate into its existing twin.
 
@@ -408,6 +422,7 @@ async def _apply_dedup_create_fold(
         source_memory_ids=live_source_ids,
         bounds=source_bounds,
         embeddings=memory_engine.embeddings,
+        preserve_tag_prefixes=preserve_tag_prefixes,
     )
     if not folded:
         # The twin vanished (or was rewritten) during the connection-free LLM window.
@@ -459,6 +474,7 @@ async def _apply_dedup_update_fold(
         twin_text=outcome.best_text,
         merged_text=outcome.merged_text,
         embeddings=memory_engine.embeddings,
+        preserve_tag_prefixes=_preserve_tag_prefixes(config),
     )
     if not folded:
         # Nothing live to fold, or the twin / updated row vanished during the LLM window —
@@ -2926,6 +2942,7 @@ async def _process_memory_batch(
                                 prepared_create.dedup,
                                 prepared_create.source_memory_ids,
                                 _TemporalBounds.of(prepared_create.agg),
+                                preserve_tag_prefixes=_preserve_tag_prefixes(config),
                             )
                             if merged_into is not None:
                                 logger.info(
