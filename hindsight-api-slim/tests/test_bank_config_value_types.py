@@ -47,6 +47,13 @@ class TestValidateConfigValueTypes:
         # Non-configurable keys are rejected by the caller, not here.
         _validate_config_value_types({"unrelated_field": {"any": "shape"}})
 
+    def test_list_element_types_are_checked(self):
+        # A list-typed field also declares what its elements are: the right
+        # container with the wrong elements must be rejected at the door.
+        _validate_config_value_types({"consolidation_preserve_tag_prefixes": ["retain:"]})
+        with pytest.raises(ValueError, match="consolidation_preserve_tag_prefixes"):
+            _validate_config_value_types({"consolidation_preserve_tag_prefixes": ["retain:", 7]})
+
     def test_dict_in_string_field_raises(self):
         for field in _STRING_FIELDS:
             with pytest.raises(ValueError, match=field) as exc:
