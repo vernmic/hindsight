@@ -246,6 +246,16 @@ async def delete_document_for_replace(
     )
 
 
+async def document_tags(*, conn, fq_table: Callable[[str], str], bank_id: str, document_id: str) -> list[str] | None:
+    """The document row's tags, or ``None`` when there is no row."""
+    row = await conn.fetchrow(
+        f"SELECT tags FROM {fq_table('documents')} WHERE id = $1 AND bank_id = $2",
+        document_id,
+        bank_id,
+    )
+    return None if row is None else list(row["tags"] or [])
+
+
 async def upsert_document_row(
     *,
     conn,

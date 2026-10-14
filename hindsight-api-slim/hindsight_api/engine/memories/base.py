@@ -3569,6 +3569,17 @@ class MemoriesExtension(Extension, ABC):
         await self.delete_document(conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=document_id)
         return None
 
+    async def document_tags(self, *, conn, fq_table, bank_id: str, document_id: str) -> list[str] | None:
+        """The tags currently stored on the document, or ``None`` when it does not exist.
+
+        Read on the caller's transaction before a retain rewrites the document, so tags a bank
+        protects (``retain_preserve_tag_prefixes``) can be carried onto the new version. This
+        default reads the store's document record."""
+        rec = await self.get_document_record(bank_id=bank_id, document_id=document_id)
+        if rec is None:
+            return None
+        return list(rec.get("tags") or [])
+
     async def upsert_document_row(
         self,
         *,
