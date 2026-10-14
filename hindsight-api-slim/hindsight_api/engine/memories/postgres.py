@@ -1583,6 +1583,7 @@ class PostgresMemories(MemoriesExtension):
         source_memory_ids: list[uuid.UUID],
         bounds: _TemporalBounds,
         embeddings: Embeddings,  # noqa: ARG002 — the fold keeps the stored embedding.
+        preserve_tag_prefixes: list[str] | None = None,
     ) -> bool:
         return await pg_consolidation.fold_sources_into_observation(
             conn=conn,
@@ -1592,6 +1593,8 @@ class PostgresMemories(MemoriesExtension):
             merged_text=merged_text,
             source_memory_ids=source_memory_ids,
             bounds=bounds,
+            bank_id=bank_id,
+            preserve_tag_prefixes=preserve_tag_prefixes,
         )
 
     async def fold_observation_into_twin(
@@ -1606,6 +1609,7 @@ class PostgresMemories(MemoriesExtension):
         twin_text: str,
         merged_text: str,
         embeddings: Embeddings,  # noqa: ARG002 — the fold keeps the twin's stored embedding.
+        preserve_tag_prefixes: list[str] | None = None,
     ) -> bool:
         return await pg_consolidation.fold_observation_into_twin(
             conn=conn,
@@ -1616,6 +1620,7 @@ class PostgresMemories(MemoriesExtension):
             twin_id=twin_id,
             twin_text=twin_text,
             merged_text=merged_text,
+            preserve_tag_prefixes=preserve_tag_prefixes,
         )
 
     async def delete_observation(self, *, conn, fq_table, bank_id: str, observation_id: str) -> None:

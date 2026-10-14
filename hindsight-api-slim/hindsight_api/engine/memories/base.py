@@ -3988,9 +3988,13 @@ class MemoriesExtension(Extension, ABC):
         source_memory_ids: list[uuid.UUID],
         bounds: _TemporalBounds,
         embeddings: Embeddings,
+        preserve_tag_prefixes: list[str] | None = None,
     ) -> bool:
         """Dedup merge: fold ``source_memory_ids``, ``merged_text`` and ``bounds`` (a consolidator
         ``_TemporalBounds``) into an existing observation. False when the fold did not happen.
+
+        ``preserve_tag_prefixes`` (the bank's ``consolidation_preserve_tag_prefixes``): the
+        sources' tags under those prefixes are unioned onto the observation's tags.
 
         Postgres UPDATEs the row gated on ``expected_text`` (its probe-time text) and keeps the
         stored embedding. This default re-upserts the observation, preserving its other fields,
@@ -4007,6 +4011,15 @@ class MemoriesExtension(Extension, ABC):
             return True
         merged_sources = list(dict.fromkeys([*(cur.source_memory_ids or []), *(str(s) for s in source_memory_ids)]))
         merged_bounds = _TemporalBounds.of(cur).merged_with(bounds)
+        merged_tags = list(cur.tags or [])
+        if [p for p in (preserve_tag_prefixes or []) if p]:
+            from ..retain.fact_storage import _union_tags, protected_tags
+
+            absorbed = await self.get_memories(
+                conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[str(s) for s in source_memory_ids]
+            )
+            extra = {t for m in absorbed for t in protected_tags(list(m.tags or []), preserve_tag_prefixes)}
+            merged_tags = _union_tags(merged_tags, sorted(extra))
         vectors = await embedding_utils.generate_embeddings_batch(embeddings, [merged_text])
         await self.upsert_observation(
             conn=conn,
@@ -4017,7 +4030,7 @@ class MemoriesExtension(Extension, ABC):
                 # Same non-optional-field caveat as in `insert_observation` above.
                 embedding=cast("list[float] | str", str(vectors[0]) if vectors else None),
                 fact_type="observation",
-                tags=list(cur.tags or []),
+                tags=merged_tags,
                 proof_count=len(merged_sources),
                 source_memory_ids=merged_sources,
                 event_date=merged_bounds.event_date,
@@ -4041,9 +4054,13 @@ class MemoriesExtension(Extension, ABC):
         twin_text: str,
         merged_text: str,
         embeddings: Embeddings,
+        preserve_tag_prefixes: list[str] | None = None,
     ) -> bool:
         """Dedup merge after an UPDATE: fold an observation's live sources and dates into its twin
         with ``merged_text``. True when folded; the caller then deletes the observation.
+
+        With ``preserve_tag_prefixes``, the folded observation's own protected tags and its
+        live sources' join the twin's tags.
 
         Postgres reads the observation's sources, locks the live ones and UPDATEs the twin, each
         gated on the probe-time texts. This default reads it through the store and folds with
@@ -4069,7 +4086,17 @@ class MemoriesExtension(Extension, ABC):
             source_memory_ids=live_sources,
             bounds=_TemporalBounds.of(updated_obs[0]),
             embeddings=embeddings,
+            preserve_tag_prefixes=preserve_tag_prefixes,
         )
+        if [p for p in (preserve_tag_prefixes or []) if p]:
+            from ..retain.fact_storage import _union_tags, protected_tags
+
+            own = protected_tags(list(updated_obs[0].tags or []), preserve_tag_prefixes)
+            twin = await self.get_memories(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[twin_id])
+            if own and twin:
+                merged = _union_tags(list(twin[0].tags or []), sorted(set(own)))
+                if merged != list(twin[0].tags or []):
+                    await self.update_memories(bank_id, [MemoryPatch(unit_id=twin_id, tags=merged)])
         return True
 
     async def delete_observation(self, *, conn, fq_table, bank_id: str, observation_id: str) -> None:
