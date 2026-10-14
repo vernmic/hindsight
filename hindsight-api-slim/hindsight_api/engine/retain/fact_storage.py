@@ -200,6 +200,7 @@ async def handle_document_tracking(
     ops=None,
     store_document_text: bool | None = None,
     attachment_filenames: dict[str, str] | None = None,
+    preserve_tag_prefixes: list[str] | None = None,
 ) -> None:
     """
     Handle document tracking in the database (full-replace mode).
@@ -219,6 +220,10 @@ async def handle_document_tracking(
             this document. Recorded on the document edge rather than the blob, since
             a filename describes the reference and the same bytes can carry a
             different name in another document.
+        preserve_tag_prefixes: The bank's ``retain_preserve_tag_prefixes``. When set, the
+            outgoing document row's tags under these prefixes are read before the row is
+            deleted and carried onto the new row (document level only: the re-extracted
+            units get the request's tags, never the carried ones).
         ops: Backend-specific DataAccessOps. Required by the inner
             ``delete_stale_observations_for_memories`` call to choose the PG
             (native array) vs Oracle (junction table) read path. Defaults to
@@ -239,10 +244,18 @@ async def handle_document_tracking(
     # no longer exist (consolidated_at on co-source memories also stays
     # frozen). Same cleanup the explicit ``delete_document`` API performs.
     preserved_created_at = None
+    carried_tags: list[str] = []
     if is_first_batch:
         from ..memories import get_memories
 
         store = get_memories()
+        if preserve_tag_prefixes:
+            # Read before the delete below takes the row away. A full replacement that sends
+            # no tags (or other tags) must not silently drop a protected document-level tag.
+            carried_tags = protected_tags(
+                await store.document_tags(conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=document_id),
+                preserve_tag_prefixes,
+            )
         # Which memories the outgoing version left behind. Asked of the store
         # rather than queried here, because it is the store that knows where they
         # are. Paged to exhaustion: every one of them is about to be deleted, and
@@ -318,6 +331,8 @@ async def handle_document_tracking(
         preserved_created_at=preserved_created_at,
         store_document_text=store_document_text,
         attachment_filenames=attachment_filenames,
+        preserve_tag_prefixes=preserve_tag_prefixes,
+        carried_tags=carried_tags,
     )
 
 
@@ -330,6 +345,7 @@ async def upsert_document_metadata(
     document_tags: list[str] | None = None,
     store_document_text: bool | None = None,
     attachment_filenames: dict[str, str] | None = None,
+    preserve_tag_prefixes: list[str] | None = None,
 ) -> None:
     """
     Update document metadata without deleting existing facts/chunks.
@@ -352,6 +368,7 @@ async def upsert_document_metadata(
         document_tags,
         store_document_text=store_document_text,
         attachment_filenames=attachment_filenames,
+        preserve_tag_prefixes=preserve_tag_prefixes,
     )
 
 
@@ -366,6 +383,8 @@ async def _upsert_document_row(
     preserved_created_at: datetime | None = None,
     store_document_text: bool | None = None,
     attachment_filenames: dict[str, str] | None = None,
+    preserve_tag_prefixes: list[str] | None = None,
+    carried_tags: list[str] | None = None,
 ) -> None:
     """Insert or update a document row.
 
@@ -379,6 +398,11 @@ async def _upsert_document_row(
     still computed from the real content so delta-retain dedup is unaffected.
     ``store_document_text`` defaults to the server-level config when ``None``;
     the retain path passes the per-bank resolved value.
+
+    With ``preserve_tag_prefixes`` (the bank's ``retain_preserve_tag_prefixes``) the row's
+    tags under those prefixes survive the write: the stored row's protected tags (or, after a
+    full replacement deleted it, ``carried_tags``) are unioned after the request's tags.
+    Unset keeps upstream replace semantics.
     """
     # Fallback to the raw global default (not get_config(), which guards
     # bank-configurable fields); the retain path always passes the resolved value.
@@ -388,7 +412,16 @@ async def _upsert_document_row(
     # to the store up front (orchestrator._store_document_bodies), so this writes nothing there.
     from ..memories import get_memories
 
-    await get_memories().upsert_document_row(
+    store = get_memories()
+    if preserve_tag_prefixes:
+        keep = list(carried_tags or [])
+        keep += protected_tags(
+            await store.document_tags(conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=document_id),
+            preserve_tag_prefixes,
+        )
+        if keep:
+            document_tags = _union_tags(document_tags, keep)
+    await store.upsert_document_row(
         conn=conn,
         fq_table=fq_table,
         bank_id=bank_id,
@@ -459,6 +492,29 @@ async def sync_document_attachments(
         )
 
 
+def protected_tags(tags: list[str] | None, prefixes: list[str] | None) -> list[str]:
+    """The tags in ``tags`` that start with one of ``prefixes`` (``retain_preserve_tag_prefixes``).
+
+    A literal ``str.startswith`` match: a prefix such as ``re_tain%`` matches only itself, never
+    as a wildcard, and no SQL ``LIKE`` is involved, so the match is the same on every store.
+    Order follows ``tags``; empty prefixes are ignored."""
+    active = [p for p in (prefixes or []) if p]
+    if not active or not tags:
+        return []
+    return [t for t in tags if any(t.startswith(p) for p in active)]
+
+
+def _union_tags(base: list[str] | None, extra: list[str]) -> list[str]:
+    """``base`` followed by the members of ``extra`` it lacks, order kept, no duplicates."""
+    out = list(base or [])
+    seen = set(out)
+    for t in extra:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
 def _normalize_scopes(value: list | str | None) -> list | str | None:
     """Compare-ready form of an ``observation_scopes`` value.
 
@@ -485,6 +541,7 @@ async def update_memory_units_metadata_and_tags(
     *,
     observation_scopes: list | str | None = None,
     label_tag_keys: set[str] | None = None,
+    preserve_tag_prefixes: list[str] | None = None,
     ops=None,
 ) -> int:
     """Update document-level attributes on existing memory units.
@@ -528,6 +585,11 @@ async def update_memory_units_metadata_and_tags(
     keep their observations: an ordinary delta edit must not re-consolidate the
     whole document.
 
+    ``preserve_tag_prefixes`` (the bank's ``retain_preserve_tag_prefixes``, default off)
+    extends the carry-forward to tags the bank protects: a survivor keeps its OWN tags under
+    those prefixes on a re-retain, unioned after the document tags. Each unit
+    keeps only what it already carried; nothing is spread to sibling units.
+
     Returns:
         Number of memory units updated.
     """
@@ -538,7 +600,7 @@ async def update_memory_units_metadata_and_tags(
         """The document tags, plus the label projection this unit already carries."""
         merged = list(tags or [])
         seen = set(merged)
-        for t in split_label_tags(existing, label_tag_keys):
+        for t in [*split_label_tags(existing, label_tag_keys), *protected_tags(existing, preserve_tag_prefixes)]:
             if t not in seen:
                 seen.add(t)
                 merged.append(t)
