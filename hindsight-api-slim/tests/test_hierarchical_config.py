@@ -102,6 +102,32 @@ async def test_config_key_normalization():
     assert normalize_config_dict(input_dict) == expected
 
 
+def test_parse_preserve_tag_prefixes_forms():
+    """JSON array, CSV, blank and empty-list forms of the preserve-prefix env var."""
+    from hindsight_api.config import _parse_preserve_tag_prefixes
+
+    # Unset / blank -> feature off (the module default, None)
+    assert _parse_preserve_tag_prefixes(None) is None
+    assert _parse_preserve_tag_prefixes("   ") is None
+    # CSV form
+    assert _parse_preserve_tag_prefixes("retain:") == ["retain:"]
+    assert _parse_preserve_tag_prefixes("retain:, pin:") == ["retain:", "pin:"]
+    # JSON form
+    assert _parse_preserve_tag_prefixes('["retain:", "pin:"]') == ["retain:", "pin:"]
+    # An explicit empty list is preserved as an explicit off, not the default
+    assert _parse_preserve_tag_prefixes("[]") == []
+
+
+def test_parse_preserve_tag_prefixes_rejects_bad_shapes():
+    from hindsight_api.config import _parse_preserve_tag_prefixes
+
+    with pytest.raises(ValueError, match="expected a JSON array of strings"):
+        _parse_preserve_tag_prefixes("[not json")
+    # Anything not starting with '[' takes the CSV path, so a JSON-looking object is
+    # read as a single literal prefix rather than rejected.
+    assert _parse_preserve_tag_prefixes('{"retain": true}') == ['{"retain": true}']
+
+
 @pytest.mark.asyncio
 async def test_hierarchical_fields_categorization():
     """Test that fields are correctly categorized as configurable, credentials, or static."""
@@ -123,6 +149,8 @@ async def test_hierarchical_fields_categorization():
     assert "consolidation_source_facts_max_tokens" in configurable
     assert "consolidation_source_facts_max_tokens_per_observation" in configurable
     assert "observations_mission" in configurable
+    assert "consolidation_preserve_tag_prefixes" in configurable
+    assert "retain_preserve_tag_prefixes" in configurable
     assert "reflect_mission" in configurable
     assert "disposition_skepticism" in configurable
     assert "disposition_literalism" in configurable
