@@ -4038,6 +4038,28 @@ class BankTemplateConfig(BaseModel):
     consolidation_source_facts_max_tokens_per_observation: int | None = Field(
         default=None, description="Max tokens of source facts per observation"
     )
+    consolidation_preserve_tag_prefixes: list[str] | None = Field(
+        default=None,
+        description=(
+            "Tag prefixes preserved when consolidation folds duplicate sources into a surviving "
+            'observation, e.g. ["retain:"]. Empty/unset (the default) leaves the survivor tags '
+            "unchanged. Tags whose value starts with one of these prefixes are unioned onto the "
+            "survivor (no duplicates, existing tags never removed, deterministic order). Applies "
+            "to Postgres-owned banks only; store-owned banks and Oracle use the store merge path, "
+            "which this does not affect."
+        ),
+    )
+    retain_preserve_tag_prefixes: list[str] | None = Field(
+        default=None,
+        description=(
+            "Tag prefixes preserved when a retain rewrites document-level tags, e.g. "
+            '["retain:"]. Empty/unset (the default) keeps upstream replace semantics. Tags '
+            "whose value starts with one of these prefixes are kept on the document row and on "
+            "each surviving memory unit across re-retains (a tag-less full replacement carries "
+            "them forward at document level only). Append re-retains always keep every "
+            "survivor's own tags regardless of this setting."
+        ),
+    )
     max_observations_per_scope: int | None = Field(
         default=None, description="Max observations to retain per consolidation scope"
     )
