@@ -246,6 +246,40 @@ async def delete_document_for_replace(
     )
 
 
+async def append_tag_snapshot(*, conn, fq_table: Callable[[str], str], bank_id: str, document_id: str):
+    """The document's experience/world units with their chunk index, and its chunk texts."""
+    from ...retain.append_tag_carry import OldDocumentSnapshot, OldUnit
+
+    units = await conn.fetch(
+        f"""
+        SELECT mu.text, mu.fact_type, mu.tags, c.chunk_index
+        FROM {fq_table("memory_units")} mu
+        LEFT JOIN {fq_table("chunks")} c ON c.chunk_id = mu.chunk_id AND c.bank_id = mu.bank_id
+        WHERE mu.bank_id = $1 AND mu.document_id = $2 AND mu.fact_type IN ('experience', 'world')
+        ORDER BY c.chunk_index NULLS LAST, mu.created_at, mu.id
+        """,
+        bank_id,
+        document_id,
+    )
+    chunks = await conn.fetch(
+        f"SELECT chunk_index, chunk_text FROM {fq_table('chunks')} WHERE bank_id = $1 AND document_id = $2",
+        bank_id,
+        document_id,
+    )
+    return OldDocumentSnapshot(
+        units=[
+            OldUnit(
+                text=r["text"] or "",
+                fact_type=r["fact_type"],
+                tags=tuple(r["tags"] or []),
+                chunk_index=r["chunk_index"],
+            )
+            for r in units
+        ],
+        chunks={r["chunk_index"]: r["chunk_text"] or "" for r in chunks if r["chunk_index"] is not None},
+    )
+
+
 async def document_tags(*, conn, fq_table: Callable[[str], str], bank_id: str, document_id: str) -> list[str] | None:
     """The document row's tags, or ``None`` when there is no row."""
     row = await conn.fetchrow(

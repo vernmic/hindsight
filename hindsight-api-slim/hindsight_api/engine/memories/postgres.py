@@ -1247,6 +1247,11 @@ class PostgresMemories(MemoriesExtension):
             outgoing_unit_ids=outgoing_unit_ids,
         )
 
+    async def append_tag_snapshot(self, *, conn, fq_table, bank_id: str, document_id: str):
+        return await pg_retain.append_tag_snapshot(
+            conn=conn, fq_table=fq_store_table, bank_id=bank_id, document_id=document_id
+        )
+
     async def document_tags(self, *, conn, fq_table, bank_id: str, document_id: str) -> list[str] | None:
         return await pg_retain.document_tags(
             conn=conn, fq_table=fq_store_table, bank_id=bank_id, document_id=document_id
