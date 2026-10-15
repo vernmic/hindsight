@@ -3498,7 +3498,7 @@ async def _streaming_retain_batch(
                     # An append re-extracting the whole document: carry the earlier units' tags.
                     carry = append_carry[0]
                     if carry is not None and carry.has_units:
-                        carried = carry.assign(
+                        carried, retag_info = carry.assign_detailed(
                             [
                                 (
                                     pf.fact_text,
@@ -3510,6 +3510,12 @@ async def _streaming_retain_batch(
                         )
                         for pf, tags in zip(batch_processed, carried):
                             pf.tags = tags
+                        marked = sum(1 for x in retag_info if x)
+                        if marked:
+                            log_buffer.append(
+                                f"[append] {marked} re-extracted unit(s) without a confident match "
+                                f"marked retag:pending (orphaned memory-only tags)"
+                            )
 
                     # Insert facts and links — skip semantic links entirely in streaming
                     # mode; they are created in a single final ANN pass after all batches.

@@ -30,9 +30,22 @@ Inherited tags exclude entity-label projections (``label_tag_keys``): those are 
 the unit's own entities, so the new unit keeps the label tags its fresh extraction produced.
 Unconditional: it is append semantics, like the delta-path survivor guarantee.
 
+5. **Retag marker** (:meth:`AppendTagCarry.assign_detailed`): an old unit that carried
+   memory-only tags (tags beyond the request's and beyond those every old unit shares) and that
+   no re-extracted unit matched is an orphan. A re-extracted unit with no confident match that
+   plausibly replaces an orphan gets ``retag:pending`` plus one ``retag-candidate:<tag>`` per
+   orphan memory-only tag (capped). "Plausibly" means: its chunk lies in pre-append text and
+   overlaps the orphan's old chunk, or (positions unknown) its word overlap with the orphan is
+   at least ``PARTIAL_MIN``. Genuinely new content (a chunk wholly after the pre-append text, or
+   no partial overlap with any orphan) is never marked. Candidates are hints for the retag
+   pass only: no ``retain:``/``kind:`` value is applied, the ``retag-candidate:`` prefix never
+   equals a real tag in a filter or a protected-tag check, and a tagger removes the
+   ``retag:*``/``retag-candidate:*`` tags once it has classified the unit.
+
 Limits: an old unit whose re-extracted text drifts below the similarity threshold (or whose
-content is folded into a sibling) loses its unit-only tags; a tagger re-classifies the new
-unit. That is the deliberate trade against over-spreading. A crash between streaming batches
+content is folded into a sibling) loses its unit-only tags; its plausible replacement is
+marked for retagging instead (rule 5). That is the deliberate trade against over-spreading.
+Orphans are judged per streaming batch (a batch holds whole chunks). A crash between streaming batches
 (after the old units are deleted) loses the snapshot for later batches, as the replace itself
 does. Old observations are invalidated by the normal document-replace path and re-consolidated
 from the new units.
@@ -46,6 +59,14 @@ from dataclasses import dataclass, field
 
 _WORD = re.compile(r"\w+", re.UNICODE)
 JACCARD_MIN = 0.5
+PARTIAL_MIN = 0.3
+RETAG_MARKER = "retag:pending"
+RETAG_CANDIDATE_PREFIX = "retag-candidate:"
+RETAG_CANDIDATE_CAP = 16
+
+
+def is_retag_tag(tag: str) -> bool:
+    return tag == RETAG_MARKER or tag.startswith(RETAG_CANDIDATE_PREFIX) or tag.startswith("retag:")
 
 
 @dataclass(frozen=True)
@@ -143,6 +164,9 @@ class AppendTagCarry:
         for u in self._units:
             self._by_text.setdefault(_norm(u.text), []).append(u)
         self._words = {id(u): _words(u.text) for u in self._units}
+        # Tags every old unit shares (document-level): not memory-only. One unit: nothing shared.
+        sets = [set(self._inheritable([u])) for u in self._units]
+        self._common = set.intersection(*sets) if len(sets) > 1 else set()
 
     @property
     def has_units(self) -> bool:
@@ -209,8 +233,56 @@ class AppendTagCarry:
             return current
         return self._match(fact_text, chunk_position, current)[0]
 
+    def _memory_only(self, unit: OldUnit, current: Sequence[str]) -> list[str]:
+        cur = set(current)
+        return [
+            t
+            for t in self._inheritable([unit])
+            if t not in cur and t not in self._common and not is_retag_tag(t)
+        ]
+
     def assign(self, facts: Sequence[tuple[str, int | None, Sequence[str]]]) -> list[list[str]]:
-        """Tags for a batch of re-extracted units ``(text, chunk position, current tags)``, each
-        judged independently by :meth:`tags_for`. No orphan spreading: an old unit no new unit
-        matched hands its tags to nobody."""
-        return [self.tags_for(text, pos, current) for text, pos, current in facts]
+        """Tags for a batch of re-extracted units ``(text, chunk position, current tags)``.
+
+        Matched units inherit exactly their old unit's tags; everything else keeps its own. No
+        orphan spreading: an unmatched old unit's tags go to nobody - its plausible replacement
+        is only marked for retagging (rule 5)."""
+        return self.assign_detailed(facts)[0]
+
+    def assign_detailed(self, facts):
+        """``(tags per fact, retag info per fact)``; retag info is None or
+        ``{"candidates": [...], "orphans": n}`` for a marked unit."""
+        current_lists = [list(c or []) for _, _, c in facts]
+        if not self._units:
+            return current_lists, [None] * len(facts)
+        tags_out, hits, spans = [], [], []
+        matched: set[int] = set()
+        for (text, pos, _), current in zip(facts, current_lists):
+            tags, hit = self._match(text, pos, current)
+            tags_out.append(tags)
+            hits.append(hit)
+            matched.update(id(u) for u in hit)
+            span = self._new_spans[pos] if pos is not None and 0 <= pos < len(self._new_spans) else None
+            spans.append(span)
+        info: list[dict | None] = [None] * len(facts)
+        for i, ((text, _, _), current) in enumerate(zip(facts, current_lists)):
+            if hits[i]:
+                continue
+            span = spans[i]
+            if span is not None and span[0] >= self._base_len:
+                continue  # genuinely new content: never marked
+            if span is not None:
+                pool = [(u, None) for u in self._candidates(span)]
+            else:
+                words = _words(text)
+                pool = [(u, _jaccard(words, self._words[id(u)])) for u in self._units]
+                pool = [(u, s) for u, s in pool if s >= PARTIAL_MIN]
+            orphans = [(u, s) for u, s in pool if id(u) not in matched and self._memory_only(u, current)]
+            if not orphans:
+                continue
+            orphans.sort(key=lambda us: -(us[1] or 0.0))
+            cands = _union(self._memory_only(u, current) for u, _ in orphans)[:RETAG_CANDIDATE_CAP]
+            extra = [RETAG_MARKER] + [RETAG_CANDIDATE_PREFIX + t for t in cands]
+            tags_out[i] = _union([tags_out[i], extra])
+            info[i] = {"candidates": cands, "orphans": len(orphans)}
+        return tags_out, info

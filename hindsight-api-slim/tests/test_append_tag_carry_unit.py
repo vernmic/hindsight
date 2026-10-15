@@ -149,3 +149,61 @@ def test_hermes_json_append_new_facts_get_only_request_tags(request_tags):
 def test_no_old_units_is_a_no_op():
     c = _carry([], {}, [BASE])
     assert c.assign([("anything", 0, ["t"])]) == [["t"]]
+
+
+# --- retag marker (rule 5): strict matching, unmatched replacements are marked, never spread ---
+from hindsight_api.engine.retain.append_tag_carry import RETAG_MARKER  # noqa: E402
+from hindsight_api.engine.retain.fact_storage import protected_tags  # noqa: E402
+
+
+def test_unmatched_pre_append_unit_is_marked_with_orphan_candidates():
+    c = _carry(
+        [U0, U1],
+        OLD_CHUNKS,
+        ["Alpha team picked Redis for caching.", "Beta team chose Postgres for reports.\nGamma team ships Friday."],
+    )
+    tags, info = c.assign_detailed(
+        [("Beta team uses Postgres for reports", 1, ["topic:new"]), ("Something unrelated entirely", 0, ["topic:new"])]
+    )
+    assert tags[0] == ["topic:one", "kind:decision"]
+    assert tags[1] == ["topic:new", RETAG_MARKER, "retag-candidate:retain:permanent"]
+    assert info[0] is None and info[1] == {"candidates": ["retain:permanent"], "orphans": 1}
+
+
+def test_genuinely_new_chunk_is_never_marked():
+    c = _carry([U0, U1], OLD_CHUNKS, [BASE, "Gamma team ships Friday."])
+    tags, info = c.assign_detailed([("Gamma ships", 1, ["topic:new"])])
+    assert tags == [["topic:new"]] and info == [None]
+
+
+def test_marker_needs_an_orphan_with_memory_only_tags():
+    plain0 = OldUnit("Alpha team uses Redis for caching", "world", ("topic:one",), 0)
+    plain1 = OldUnit("Beta team uses Postgres for reports", "world", ("topic:one",), 1)
+    c = _carry([plain0, plain1], OLD_CHUNKS, ["Alpha team picked Redis for caching.", "x"])
+    assert c.assign([("Something unrelated entirely", 0, ["topic:new"])]) == [["topic:new"]]
+
+
+def test_hermes_json_paraphrase_below_threshold_is_marked_new_facts_are_not():
+    base = '[{"role": "user", "content": "A"}]'
+    c = AppendTagCarry(
+        base_text=base,
+        new_spans=new_chunk_spans(base, base[:-1] + ', {}]', ["x"]),
+        snapshot=OldDocumentSnapshot(units=[_HA, _HB], chunks={0: "x"}),
+    )
+    current = ["session:hs2acc-2", *_H_BASE]
+    para = "Quillfeather deploys run each Tuesday at 14:00 UTC."  # Jaccard ~0.43: partial, not a match
+    tags, info = c.assign_detailed(
+        [(para, 0, current), (_HB.text, 0, current)] + [(f, 0, current) for f in _NEW_FACTS]
+    )
+    a_only = ["retain:permanent", "task:release-ops", "kind:decision"]
+    assert tags[0] == current + [RETAG_MARKER] + ["retag-candidate:" + t for t in a_only]
+    assert info[0] == {"candidates": a_only, "orphans": 1}
+    assert set(tags[1]) == set(_HB.tags)
+    for i in range(2, 5):
+        assert tags[i] == current and info[i] is None
+
+
+def test_retag_tags_are_not_protected_and_not_real_filter_values():
+    tags = [RETAG_MARKER, "retag-candidate:retain:permanent", "retag-candidate:kind:decision"]
+    assert protected_tags(tags, ["retain:"]) == []
+    assert not {"retain:permanent", "kind:decision", "task:release-ops"} & set(tags)

@@ -39,6 +39,8 @@ def one_fact_per_fixture_sentence(monkeypatch):
         text = "\n".join(m.get("content", "") for m in messages if m.get("role") == "user")
         seen = []
         for s in _FIXTURE.findall(text):
+            if PARAPHRASE_A and "Fixture C" in text and s == A:
+                s = A_PARAPHRASE
             if s not in seen:
                 seen.append(s)
         return {
@@ -68,6 +70,8 @@ E = "Fixture E: the Osprey queue is drained nightly."
 A_EXTRA = ["retain:permanent", "task:release-ops", "kind:decision"]
 B_EXTRA = ["target:storage", "value:high"]
 _OMIT = object()
+PARAPHRASE_A = False
+A_PARAPHRASE = "Fixture A: Quillfeather deploys happen on Tuesdays, 14:00 UTC, weekly."
 
 
 def _turn(*facts):
@@ -141,4 +145,53 @@ async def test_append_new_facts_never_inherit_other_units_tags(memory, request_c
             got = await _by_fixture(memory, bank_id, doc)
             assert got == expected, f"after appending {key}: {got} != {expected}"
     finally:
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(600)
+@pytest.mark.parametrize("gate", [["retain:"], []], ids=["gate_on", "gate_off"])
+async def test_unmatched_reextraction_is_marked_for_retag_not_spread(memory, request_context, gate):
+    """A's re-extraction drifts below the match threshold when C is appended: A's replacement gets
+    the request's tags plus retag:pending and A's memory-only tags as retag-candidate:* hints -
+    never A's real tags; genuinely new facts are never marked."""
+    globals()["PARAPHRASE_A"] = True
+    bank_id = f"test_append_retag_{bool(gate)}_{datetime.now(timezone.utc).timestamp()}"
+    doc = "hermes-session-doc"
+    try:
+        await memory._ensure_bank_exists(bank_id, request_context)
+        await memory._config_resolver.update_bank_config(
+            bank_id, {"retain_preserve_tag_prefixes": gate, "consolidation_preserve_tag_prefixes": gate}
+        )
+        first = ["session:one"] + BASE
+        await _retain(memory, bank_id, request_context, _turn(A, B), doc, first, "append")
+        async with memory._pool.acquire() as conn:
+            for text, extra in ((A, A_EXTRA), (B, B_EXTRA)):
+                await conn.execute(
+                    "UPDATE memory_units SET tags = tags || $3::varchar[] WHERE bank_id=$1 AND text LIKE $2",
+                    bank_id,
+                    text.split(":")[0] + ":%",
+                    extra,
+                )
+        second = ["session:two"] + BASE
+        await _retain(memory, bank_id, request_context, _turn(C), doc, second, "append")
+        marked = set(second) | {"retag:pending"} | {"retag-candidate:" + t for t in A_EXTRA}
+        expected = {"A": marked, "B": set(first) | set(B_EXTRA), "C": set(second)}
+        assert await _by_fixture(memory, bank_id, doc) == expected
+        await _retain(memory, bank_id, request_context, _turn(D), doc, _OMIT, "append")
+        expected["D"] = set()
+        assert await _by_fixture(memory, bank_id, doc) == expected
+        await _retain(memory, bank_id, request_context, _turn(E), doc, [], "append")
+        expected["E"] = set()
+        assert await _by_fixture(memory, bank_id, doc) == expected
+        async with memory._pool.acquire() as conn:
+            prot = await conn.fetchval(
+                "SELECT count(*) FROM memory_units WHERE bank_id=$1 AND tags && "
+                "ARRAY['retain:permanent','kind:decision','kind:preference','kind:correction']::varchar[]",
+                bank_id,
+            )
+        # Markers/candidates are not protection: A's replacement lost its real tags, so nothing
+        # in the document is prune-protected until the retag pass re-classifies it.
+        assert prot == 0
+    finally:
+        globals()["PARAPHRASE_A"] = False
         await memory.delete_bank(bank_id, request_context=request_context)
