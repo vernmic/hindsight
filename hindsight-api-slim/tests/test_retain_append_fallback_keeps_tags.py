@@ -9,8 +9,11 @@ full path: every old unit is deleted and the whole document re-extracted, and th
 units used to come back with only the append request's tags - every per-unit classification
 the earlier units carried was gone.
 
-Contract: units re-extracted from text that existed before the append inherit the tags of the
-old units of that text; units from genuinely new text get only the request's tags.
+Contract (precision first, 2026-10-14): a re-extracted unit whose text matches an old unit
+(exact, or clearly similar) inherits exactly that old unit's tags; every other unit - genuinely
+new text, or re-extracted text with no confident match - gets only the request's tags. An old
+unit with no confident match loses its unit-only tags rather than spreading them to siblings
+(see ``test_append_tag_carry_precision.py`` for the leak this prevents).
 """
 
 import uuid
@@ -129,17 +132,11 @@ async def test_append_fallback_keeps_old_unit_tags(memory, request_context, how)
             # The scenario under test: nothing survived, everything was re-extracted.
             assert not (set(after) & set(before)), "a unit survived - the delta did not fall back"
 
-        # 1. No tag any earlier unit carried is lost from the document's units.
-        old_tags = set().union(*(r["tags"] for r in before.values()))
-        new_tags = set().union(*(r["tags"] for r in after.values()))
-        assert old_tags <= new_tags, f"lost: {sorted(old_tags - new_tags)}"
-
-        # 2. A unit re-extracted from a chunk made only of pre-append text takes the old
-        #    units' tags, not the append request's.
+        # Every unit carries either exactly one old unit's tag set (a matched re-extraction) or
+        # exactly the append request's tags: never a union of several old units, never a mix.
+        old_sets = [r["tags"] for r in before.values()]
         for uid, row in after.items():
-            if _D not in row["chunk"]:
-                assert "topic:three" not in row["tags"], (uid, row)
-                assert row["tags"] & old_tags, (uid, row)
+            assert row["tags"] in old_sets or row["tags"] == {"topic:three"}, (uid, row, old_sets)
             if row["chunk"].strip() == _D:
                 assert row["tags"] == {"topic:three"}, (uid, row)
         assert old_text  # keep the snapshot readable in failure output
