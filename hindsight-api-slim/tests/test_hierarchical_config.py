@@ -189,7 +189,7 @@ async def test_hierarchical_fields_categorization():
     assert "reflect_default_options" in configurable
 
     # Verify count is correct
-    assert len(configurable) == 59
+    assert len(configurable) == 61
 
     # Verify credential fields (NEVER exposed)
     assert "llm_api_key" in credentials

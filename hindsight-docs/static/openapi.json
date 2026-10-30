@@ -9794,6 +9794,36 @@
             "title": "Default Observation Scopes",
             "description": "observation_scopes applied at retain to items that send none ('combined' when unset). A list of tag lists may use globs, e.g. [['topic:*']] scopes each memory by its own topic tags."
           },
+          "consolidation_preserve_tag_prefixes": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Consolidation Preserve Tag Prefixes",
+            "description": "Preserve tags matching these literal prefixes on consolidation fold survivors (off by default)"
+          },
+          "retain_preserve_tag_prefixes": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retain Preserve Tag Prefixes",
+            "description": "Preserve tags matching these literal prefixes during retain tag rewrites (off by default)"
+          },
           "consolidation_strategies": {
             "anyOf": [
               {

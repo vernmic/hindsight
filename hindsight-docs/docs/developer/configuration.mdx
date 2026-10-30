@@ -1748,6 +1748,36 @@ Three things to know:
 Webhook delivery is the one caller that ignores all of this on purpose: its SSRF guard
 validates the address it resolved, and a proxy would contact one that was never checked.
 
+### Protected tag prefixes
+
+These optional policies preserve operator annotations during automatic memory updates.
+Both are disabled by default and accept a comma-separated list or a JSON array of literal
+prefixes. Per-bank overrides take the same list of strings; an empty list disables the
+policy for that bank. Empty prefixes are ignored. `%` and `_` have no wildcard meaning.
+
+| Environment variable | Bank override | Default |
+|---|---|---|
+| `HINDSIGHT_API_RETAIN_PRESERVE_TAG_PREFIXES` | `retain_preserve_tag_prefixes` | Unset |
+| `HINDSIGHT_API_CONSOLIDATION_PRESERVE_TAG_PREFIXES` | `consolidation_preserve_tag_prefixes` | Unset |
+
+For example, `HINDSIGHT_API_RETAIN_PRESERVE_TAG_PREFIXES=pin:,review:` protects tags such
+as `pin:critical` and `review:verified`. A retain that changes document tags preserves
+each surviving memory's **own** matching annotations, without copying a sibling's tags
+onto unrelated or newly extracted memories. The document row keeps its own matching tags
+through an upsert or full replacement. Full replacement deletes old memory units: this
+setting does not map arbitrary per-unit annotations onto re-extracted facts.
+
+Consolidation preservation carries matching tags from absorbed facts and observations
+onto the surviving observation in duplicate-fold paths. It does not copy every source tag
+or prevent deletion, and does not add a general derivation-inheritance policy. Choose
+prefixes deliberately because observation tags also participate in visibility and scope
+matching. The setting does not change which observations are eligible to fold.
+
+An explicit document `PATCH` supplying `tags` remains an exact replacement, allowing
+intentional removal or retagging. These policies apply to automatic retain/fold writes;
+they do not override explicit operator writes or direct database operations. Existing
+entity-label preservation and scope-change invalidation remain in effect.
+
 ### Retrieval
 
 | Variable | Description | Default |
