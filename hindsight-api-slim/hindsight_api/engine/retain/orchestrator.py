@@ -1338,6 +1338,8 @@ async def _delta_store_owned_write(
                     retain_params.get("metadata", {}),
                     observation_scopes=retain_params.get("observation_scopes"),
                     label_tag_keys=label_tag_keys(getattr(config, "entity_labels", None)),
+                    # update_mode="append" only adds: survivors keep their own tags.
+                    append=_is_append_submission(contents_dicts),
                     ops=pool.ops,
                 )
 
@@ -4257,6 +4259,7 @@ async def _try_delta_retain(
                     retain_params.get("metadata", {}),
                     observation_scopes=retain_params.get("observation_scopes"),
                     label_tag_keys=label_tag_keys(getattr(config, "entity_labels", None)),
+                    append=_is_append_submission(contents_dicts),
                     ops=pool.ops,
                 )
                 log_buffer.append(
@@ -4359,6 +4362,15 @@ async def _try_delta_retain(
     return RetainBatchResult(result_unit_ids, usage, processed_tokens)
 
 
+def _is_append_submission(contents_dicts) -> bool:
+    """Whether any content item of this submission carries ``update_mode="append"``.
+
+    The append signal rides on the content item (the oversized-item splitter copies it onto
+    every slice), so it is readable wherever ``contents_dicts`` is.
+    """
+    return any(str(item.get("update_mode") or "") == "append" for item in contents_dicts)
+
+
 async def _delta_metadata_only(
     pool: Any,
     bank_id,
@@ -4431,6 +4443,7 @@ async def _delta_metadata_only(
                     retain_params.get("metadata", {}),
                     observation_scopes=retain_params.get("observation_scopes"),
                     label_tag_keys=label_tag_keys(getattr(config, "entity_labels", None)),
+                    append=_is_append_submission(contents_dicts),
                     ops=pool.ops,
                 )
         if outbox_callback is not None:
@@ -4479,6 +4492,7 @@ async def _delta_metadata_only(
                     retain_params.get("metadata", {}),
                     observation_scopes=retain_params.get("observation_scopes"),
                     label_tag_keys=label_tag_keys(getattr(config, "entity_labels", None)),
+                    append=_is_append_submission(contents_dicts),
                     ops=pool.ops,
                 )
                 if outbox_callback is not None:

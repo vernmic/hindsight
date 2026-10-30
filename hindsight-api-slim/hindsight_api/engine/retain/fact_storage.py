@@ -485,6 +485,7 @@ async def update_memory_units_metadata_and_tags(
     *,
     observation_scopes: list | str | None = None,
     label_tag_keys: set[str] | None = None,
+    append: bool = False,
     ops=None,
 ) -> int:
     """Update document-level attributes on existing memory units.
@@ -528,6 +529,16 @@ async def update_memory_units_metadata_and_tags(
     keep their observations: an ordinary delta edit must not re-consolidate the
     whole document.
 
+    ``append`` is the ``update_mode="append"`` guarantee: an append may only ADD. Its
+    request tags belong to the units that submission inserts, never to the facts the
+    document already holds, so with ``append`` every survivor's final tag set is exactly
+    the one it already carries, whether the append sent different tags, no ``tags`` field,
+    or ``tags=[]``. Without this the document's tag set replaced (or, for an empty set,
+    cleared) the per-unit tags of every earlier unit. Metadata
+    and ``observation_scopes`` still propagate: they are the document-level bag the caller
+    owns. A survivor's tags are then unchanged, so it is reported as rescoped only when its
+    ``observation_scopes`` actually moved.
+
     Returns:
         Number of memory units updated.
     """
@@ -535,7 +546,11 @@ async def update_memory_units_metadata_and_tags(
     from .entity_labels import split_label_tags
 
     def _tags_for(existing: list[str] | None) -> list[str]:
-        """The document tags, plus the label projection this unit already carries."""
+        """The document tags, plus the label projection this unit already carries.
+
+        On an append, the unit's own tags, untouched."""
+        if append:
+            return list(existing or [])
         merged = list(tags or [])
         seen = set(merged)
         for t in split_label_tags(existing, label_tag_keys):
