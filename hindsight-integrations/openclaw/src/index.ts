@@ -142,6 +142,7 @@ const banksWithDefaultsApplied = new Set<string>();
 
 // In-flight recall deduplication: concurrent recalls for the same bank reuse one promise
 import type { RecallResponse } from "./types.js";
+import { registerHindsightContextEngine } from "./context-engine.js";
 const inflightRecalls = new Map<string, Promise<RecallResponse>>();
 
 // Lightweight bank-scoped facade over HindsightClient. Created per-request via
@@ -2304,6 +2305,10 @@ export default function (api: MoltbotPluginAPI) {
 
     // Store config globally for bank ID derivation in hooks
     currentPluginConfig = pluginConfig;
+
+    // Register the Hindsight context engine (non-durable shell; see context-engine.ts).
+    // Inert unless plugins.slots.contextEngine selects "hindsight-openclaw".
+    registerHindsightContextEngine(api, log);
 
     debug("[Hindsight] Plugin loaded successfully (deferred heavy init to gateway start)");
 
