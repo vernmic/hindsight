@@ -8,8 +8,8 @@ These candidates are not upstream API promises. [Inventory](CONTRIBUTIONS.md) an
 A surviving old unit keeps its complete tag set when a later append carries different tags,
 omits tags or explicitly supplies an empty list. Newly inserted units receive the request's tags;
 one sibling's classification must not spread to another. Metadata and observation-scope propagation
-retain their documented behavior. Synthetic tests use `status:*` / `priority:*` annotations,
-isolated PostgreSQL and mock extraction. Deleted/recreated units are separate S4 work.
+retain their documented behavior. The provided real-storage tests use `status:*` / `priority:*` annotations,
+isolated PostgreSQL and mock extraction; their database assertions did not complete in this pass. Deleted/recreated units are separate S4 work.
 
 ## S2/S3: protected prefixes
 
@@ -34,3 +34,5 @@ classifier, repair workflow or schema migration is required.
 The regression boundary includes off/default parity, per-unit ownership, configured carry,
 literal special characters, bank isolation and storage-path effects. Mock helper results alone
 are not database persistence proof. Each branch's dossier names executed checks and limitations.
+
+Exact source identities and executed/unfinished checks: [candidate validation](CANDIDATE-VALIDATION.md).

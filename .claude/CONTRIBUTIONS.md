@@ -43,3 +43,5 @@ not counted as additional deliverables. No production cutover is part of this pu
 | Portable features require the customization layer | no | no | no |
 | Native provider needs a new upstream request | no, already native | no | no |
 | Publication proves runtime installation | no | no | no |
+
+Exact source identities and executed/unfinished checks: [candidate validation](CANDIDATE-VALIDATION.md).
