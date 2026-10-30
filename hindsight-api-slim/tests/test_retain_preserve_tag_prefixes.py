@@ -1,13 +1,13 @@
 """Bank-gated tag-prefix preservation on retain (``retain_preserve_tag_prefixes``).
 
 Some tags are written onto a document or onto individual memory units AFTER extraction:
-a gardener marks a unit ``pin:critical``, an operator pins a document ``pin:doc``.
+a classifier marks a unit ``pin:critical``, an operator pins a document ``pin:doc``.
 Upstream re-retain semantics replace a survivor's tags with the submission's document tags,
 so the next replace-mode re-retain of the same document silently drops them. With the
 bank's ``retain_preserve_tag_prefixes`` set (default off), tags under those prefixes
 survive the retain write paths:
 
-* a replace-mode (delta) re-pin: each SURVIVING unit keeps its OWN protected tags, after
+* a replace-mode (delta) re-retain: each SURVIVING unit keeps its OWN protected tags, after
   the new document tags. Nothing spreads to sibling units or to freshly extracted ones;
 * the document row keeps its protected tags on an in-place upsert and, through a full
   replacement that deletes and re-inserts the row (including one that sends no tags), by
@@ -16,8 +16,8 @@ survive the retain write paths:
   removal is always possible;
 * rescope detection still compares against what each unit ends with.
 
-Append re-retains keep every survivor's whole tag set unconditionally; that is covered by
-``test_retain_append_preserves_unit_tags.py``.
+This feature is independent of general append tag-preservation policy: only configured
+prefixes are protected by this contribution.
 """
 
 import uuid
@@ -83,7 +83,7 @@ def test_protected_tags_is_a_literal_prefix_match():
     # `_` and `%` are not wildcards: each prefix matches only itself.
     assert protected_tags(tags, ["pi_n:"]) == ["pi_n:y"]
     assert protected_tags(tags, ["re%"]) == ["re%:w"]
-    assert protected_tags(tags, ["pin:", "tier:"]) == ["pin:x", "label:one"]
+    assert protected_tags(tags, ["pin:", "label:"]) == ["pin:x", "label:one"]
 
 
 def test_protected_tags_off_and_empty():
@@ -157,7 +157,7 @@ async def _seed(memory, bank_id, doc, request_context):
 @pytest.mark.asyncio
 @pytest.mark.timeout(600)
 @pytest.mark.parametrize("gate", [["pin:"], None], ids=["gate_on", "gate_off"])
-async def test_replace_rerentain_survivors_keep_only_their_own_protected_tags(memory, request_context, gate):
+async def test_replace_reretain_survivors_keep_only_their_own_protected_tags(memory, request_context, gate):
     bank_id = await _bank(memory, request_context, "delta", gate=gate)
     doc = "doc"
     try:
