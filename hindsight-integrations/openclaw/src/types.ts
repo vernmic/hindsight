@@ -10,6 +10,7 @@ export interface PluginPromptHookResult {
 }
 
 export interface MoltbotPluginAPI {
+  runtime?: { state?: { resolveStateDir?: () => string } };
   config: MoltbotConfig;
   registerService(config: ServiceConfig): void;
   // OpenClaw hook handler signature: (event, ctx?) where ctx contains channel/sender info
