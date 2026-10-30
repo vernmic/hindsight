@@ -1,3 +1,5 @@
+> Fork status: [contribution and integration boundaries](../../.claude/OPENCLAW-INTEGRATION.md). This historical source branch is separate from current candidates.
+
 # Hindsight Memory Plugin for OpenClaw
 
 Biomimetic long-term memory for [OpenClaw](https://openclaw.ai) using [Hindsight](https://vectorize.io/hindsight). Automatically captures conversations and intelligently recalls relevant context.

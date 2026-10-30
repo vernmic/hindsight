@@ -17,6 +17,20 @@
 
 ---
 
+## Vern's fork: contribution status
+
+This fork's default branch retains its historical source baseline. Current reference candidates
+live on separate branches; publication is neither upstream acceptance nor production deployment.
+
+- [Contribution inventory](.claude/CONTRIBUTIONS.md)
+- [Server feature contracts](.claude/SERVER-FEATURES.md)
+- [OpenClaw integration boundaries](.claude/OPENCLAW-INTEGRATION.md)
+- [Upstream requests](.claude/UPSTREAM-REQUESTS.md)
+
+Hindsight [declines external PRs](https://github.com/vectorize-io/hindsight/blob/main/CONTRIBUTING.md).
+We offer focused reproductions and reference patches through its issue process.
+The upstream introduction and license below are preserved.
+
 ## What is Hindsight?
 
 Hindsight™ is an agent memory system built to create smarter agents that learn over time. Most agent memory systems focus on recalling conversation history. Hindsight is focused on making agents that learn, not just remember.
