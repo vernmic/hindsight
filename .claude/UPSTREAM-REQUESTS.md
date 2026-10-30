@@ -6,8 +6,8 @@ focused issues with synthetic reproductions and public reference implementations
 
 | Candidate | Route / disposition |
 |---|---|
-| S1 append survivor tags | Focused bug draft; current-source reproduction/reference review precede submission. Confirmed URL added after submission. |
-| S2/S3 protected prefixes | Focused default-off feature draft; explicit replacement remains supported. Confirmed URL added after submission. |
+| S1 append survivor tags | Submitted [#6206](https://github.com/vectorize-io/hindsight/issues/6206); open, text/author readback verified. Helper-level reproduction and DB limits disclosed. |
+| S2/S3 protected prefixes | Submitted [#6207](https://github.com/vectorize-io/hindsight/issues/6207); open, text/author readback verified. Default-off reference with pending DB/client coverage. |
 | P1 Hermes recall count cap | [#5426](https://github.com/vectorize-io/hindsight/issues/5426) open; existing `d9553b66c` reference public. Consider the third-party implementation linked October29. No duplicate issue. |
 | P2 native provider | Already implemented [#5535](https://github.com/vectorize-io/hindsight/pull/5535). No request. |
 | S5 source context | [#2551](https://github.com/vectorize-io/hindsight/issues/2551) open with our existing evidence. No repeated progress-only comment or duplicate request. |

@@ -57,3 +57,7 @@ bank's observation-scope policy in mind; preserving a tag is not proof that it c
 Candidate source, public documentation, upstream submission, maintainer acceptance and deployed
 runtime are separate states. Follow the [request ledger](UPSTREAM-REQUESTS.md). No raw operator
 logs, credentials, transcripts or databases are needed to reproduce the source-level invariant.
+
+Custom MemoriesExtension implementations overriding fold methods must accept the new optional
+preservation keyword; default generic-store and Postgres implementations are updated in the
+reference. Third-party override compatibility has not been qualified.

@@ -29,3 +29,12 @@ At the start of this publication work the new pair was not runtime-qualified. Re
 on-disk staging do not close that gate. Production cutover, compaction ownership and deferred
 supervision are outside the publication work order. No raw transcript, queue, database,
 credential, private journal or machine path is included as public evidence.
+
+### Paired launch result
+
+The corrected pair was staged and the frozen host artifact set reverified. A bounded clone
+launch then refused at database readiness: its active agent databases were schema24 and the
+host required a native migration before serving them. No listening gateway or loaded-provider
+qualification was achieved. The clone is stopped; the previously qualified plugin identity
+was not advanced. Offline migration fixtures do not establish migration of this active copy.
+The contribution references can be evaluated independently of that explicitly open runtime lane.

@@ -45,3 +45,10 @@ not counted as additional deliverables. No production cutover is part of this pu
 | Publication proves runtime installation | no | no | no |
 
 Exact source identities and executed/unfinished checks: [candidate validation](CANDIDATE-VALIDATION.md).
+
+## Published source and submission readback
+
+- S1: [`821b46bea`](https://github.com/vernmic/hindsight/commit/821b46bea1e9cf0bf0fb89e1682bcece46bacc6f), request [#6206](https://github.com/vectorize-io/hindsight/issues/6206).
+- S2/S3: [`eef396fcf`](https://github.com/vernmic/hindsight/commit/eef396fcf3851dde89cd6550461e973c7901e2f8), request [#6207](https://github.com/vectorize-io/hindsight/issues/6207).
+- Documentation and standalone reproducer initially published at [`9490d7413`](https://github.com/vernmic/hindsight/commit/9490d74132e4cbfda5b00df8e5699214c5f4ad90).
+- Both requests were verified open under the submitting account. Maintainer acceptance is unclaimed; candidate database/client limits remain unchanged. Raw integration branches were not published.
