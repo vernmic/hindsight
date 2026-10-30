@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 import subprocess
 import uuid
 from pathlib import Path
@@ -16,7 +17,7 @@ PSQL = [
     "exec",
     "-i",
     "-e",
-    "PGPASSWORD=hindsight",
+    "PGPASSWORD",  # value filled in by psql_command()
     "-e",
     "LD_LIBRARY_PATH=/home/hindsight/.pg0/installation/18.1.0/lib",
     "hindsight-hindsight-1",
@@ -34,8 +35,19 @@ PSQL = [
 ]
 
 
+def pg_password():
+    try:
+        return os.environ["HINDSIGHT_PGPASSWORD"]
+    except KeyError:
+        raise RuntimeError("HINDSIGHT_PGPASSWORD must be set") from None
+
+
+def psql_command():
+    return ["PGPASSWORD=" + pg_password() if arg == "PGPASSWORD" else arg for arg in PSQL]
+
+
 def query(sql):
-    r = subprocess.run(PSQL, input=sql, text=True, capture_output=True, timeout=120)
+    r = subprocess.run(psql_command(), input=sql, text=True, capture_output=True, timeout=120)
     if r.returncode:
         raise RuntimeError(r.stderr)
     return [json.loads(line) for line in r.stdout.splitlines() if line.startswith("{")]

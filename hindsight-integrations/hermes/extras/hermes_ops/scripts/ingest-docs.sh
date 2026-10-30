@@ -94,7 +94,8 @@ CT="$(container_for_url)"
 PSQL_BIN="PATH=$PG_VERSION_DIR:\$PATH psql -U hindsight -d hindsight -A -F\"|\" -t"
 sql() {  # sql "<one-line sql>" ; prints rows or empty on failure
   [ -n "$DKR" ] || { echo "NO_DOCKER"; return 1; }
-  "$DKR" exec -i -e PGPASSWORD=hindsight -e SQL_TEXT="$1" "$CT" \
+  : "${HINDSIGHT_PGPASSWORD:?HINDSIGHT_PGPASSWORD must be set}"
+  "$DKR" exec -i -e "PGPASSWORD=$HINDSIGHT_PGPASSWORD" -e SQL_TEXT="$1" "$CT" \
     sh -c "$PSQL_BIN -c \"\$SQL_TEXT\"" 2>&1
 }
 

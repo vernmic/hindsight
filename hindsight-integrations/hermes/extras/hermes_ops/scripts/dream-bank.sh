@@ -16,6 +16,7 @@ for arg in "$@"; do
   esac
 done
 
+: "${HINDSIGHT_PGPASSWORD:?HINDSIGHT_PGPASSWORD must be set}"
 DOCKER="/mnt/c/Program Files/Docker/Docker/resources/bin/docker.exe"
 API="http://host.docker.internal:8888"
 LOG="/home/vern/.hermes/workspace/dream-bank-log.jsonl"
@@ -36,7 +37,7 @@ refuse_bank() {
 
 psql_sql() {
   refuse_bank "$1"
-  "$DOCKER" exec -i -e PGPASSWORD=hindsight hindsight-hindsight-1 \
+  "$DOCKER" exec -i -e "PGPASSWORD=$HINDSIGHT_PGPASSWORD" hindsight-hindsight-1 \
     sh -c 'PATH=/home/hindsight/.pg0/installation/18.1.0/bin:$PATH psql -U hindsight -d hindsight -v ON_ERROR_STOP=1 -q -At'
 }
 

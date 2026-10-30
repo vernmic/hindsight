@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import json
 import math
+import os
 import sqlite3
 import subprocess
 import sys
@@ -14,6 +15,14 @@ import uuid
 from pathlib import Path
 
 from gardener_source_context import select_document
+
+
+def pg_password():
+    try:
+        return os.environ["HINDSIGHT_PGPASSWORD"]
+    except KeyError:
+        raise RuntimeError("HINDSIGHT_PGPASSWORD must be set") from None
+
 
 POLICY = "gardener-batch-v7"
 TASKS = ["design", "build", "patch", "debug", "validate", "review", "research", "ingest", "configure", "ops"]
@@ -597,7 +606,7 @@ ROLLBACK;
         "exec",
         "-i",
         "-e",
-        "PGPASSWORD=hindsight",
+        "PGPASSWORD=" + pg_password(),
         "-e",
         "LD_LIBRARY_PATH=/home/hindsight/.pg0/installation/18.1.0/lib",
         "hindsight-hindsight-1",
