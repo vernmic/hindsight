@@ -13,6 +13,8 @@ export interface MoltbotPluginAPI {
   runtime?: { state?: { resolveStateDir?: () => string } };
   config: MoltbotConfig;
   registerService(config: ServiceConfig): void;
+  // Optional: hosts without context-engine support omit it (registration is skipped).
+  registerContextEngine?: (id: string, factory: () => unknown) => void;
   // OpenClaw hook handler signature: (event, ctx?) where ctx contains channel/sender info
   on(
     event: string,
