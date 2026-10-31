@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { zstdCompressSync } from "node:zlib";
@@ -339,6 +339,44 @@ describe("last-assemble bookkeeping and cached marks index (wave 11)", () => {
       } catch {
         /* Windows may hold the read-only SeqIndex handle briefly */
       }
+    }
+  });
+
+  it("stamps the state generation and falls back to lastCommittedSeq on a cold ledger", async () => {
+    const r = mkdtempSync(join(tmpdir(), "hs-w13-"));
+    try {
+      const key = "agent:main:w13";
+      const p = join(r, "workspace", "state", "astinus", "agent_main_w13.json");
+      mkdirSync(dirname(p), { recursive: true });
+      writeFileSync(p, JSON.stringify({ lastGenerationSeen: "gen-3", lastCommittedSeq: 77 }));
+      const apply = vi.fn(() => ({
+        messages: [{ role: "user", content: "y" }],
+        admitted: [mark],
+        marksInEffect: 1,
+        changed: true,
+        pendingCount: 1,
+        tokensBefore: 20,
+        tokensAfter: 3,
+        skipped: [],
+        windowFirstSeq: 1,
+      })) as unknown as MarksReadSide["applyMarks"];
+      const s = side({
+        readMarksCached: vi.fn(() => ({ ok: true, marks: [mark] })),
+        readMaxTurnId: vi.fn(() => null),
+        applyMarks: apply,
+      });
+      await createContextEngine(log(), { hostStateRoot: r, loadMarks: async () => s }).assemble({
+        messages: msgs,
+        sessionKey: key,
+        sessionId: "u",
+      });
+      const ctx = (apply as unknown as { mock: { calls: unknown[][] } }).mock.calls[0][2] as {
+        turnCounter: number;
+      };
+      expect(ctx.turnCounter).toBe(77);
+      expect(s.markMarksApplied).toHaveBeenCalledWith(key, [9], "gen-3", 20, 3);
+    } finally {
+      rmSync(r, { recursive: true, force: true });
     }
   });
 
