@@ -126,6 +126,46 @@ export function hostDbPathFor(hostStateRoot: string, sessionKey: string): string
   return join(hostStateRoot, "agents", agentId, "agent", "openclaw-agent.sqlite");
 }
 
+/** Last-resort marks per host root + session (e8cb astinusMarksIndex, generalized): refilled by
+ *  every successful ledger read and used when the ledger read fails, or not at all on a cold start.
+ *  R11.1: keyed by host state root AND session key, so a failed read in one root can never reuse
+ *  another root's sequence ranges (separate transcripts share seq numbers and session keys). */
+const marksIndex = new Map<string, unknown[]>();
+const MARKS_INDEX_MAX_SESSIONS = 2000;
+const MAX_TRACKED_SESSIONS = 10_000;
+
+/** What assemble() records per session (e8cb AstinusAssembleFact): the serving signal and the
+ *  pass pressure inputs (view_tokens / token_budget / estimator / window_first_seq). */
+export type AssembleFact = {
+  at: number;
+  viewTokens: number;
+  tokenBudget: number | null;
+  estimator: "host" | "plugin";
+  windowFirstSeq: number | null;
+};
+
+// e8cb R2 (2026-10-25): the map is shared by every plugin copy of one host instance, so it lives in
+// a process-wide registry keyed by host state root (e8cb lifecycle.lastAssemble via Symbol.for).
+const LAST_ASSEMBLE = Symbol.for("@vectorize-io/hindsight-openclaw/last-assemble");
+function lastAssembleFor(stateRoot: string): Map<string, AssembleFact> {
+  const g = globalThis as unknown as Record<symbol, Map<string, Map<string, AssembleFact>>>;
+  const all = (g[LAST_ASSEMBLE] ??= new Map());
+  let m = all.get(stateRoot);
+  if (!m) {
+    m = new Map();
+    all.set(stateRoot, m);
+  }
+  return m;
+}
+
+/** Read side for the future pass payload (commit path, not ported yet). */
+export function getLastAssembleFact(
+  stateRoot: string,
+  sessionKey: string
+): AssembleFact | undefined {
+  return lastAssembleFor(stateRoot).get(sessionKey);
+}
+
 export function createContextEngine(log: Logger, options: ContextEngineOptions = {}) {
   const loadDelegate = options.loadDelegate ?? loadRuntimeDelegate;
   const loadMarks = options.loadMarks ?? loadMarksReadSide;
@@ -149,8 +189,11 @@ export function createContextEngine(log: Logger, options: ContextEngineOptions =
       estimatedTokens: number;
       promptAuthority: "assembled" | "preassembly_may_overflow";
     }> {
+      const assembleStartedAt = Date.now();
       const list = Array.isArray(params.messages) ? params.messages : [];
       let outList = list;
+      let windowFirstSeq: number | null = null;
+      let marksSeen = 0;
       let estimatedTokens = 0;
       let marksInEffect = 0;
       const key = params.sessionKey ?? params.sessionId;
@@ -159,8 +202,23 @@ export function createContextEngine(log: Logger, options: ContextEngineOptions =
         try {
           const side = await loadMarks();
           const read = side.readMarksCached(key, (m) => log.warn(m));
-          if (read.ok && read.marks.length > 0) {
-            const res = side.applyMarks(list, read.marks as never, {
+          const cacheKey = JSON.stringify([options.hostStateRoot ?? "", key]);
+          let marks: unknown[] = marksIndex.get(cacheKey) ?? [];
+          if (read.ok) {
+            marks = read.marks;
+            marksIndex.set(cacheKey, marks);
+            if (marksIndex.size > MARKS_INDEX_MAX_SESSIONS) {
+              const oldest = marksIndex.keys().next().value;
+              if (oldest !== undefined) marksIndex.delete(oldest);
+            }
+          } else if (read.reason !== "not-open") {
+            log.warn(
+              `[hindsight-engine] assemble: marks unavailable (${read.reason}); using cached index (${marks.length})`
+            );
+          }
+          marksSeen = marks.length;
+          if (marks.length > 0) {
+            const res = side.applyMarks(list, marks as never, {
               sessionKey: key,
               hostDbPath,
               // B1: transcript rows are keyed by the HOST session UUID, never the session key.
@@ -177,6 +235,8 @@ export function createContextEngine(log: Logger, options: ContextEngineOptions =
               );
             }
             outList = res.messages;
+            // Captured unconditionally (e8cb Q1 2026-10-07): the held-marks case needs it most.
+            windowFirstSeq = res.windowFirstSeq ?? null;
             estimatedTokens = res.tokensBefore;
             marksInEffect = res.marksInEffect;
             const admittedIds = res.admitted.map((m) => m.mark_id);
@@ -192,8 +252,6 @@ export function createContextEngine(log: Logger, options: ContextEngineOptions =
             if (marksInEffect > 0 && outList !== list) {
               estimatedTokens = side.estimateTokensHost(outList);
             }
-          } else if (!read.ok && read.reason !== "not-open") {
-            log.warn(`[hindsight-engine] assemble: marks unavailable (${read.reason})`);
           }
         } catch (e) {
           // Any failure degrades to "less pruned", never an error.
@@ -203,9 +261,34 @@ export function createContextEngine(log: Logger, options: ContextEngineOptions =
           outList = list;
           marksInEffect = 0;
           estimatedTokens = 0;
+          windowFirstSeq = null;
         }
       }
       if (estimatedTokens === 0 && list.length > 0) estimatedTokens = estimateTokens(list);
+      // PERF instrumentation (e8cb): assemble runs once per model call; name a slow one.
+      const assembleMs = Date.now() - assembleStartedAt;
+      if (assembleMs > 150) {
+        log.warn(
+          `[hindsight-engine] assemble took ${assembleMs}ms: ${list.length} msgs, ~${estimatedTokens} tok, marks=${marksSeen} (${marksInEffect} in effect)` +
+            (key ? ` session=${key}` : "")
+        );
+      }
+      if (key) {
+        // Record this session's last assemble; touch-on-write so the cap behaves LRU (e8cb m1).
+        const facts = lastAssembleFor(options.hostStateRoot ?? "");
+        facts.delete(key);
+        facts.set(key, {
+          at: Date.now(),
+          viewTokens: estimatedTokens,
+          tokenBudget: typeof params.tokenBudget === "number" ? params.tokenBudget : null,
+          estimator: marksInEffect > 0 ? "host" : "plugin",
+          windowFirstSeq,
+        });
+        if (facts.size > MAX_TRACKED_SESSIONS) {
+          const oldest = facts.keys().next().value;
+          if (oldest !== undefined) facts.delete(oldest);
+        }
+      }
       return {
         messages: outList,
         estimatedTokens,
