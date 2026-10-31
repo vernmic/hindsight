@@ -208,6 +208,14 @@ export interface PluginConfig {
    * diagnose latency without patching the dist. Default: false.
    */
   debugPerfTiming?: boolean;
+  /**
+   * Context engine marks admission policy (see assemble-marks.ts DEFAULT_MARKS_POLICY).
+   * Declared in openclaw.plugin.json as `astinusMarks`. Kept on ONE line on purpose:
+   * manifest.test.ts extracts PluginConfig keys per line, so a nested block would read as four
+   * extra top-level fields and fail the schema-parity assertion.
+   */
+  // prettier-ignore
+  astinusMarks?: { minPressure?: number; admitShare?: boolean; debounceTurns?: number; criticalPressure?: number };
 }
 
 export interface ServiceConfig {

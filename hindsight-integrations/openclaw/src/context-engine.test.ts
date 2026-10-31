@@ -4,11 +4,13 @@ import { DatabaseSync } from "node:sqlite";
 import { zstdCompressSync } from "node:zlib";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { estimateTokensHost } from "./assemble-marks.js";
+import { getPluginConfig } from "./index.js";
 import { closeAllLedgers, configureSessionLedger, openSessionLedger } from "./session-ledger.js";
 import { dirname, join } from "node:path";
 import {
   createContextEngine,
   hostDbPathFor,
+  marksPolicyFromConfig,
   registerHindsightContextEngine,
   type MarksReadSide,
 } from "./context-engine.js";
@@ -247,5 +249,159 @@ describe("composed assembly over a real ledger and compressed host store", () =>
       .all() as Array<{ mark_id: number; applied_at: number | null }>;
     expect(stamped[0].applied_at).not.toBeNull();
     expect(stamped[1].applied_at).toBeNull();
+  });
+  it("honours the configured astinusMarks policy (minPressure above current pressure)", async () => {
+    root = mkdtempSync(join(tmpdir(), "hs-engine-composed-"));
+    const sessionKey = "agent:main:composed-policy";
+    const hostDbPath = hostDbPathFor(root, sessionKey);
+    mkdirSync(dirname(hostDbPath), { recursive: true });
+    const host = new DatabaseSync(hostDbPath);
+    host.exec(
+      "CREATE TABLE transcript_events (session_id TEXT, seq INTEGER, event_json TEXT, event_zstd BLOB, event_utf8_bytes INTEGER)"
+    );
+    const insert = host.prepare("INSERT INTO transcript_events VALUES (?,?,?,?,?)");
+    const messages: unknown[] = [];
+    for (let turn = 1; turn <= 12; turn++) {
+      for (const role of ["user", "assistant"]) {
+        const message = {
+          role,
+          idempotencyKey: `${role}-${turn}`,
+          content: [{ type: "text", text: `${role} ${turn}: ` + "synthetic content ".repeat(150) }],
+        };
+        messages.push(message);
+        const bytes = Buffer.from(JSON.stringify({ message }), "utf8");
+        insert.run("host-uuid", messages.length, null, zstdCompressSync(bytes), bytes.length);
+      }
+    }
+    host.close();
+
+    configureSessionLedger(root);
+    const opened = openSessionLedger(sessionKey, "main", hostDbPath, () => {});
+    expect(opened.ok).toBe(true);
+    if (!opened.ok) return;
+    const addMark = opened.db.prepare(
+      "INSERT INTO marks (mark_id, session_id, seq_start, seq_end, kind, action, reason, proposed_at) VALUES (?,?,?,?,?,?,?,?)"
+    );
+    addMark.run(1, "host-uuid", 2, 2, "turn", "drop", "synthetic", 1);
+    addMark.run(2, "host-uuid", 900, 900, "turn", "drop", "out of window", 1);
+
+    const engine = createContextEngine(log(), {
+      hostStateRoot: root,
+      // Through the real loader (R9.1): the override must survive getPluginConfig.
+      getPolicy: () => marksPolicyFromConfig(loadConfig({ astinusMarks: { minPressure: 0.99 } })),
+    });
+    const out = await engine.assemble({
+      messages,
+      sessionKey,
+      sessionId: "host-uuid",
+      tokenBudget: Math.ceil(estimateTokensHost(messages) / 0.9),
+    });
+    expect(out.messages.length).toBe(24);
+    expect(out.promptAuthority).toBe("preassembly_may_overflow");
+    const stamped = opened.db
+      .prepare("SELECT mark_id, applied_at FROM marks ORDER BY mark_id")
+      .all() as Array<{ mark_id: number; applied_at: number | null }>;
+    expect(stamped[0].applied_at).toBeNull();
+    expect(stamped[1].applied_at).toBeNull();
+  });
+});
+
+function loadConfig(raw: Record<string, unknown>) {
+  return getPluginConfig({
+    config: { plugins: { entries: { "hindsight-openclaw": { config: raw } } } },
+  } as never);
+}
+
+describe("astinusMarks through the real getPluginConfig (R9.1)", () => {
+  it("preserves all supported overrides", () => {
+    const requested = {
+      minPressure: 0.99,
+      admitShare: false,
+      debounceTurns: 3,
+      criticalPressure: 0.8,
+    };
+    const parsed = loadConfig({ astinusMarks: requested });
+    expect(parsed.astinusMarks).toEqual(requested);
+    expect(marksPolicyFromConfig(parsed)).toEqual(requested);
+  });
+
+  it("keeps a partial override partial and drops mistyped fields", () => {
+    const parsed = loadConfig({ astinusMarks: { minPressure: 0.5, debounceTurns: "x" } });
+    expect(marksPolicyFromConfig(parsed)).toEqual({ minPressure: 0.5 });
+  });
+
+  it("leaves the policy undefined (defaults) when absent", () => {
+    const parsed = loadConfig({});
+    expect(parsed.astinusMarks).toBeUndefined();
+    expect(marksPolicyFromConfig(parsed)).toBeUndefined();
+  });
+});
+
+describe("astinusMarks policy wiring", () => {
+  it("parses only typed overrides", () => {
+    expect(marksPolicyFromConfig(undefined)).toBeUndefined();
+    expect(marksPolicyFromConfig({})).toBeUndefined();
+    expect(marksPolicyFromConfig({ astinusMarks: { minPressure: "x" } })).toBeUndefined();
+    expect(
+      marksPolicyFromConfig({
+        astinusMarks: {
+          minPressure: 0.4,
+          admitShare: false,
+          debounceTurns: 3,
+          criticalPressure: 0.8,
+        },
+      })
+    ).toEqual({ minPressure: 0.4, admitShare: false, debounceTurns: 3, criticalPressure: 0.8 });
+  });
+
+  it("re-reads the policy on every assemble and passes it to applyMarks", async () => {
+    let cfg: unknown = { astinusMarks: { minPressure: 0.5 } };
+    const registerContextEngine = vi.fn();
+    registerHindsightContextEngine({ registerContextEngine }, log(), "/root", () =>
+      marksPolicyFromConfig(cfg)
+    );
+    const applyMarks = vi.fn((messages: unknown[]) => ({
+      messages,
+      admitted: [],
+      marksInEffect: 0,
+      changed: false,
+      pendingCount: 0,
+      tokensBefore: 1,
+      tokensAfter: 1,
+      skipped: [],
+      windowFirstSeq: null,
+    }));
+    const engine = registerContextEngine.mock.calls[0][1]() as ReturnType<
+      typeof createContextEngine
+    >;
+    // The registered factory uses the real lazy read side; drive the option path directly instead.
+    expect(engine.info.id).toBe("hindsight-openclaw");
+    const direct = createContextEngine(log(), {
+      hostStateRoot: "/root",
+      getPolicy: () => marksPolicyFromConfig(cfg),
+      loadMarks: async () => ({
+        readMarksCached: () => ({
+          ok: true,
+          marks: [{ mark_id: 1, seq_start: 1, seq_end: 1, action: "drop" }],
+        }),
+        readMaxTurnId: () => 1,
+        markMarksApplied: vi.fn(),
+        applyMarks: applyMarks as unknown as MarksReadSide["applyMarks"],
+        estimateTokensHost: () => 1,
+      }),
+    });
+    const params = {
+      messages: [{ role: "user", content: "a" }],
+      sessionKey: "agent:main:p",
+      sessionId: "u",
+    };
+    await direct.assemble(params);
+    cfg = { astinusMarks: { debounceTurns: 2 } };
+    await direct.assemble(params);
+    const policies = applyMarks.mock.calls.map(
+      (call) => (call as unknown[])[2] as { policy?: unknown }
+    );
+    expect(policies[0].policy).toEqual({ minPressure: 0.5 });
+    expect(policies[1].policy).toEqual({ debounceTurns: 2 });
   });
 });
