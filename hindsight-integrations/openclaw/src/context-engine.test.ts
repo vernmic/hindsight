@@ -3,12 +3,13 @@ import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { zstdCompressSync } from "node:zlib";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { estimateTokensHost } from "./assemble-marks.js";
+import { applyMarks, estimateTokensHost } from "./assemble-marks.js";
 import { getPluginConfig } from "./index.js";
 import { closeAllLedgers, configureSessionLedger, openSessionLedger } from "./session-ledger.js";
 import { dirname, join } from "node:path";
 import {
   createContextEngine,
+  getLastAssembleFact,
   hostDbPathFor,
   marksPolicyFromConfig,
   registerHindsightContextEngine,
@@ -184,6 +185,188 @@ describe("assemble with marks (read side)", () => {
     expect(out.promptAuthority).toBe("preassembly_may_overflow");
     expect(out.estimatedTokens).toBeGreaterThan(0);
     expect(l.warn).toHaveBeenCalled();
+  });
+});
+
+describe("last-assemble bookkeeping and cached marks index (wave 11)", () => {
+  const msgs = [{ role: "user", content: "x".repeat(40) }];
+  const mark = { mark_id: 9, seq_start: 1, seq_end: 2, action: "drop" };
+  const applied = (wfs: number | null) =>
+    vi.fn(() => ({
+      messages: [{ role: "user", content: "y" }],
+      admitted: [],
+      marksInEffect: 1,
+      changed: true,
+      pendingCount: 0,
+      tokensBefore: 20,
+      tokensAfter: 3,
+      skipped: [],
+      windowFirstSeq: wfs,
+    })) as unknown as MarksReadSide["applyMarks"];
+  function side(over: Partial<MarksReadSide>): MarksReadSide {
+    return {
+      readMarksCached: vi.fn(() => ({ ok: false, marks: [], reason: "not-open" })),
+      readMaxTurnId: vi.fn(() => 0),
+      markMarksApplied: vi.fn(),
+      applyMarks: vi.fn() as unknown as MarksReadSide["applyMarks"],
+      estimateTokensHost: vi.fn(() => 3),
+      ...over,
+    };
+  }
+
+  it("records a plugin-estimated fact for a pass-through assemble", async () => {
+    await createContextEngine(log(), { hostStateRoot: "/w11a" }).assemble({
+      messages: msgs,
+      sessionKey: "agent:main:w11a",
+      tokenBudget: 500,
+    });
+    const fact = getLastAssembleFact("/w11a", "agent:main:w11a");
+    expect(fact).toMatchObject({ tokenBudget: 500, estimator: "plugin", windowFirstSeq: null });
+    expect(fact?.viewTokens).toBeGreaterThan(0);
+    expect(getLastAssembleFact("/other-root", "agent:main:w11a")).toBeUndefined();
+  });
+
+  it("records host estimator, view tokens and windowFirstSeq when marks apply", async () => {
+    const s = side({
+      readMarksCached: vi.fn(() => ({ ok: true, marks: [mark] })),
+      applyMarks: applied(42),
+    });
+    await createContextEngine(log(), { hostStateRoot: "/w11b", loadMarks: async () => s }).assemble(
+      { messages: msgs, sessionKey: "agent:main:w11b", sessionId: "u" }
+    );
+    expect(getLastAssembleFact("/w11b", "agent:main:w11b")).toMatchObject({
+      viewTokens: 3,
+      tokenBudget: null,
+      estimator: "host",
+      windowFirstSeq: 42,
+    });
+  });
+
+  it("falls back to the cached marks index when a later ledger read fails", async () => {
+    const reads = [
+      { ok: true, marks: [mark] },
+      { ok: false, marks: [], reason: "ledger-error" },
+    ];
+    const apply = applied(1);
+    const s = side({ readMarksCached: vi.fn(() => reads.shift()!), applyMarks: apply });
+    const l = log();
+    const engine = createContextEngine(l, { hostStateRoot: "/w11c", loadMarks: async () => s });
+    const p = { messages: msgs, sessionKey: "agent:main:w11c", sessionId: "u" };
+    await engine.assemble(p);
+    const out = await engine.assemble(p);
+    expect(apply).toHaveBeenCalledTimes(2);
+    expect(out.promptAuthority).toBe("assembled");
+    expect(l.warn).toHaveBeenCalledWith(expect.stringContaining("using cached index (1)"));
+  });
+
+  it("never applies one host root's cached marks to another root (R11.1)", async () => {
+    const key = "agent:main:r111-isolation";
+    const base = mkdtempSync(join(tmpdir(), "hs-r111-"));
+    const quiet = { info() {}, warn() {} };
+    function fixture(name: string) {
+      const root = join(base, name);
+      const dbPath = hostDbPathFor(root, key);
+      mkdirSync(dirname(dbPath), { recursive: true });
+      const db = new DatabaseSync(dbPath);
+      db.exec("CREATE TABLE transcript_events(session_id TEXT, seq INTEGER, event_json TEXT)");
+      const insert = db.prepare("INSERT INTO transcript_events VALUES (?,?,?)");
+      const messages: unknown[] = [];
+      for (let turn = 1; turn <= 12; turn++) {
+        for (const role of ["user", "assistant"]) {
+          const message = {
+            role,
+            idempotencyKey: `${name}-${role}-${turn}`,
+            content: [
+              { type: "text", text: `${name} ${role} ${turn}: ` + "synthetic ".repeat(100) },
+            ],
+          };
+          messages.push(message);
+          insert.run(name, messages.length, JSON.stringify({ message }));
+        }
+      }
+      db.close();
+      return { root, messages, sessionId: name };
+    }
+    try {
+      const a = fixture("host-a");
+      const b = fixture("host-b");
+      const m = {
+        mark_id: 1,
+        session_id: a.sessionId,
+        seq_start: 2,
+        seq_end: 2,
+        action: "drop",
+        applied_at: 1,
+      };
+      const realSide = (read: () => { ok: boolean; marks: unknown[]; reason?: string }) =>
+        ({
+          readMarksCached: read,
+          readMaxTurnId: () => 100,
+          markMarksApplied: () => {
+            throw new Error("already-applied mark must not be admitted");
+          },
+          applyMarks,
+          estimateTokensHost,
+        }) as unknown as MarksReadSide;
+      let aRead: { ok: boolean; marks: unknown[]; reason?: string } = { ok: true, marks: [m] };
+      const engineA = createContextEngine(quiet, {
+        hostStateRoot: a.root,
+        loadMarks: async () => realSide(() => aRead),
+      });
+      const engineB = createContextEngine(quiet, {
+        hostStateRoot: b.root,
+        loadMarks: async () => realSide(() => ({ ok: false, marks: [], reason: "not-open" })),
+      });
+      const p = (f: typeof a) => ({
+        messages: f.messages,
+        sessionKey: key,
+        sessionId: f.sessionId,
+      });
+      expect((await engineB.assemble(p(b))).messages.length).toBe(24);
+      expect((await engineA.assemble(p(a))).messages.length).toBe(23);
+      const afterA = await engineB.assemble(p(b));
+      expect(afterA.messages.length).toBe(24);
+      expect(afterA.promptAuthority).toBe("preassembly_may_overflow");
+      expect(getLastAssembleFact(b.root, key)?.estimator).toBe("plugin");
+      // Same-root reuse is preserved: A's own failed read still falls back to A's cached marks.
+      aRead = { ok: false, marks: [], reason: "ledger-error" };
+      const aAgain = await engineA.assemble(p(a));
+      expect(aAgain.messages.length).toBe(23);
+      expect(aAgain.promptAuthority).toBe("assembled");
+    } finally {
+      try {
+        rmSync(base, { recursive: true, force: true });
+      } catch {
+        /* Windows may hold the read-only SeqIndex handle briefly */
+      }
+    }
+  });
+
+  it("shares the fact map across engine instances of one state root", async () => {
+    await createContextEngine(log(), { hostStateRoot: "/w11d" }).assemble({
+      messages: msgs,
+      sessionKey: "agent:main:w11d",
+    });
+    const a = getLastAssembleFact("/w11d", "agent:main:w11d");
+    await createContextEngine(log(), { hostStateRoot: "/w11d" }).assemble({
+      messages: [],
+      sessionKey: "agent:main:w11d",
+    });
+    const b = getLastAssembleFact("/w11d", "agent:main:w11d");
+    expect(a?.viewTokens).toBeGreaterThan(0);
+    expect(b?.viewTokens).toBe(0);
+  });
+
+  it("warns when an assemble is slow", async () => {
+    const now = vi.spyOn(Date, "now");
+    now.mockReturnValueOnce(1000).mockReturnValue(1300);
+    const l = log();
+    try {
+      await createContextEngine(l).assemble({ messages: msgs, sessionKey: "agent:main:w11e" });
+    } finally {
+      now.mockRestore();
+    }
+    expect(l.warn).toHaveBeenCalledWith(expect.stringContaining("assemble took 300ms"));
   });
 });
 
