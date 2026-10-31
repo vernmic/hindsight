@@ -142,7 +142,7 @@ const banksWithDefaultsApplied = new Set<string>();
 
 // In-flight recall deduplication: concurrent recalls for the same bank reuse one promise
 import type { RecallResponse } from "./types.js";
-import { registerHindsightContextEngine } from "./context-engine.js";
+import { marksPolicyFromConfig, registerHindsightContextEngine } from "./context-engine.js";
 import { resolveHostStateRoot } from "./host-paths.js";
 const inflightRecalls = new Map<string, Promise<RecallResponse>>();
 
@@ -2271,6 +2271,10 @@ export function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
         ? config.retainQueueFlushIntervalMs
         : undefined,
     senderPrefixPattern,
+    // Context engine admission overrides: only the typed, supported fields survive; absent ->
+    // undefined, so applyMarks keeps DEFAULT_MARKS_POLICY. (e8cb's loader dropped this field too,
+    // which left its configured knobs unreachable; review 9 R9.1.)
+    astinusMarks: marksPolicyFromConfig(config),
   };
 }
 
@@ -2316,7 +2320,11 @@ export default function (api: MoltbotPluginAPI) {
     } catch {
       engineStateRoot = undefined;
     }
-    registerHindsightContextEngine(api, log, engineStateRoot);
+    // Admission knobs ride the apply context from the live plugin config (re-read per assemble,
+    // so a config reinit is honoured).
+    registerHindsightContextEngine(api, log, engineStateRoot, () =>
+      marksPolicyFromConfig(currentPluginConfig)
+    );
 
     debug("[Hindsight] Plugin loaded successfully (deferred heavy init to gateway start)");
 
