@@ -23,6 +23,7 @@
 // ENGINE ID = PLUGIN ID ("hindsight-openclaw"): the host reads
 // plugins.slots.contextEngine both as the owning plugin id and as the engine id.
 import { join } from "node:path";
+import type { MarksAdmissionPolicy } from "./assemble-marks.js";
 import { ENGINE_ID } from "./engine-compat.js";
 
 type Logger = { info(msg: string): void; warn(msg: string): void };
@@ -102,7 +103,21 @@ export type ContextEngineOptions = {
   /** Host instance state root (runtime.state.resolveStateDir); marks are skipped without it. */
   hostStateRoot?: string;
   loadMarks?: () => Promise<MarksReadSide>;
+  /** Admission overrides from plugin config (`astinusMarks`); DEFAULT_MARKS_POLICY otherwise. */
+  getPolicy?: () => Partial<MarksAdmissionPolicy> | undefined;
 };
+
+/** Plugin config `astinusMarks` -> admission overrides (e8cb index.ts astinusMarksPolicy). */
+export function marksPolicyFromConfig(config: unknown): Partial<MarksAdmissionPolicy> | undefined {
+  const raw = (config as { astinusMarks?: Record<string, unknown> } | undefined)?.astinusMarks;
+  if (!raw || typeof raw !== "object") return undefined;
+  const out: Partial<MarksAdmissionPolicy> = {};
+  if (typeof raw.minPressure === "number") out.minPressure = raw.minPressure;
+  if (typeof raw.admitShare === "boolean") out.admitShare = raw.admitShare;
+  if (typeof raw.debounceTurns === "number") out.debounceTurns = raw.debounceTurns;
+  if (typeof raw.criticalPressure === "number") out.criticalPressure = raw.criticalPressure;
+  return Object.keys(out).length > 0 ? out : undefined;
+}
 
 /** Host transcript store for an agent session key (generalized from e8cb's fixed workspace path). */
 export function hostDbPathFor(hostStateRoot: string, sessionKey: string): string {
@@ -151,6 +166,8 @@ export function createContextEngine(log: Logger, options: ContextEngineOptions =
               // B1: transcript rows are keyed by the HOST session UUID, never the session key.
               sessionId: params.sessionId,
               tokenBudget: params.tokenBudget ?? 0,
+              // Review answer 1 (e8cb): the admission knobs ride the apply context from plugin config.
+              policy: options.getPolicy?.(),
               // The session state document (lastCommittedSeq fallback) is not ported yet.
               turnCounter: side.readMaxTurnId(key) ?? 0,
             });
@@ -221,7 +238,8 @@ export function createContextEngine(log: Logger, options: ContextEngineOptions =
 export function registerHindsightContextEngine(
   api: { registerContextEngine?: RegisterContextEngine },
   log: Logger,
-  hostStateRoot?: string
+  hostStateRoot?: string,
+  getPolicy?: () => Partial<MarksAdmissionPolicy> | undefined
 ): boolean {
   const register = api.registerContextEngine;
   if (typeof register !== "function") {
@@ -229,7 +247,7 @@ export function registerHindsightContextEngine(
     return false;
   }
   try {
-    register.call(api, ENGINE_ID, () => createContextEngine(log, { hostStateRoot }));
+    register.call(api, ENGINE_ID, () => createContextEngine(log, { hostStateRoot, getPolicy }));
     return true;
   } catch (e) {
     log.warn(`[hindsight-engine] registerContextEngine failed: ${(e as Error)?.message ?? e}`);
