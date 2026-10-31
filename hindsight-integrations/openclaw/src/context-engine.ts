@@ -25,6 +25,7 @@
 import { join } from "node:path";
 import type { MarksAdmissionPolicy } from "./assemble-marks.js";
 import { ENGINE_ID } from "./engine-compat.js";
+import { loadSessionStateCached } from "./session-state.js";
 
 type Logger = { info(msg: string): void; warn(msg: string): void };
 
@@ -218,6 +219,8 @@ export function createContextEngine(log: Logger, options: ContextEngineOptions =
           }
           marksSeen = marks.length;
           if (marks.length > 0) {
+            // Durable state document (e8cb loadSessionStateCached): generation stamp + seq counter.
+            const state = loadSessionStateCached(options.hostStateRoot ?? "", key);
             const res = side.applyMarks(list, marks as never, {
               sessionKey: key,
               hostDbPath,
@@ -226,8 +229,9 @@ export function createContextEngine(log: Logger, options: ContextEngineOptions =
               tokenBudget: params.tokenBudget ?? 0,
               // Review answer 1 (e8cb): the admission knobs ride the apply context from plugin config.
               policy: options.getPolicy?.(),
-              // The session state document (lastCommittedSeq fallback) is not ported yet.
-              turnCounter: side.readMaxTurnId(key) ?? 0,
+              // e8cb M1: the debounce counts TURNS off the ledger; the durable seq counter
+              // (state.lastCommittedSeq) is only the cold-handle fallback.
+              turnCounter: side.readMaxTurnId(key) ?? state.lastCommittedSeq,
             });
             if (res.readError) {
               log.warn(
@@ -241,8 +245,13 @@ export function createContextEngine(log: Logger, options: ContextEngineOptions =
             marksInEffect = res.marksInEffect;
             const admittedIds = res.admitted.map((m) => m.mark_id);
             if (admittedIds.length > 0) {
-              // Generation stamp comes from the unported state document; "" as e8cb's cold default.
-              side.markMarksApplied(key, admittedIds, "", res.tokensBefore, res.tokensAfter);
+              side.markMarksApplied(
+                key,
+                admittedIds,
+                state.lastGenerationSeen ?? "",
+                res.tokensBefore,
+                res.tokensAfter
+              );
             }
             if (res.changed || marksInEffect > 0) {
               log.info(
