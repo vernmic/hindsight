@@ -4,28 +4,57 @@ One versioned JSON record per (kind, exact proposal), written atomically before 
 Records are recommendations only: nothing here returns, stores or replays an approval, and no outcome
 of capture or delivery changes what the host already decided. A worker implementing one must obtain a
 fresh policy judgment through the normal ``skill_manage`` path.
+
+Every read-modify-write of a record runs under one store-wide OS file lock (the host's own
+``agent.trajectory._lock_append_handle``), so capture, delivery acknowledgement and ``mark`` are
+serialized across threads, store instances and processes sharing ``root``. The lock is never held
+during board I/O: delivery snapshots the record, talks to the board unlocked, then commits against a
+fresh read, so it only ever moves a record forward.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import tempfile
 import time
+import uuid
 from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Protocol
 
-SCHEMA = "jev-skill-recommendation/1"
+SCHEMA = "jev-skill-recommendation/2"
 KINDS = {"Skill batch policy denied: ": "declined", "Skill batch policy unavailable: ": "unavailable"}
-OPEN = ("pending_delivery", "delivered", "reviewed")
+STATES = ("pending_delivery", "delivered", "reviewed", "implemented")
 NEXT = {"pending_delivery": {"reviewed"}, "delivered": {"reviewed"}, "reviewed": {"implemented"}}
 INSTRUCTION = (
     "Recommendation only, not an approval. Before implementing, re-read each named skill and compare its "
     "sha256 with skill_sha256; if it changed, re-plan against the current content. Apply the change through "
     "skill_manage so the current skill policy judges it afresh. Do not use any other write path."
 )
+_OPT = type(None)
+FIELDS: dict[str, Any] = {  # the full record shape; a file that does not match it is never trusted
+    "schema": str,
+    "key": str,
+    "cycle": str,
+    "kind": str,
+    "reason": str,
+    "operations": (list, _OPT),
+    "operations_sha256": str,
+    "skill_sha256": dict,
+    "source": dict,
+    "instruction": str,
+    "status": str,
+    "receipts": list,
+    "sightings": int,
+    "delivery": (str, _OPT),
+    "created_ms": int,
+    "updated_ms": int,
+}
+logger = logging.getLogger(__name__)
 
 
 def canonical(value: object) -> str:
@@ -55,6 +84,28 @@ def proposal_operations(args: Mapping[str, Any]) -> list[dict[str, Any]]:
     return [{k: v for k, v in args.items() if v is not None and k != "session_id"}]
 
 
+def invalid(record: object, key: str) -> str | None:
+    """Why ``record`` is not a trustworthy ``SCHEMA`` record for ``key``, or ``None`` when it is."""
+    if not isinstance(record, dict):
+        return "not an object"
+    for name, types in FIELDS.items():
+        value = record.get(name)
+        if not isinstance(value, types) or (types is int and isinstance(value, bool)):
+            return f"field {name!r} missing or wrong type"
+    checks = {
+        "schema": record["schema"] == SCHEMA,
+        "key": record["key"] == key,
+        "kind": record["kind"] in KINDS.values(),
+        "status": record["status"] in STATES,
+        "sightings": record["sightings"] >= 1,
+        "receipts": all(isinstance(r, dict) and r.get("status") in STATES for r in record["receipts"]),
+        "skill_sha256": all(isinstance(v, (str, _OPT)) for v in record["skill_sha256"].values()),
+        "operations": record["operations"] is None
+        or sha256(canonical(record["operations"])) == record["operations_sha256"],
+    }
+    return next((f"field {name!r} invalid" for name, ok in checks.items() if not ok), None)
+
+
 class Board(Protocol):
     """Optional task board. ``find`` must look a card up by the idempotency key ``create`` was given;
     an adapter that cannot do that only offers at-least-once delivery and must say so."""
@@ -72,112 +123,144 @@ class RecommendationStore:
     def _path(self, key: str) -> Path:
         return self.root / f"{key}.json"
 
-    def _write(self, record: dict[str, Any]) -> None:
-        record["updated_ms"] = int(time.time() * 1000)
+    @contextmanager
+    def _locked(self) -> Iterator[None]:
+        from agent.trajectory import _lock_append_handle  # host helper: flock / msvcrt range lock
+
         self.root.mkdir(parents=True, exist_ok=True)
+        with open(self.root / ".lock", "a", encoding="utf-8") as handle:
+            _lock_append_handle(handle, True)
+            try:
+                yield
+            finally:
+                _lock_append_handle(handle, False)
+
+    def _write(self, record: dict[str, Any], path: Path | None = None) -> None:
+        record["updated_ms"] = int(time.time() * 1000)
         fd, tmp = tempfile.mkstemp(dir=self.root, prefix=".tmp-", suffix=".partial")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 handle.write(canonical(record))
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(tmp, self._path(record["key"]))
+            os.replace(tmp, path or self._path(record["key"]))
         except BaseException:
             Path(tmp).unlink(missing_ok=True)
             raise
 
     def load(self, key: str) -> dict[str, Any] | None:
-        """The record, ``None`` if absent. A corrupt or other-schema file is set aside (renamed, never
-        deleted) and reported as absent so a fresh capture can replace it."""
+        """The validated record, ``None`` if absent. Undecodable or invalid content is quarantined
+        (renamed ``*.invalid-<ms>``, never deleted; the reason is logged) and reported as absent.
+        Permission and other I/O errors are raised, not mistaken for bad data."""
         path = self._path(key)
         try:
             record = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(record, dict) and record.get("schema") == SCHEMA and record.get("key") == key:
-                return record
         except FileNotFoundError:
             return None
-        except (OSError, ValueError):
-            pass
-        path.replace(path.with_name(f"{path.name}.unreadable-{int(time.time() * 1000)}"))
+        except ValueError as exc:
+            problem = f"undecodable: {exc}"
+        else:
+            problem = invalid(record, key)
+            if problem is None:
+                return record
+        quarantine = path.with_name(f"{path.name}.invalid-{int(time.time() * 1000)}")
+        path.replace(quarantine)
+        logger.warning("skill recommendation %s quarantined as %s: %s", key, quarantine.name, problem)
         return None
 
     def records(self) -> Iterator[dict[str, Any]]:
         for path in sorted(self.root.glob("*.json")):
-            record = self.load(path.stem)
+            with self._locked():
+                record = self.load(path.stem)
             if record is not None:
                 yield record
 
     # -- capture -----------------------------------------------------------------------------------
     def capture(self, kind: str, reason: str, args: Mapping[str, Any], source: Mapping[str, Any]) -> dict:
-        """Persist (or re-sight) the recommendation; returns it only after it is on disk."""
+        """Persist (or re-sight) the recommendation; returns it only after it is on disk. Re-refusing an
+        implemented proposal opens a new review cycle (new ``cycle`` id, so a new board card) and keeps
+        the finished cycle as ``<key>.json.implemented-<cycle>``."""
         operations = proposal_operations(args)
         key = sha256(canonical({"kind": kind, "operations": operations}))
-        record = self.load(key)
-        if record is not None and record["status"] == "implemented":
-            path = self._path(key)
-            path.replace(path.with_name(f"{path.name}.implemented-{record['updated_ms']}"))
-            record = None
-        if record is None:
-            names = sorted({str(op.get("name")) for op in operations if op.get("name")})
-            record = {
-                "schema": SCHEMA,
-                "key": key,
-                "kind": kind,
-                "reason": reason,
-                "operations": operations if self.store_bodies else None,
-                "operations_sha256": sha256(canonical(operations)),
-                "skill_sha256": {name: self._skill_hash(name) for name in names},
-                "source": dict(source),
-                "instruction": INSTRUCTION,
-                "status": "pending_delivery",
-                "receipts": [],
-                "sightings": 0,
-                "delivery": None,
-                "created_ms": int(time.time() * 1000),
-            }
-        record["sightings"] += 1
-        self._write(record)
+        with self._locked():
+            record = self.load(key)
+            if record is not None and record["status"] == "implemented":
+                self._write(record, self._path(key).with_name(f"{key}.json.implemented-{record['cycle']}"))
+                record = None
+            if record is None:
+                names = sorted({str(op.get("name")) for op in operations if op.get("name")})
+                record = {
+                    "schema": SCHEMA,
+                    "key": key,
+                    "cycle": uuid.uuid4().hex,
+                    "kind": kind,
+                    "reason": reason,
+                    "operations": operations if self.store_bodies else None,
+                    "operations_sha256": sha256(canonical(operations)),
+                    "skill_sha256": {name: self._skill_hash(name) for name in names},
+                    "source": dict(source),
+                    "instruction": INSTRUCTION,
+                    "status": "pending_delivery",
+                    "receipts": [],
+                    "sightings": 0,
+                    "delivery": None,
+                    "created_ms": int(time.time() * 1000),
+                }
+            record["sightings"] += 1
+            self._write(record)
         return record
 
     # -- delivery ----------------------------------------------------------------------------------
     def deliver_pending(self, board: Board) -> dict[str, str]:
-        """At most one card per record. Each attempt first reconciles by idempotency key, so a crash or
-        lost acknowledgement after ``create`` never yields a second card. Failures leave it pending."""
+        """At most one card per record cycle. Each attempt first reconciles by the cycle's idempotency key
+        (``<key>:<cycle>``), so a crash or lost acknowledgement after ``create`` never yields a second card,
+        while a reopened proposal gets its own. The result is committed to a fresh read under the lock,
+        moving the record forward only. Failures leave it pending; an unreadable record is reported and
+        skipped so later records still recover."""
         results = {}
-        for record in self.records():
-            if record["status"] != "pending_delivery":
-                continue
-            card = {
-                k: record[k]
-                for k in ("kind", "reason", "operations", "operations_sha256", "skill_sha256", "source", "instruction")
-            }
+        for path in sorted(self.root.glob("*.json")):
+            key = path.stem
             try:
-                receipt = board.find(record["key"])
-                if receipt is None:
-                    record["delivery"] = "attempting"
+                with self._locked():
+                    snapshot = self.load(key)
+                if snapshot is None or snapshot["status"] != "pending_delivery":
+                    continue
+                card_key = f"{key}:{snapshot['cycle']}"
+                card = {k: snapshot[k] for k in ("kind", "reason", "operations", "operations_sha256")}
+                card.update({k: snapshot[k] for k in ("skill_sha256", "source", "instruction")})
+                try:
+                    receipt = board.find(card_key) or board.create(card_key, card)
+                    if not receipt:
+                        raise ValueError("board returned no receipt")
+                    outcome = "delivered"
+                except Exception as exc:  # timeout, outage, bad adapter: retry later, reconcile first
+                    outcome = f"uncertain:{type(exc).__name__}"
+                with self._locked():
+                    record = self.load(key)
+                    if record is None or record["cycle"] != snapshot["cycle"]:
+                        results[key] = "superseded"
+                        continue
+                    if outcome == "delivered":
+                        record["receipts"].append({"status": "delivered", **receipt})
+                        if record["status"] == "pending_delivery":
+                            record["status"] = "delivered"
+                    if record["delivery"] != "delivered":
+                        record["delivery"] = outcome
                     self._write(record)
-                    receipt = board.create(record["key"], card)
-                if not receipt:
-                    raise ValueError("board returned no receipt")
-            except Exception as exc:  # timeout, outage, bad adapter: retry later, reconcile first
-                record["delivery"] = f"uncertain:{type(exc).__name__}"
-                self._write(record)
-                results[record["key"]] = record["delivery"]
-                continue
-            record.update(status="delivered", delivery="delivered")
-            record["receipts"].append({"status": "delivered", **receipt})
-            self._write(record)
-            results[record["key"]] = "delivered"
+                results[key] = outcome
+            except OSError as exc:  # permission / storage failure: explicit, not treated as corrupt data
+                results[key] = f"error:{type(exc).__name__}"
         return results
 
     def mark(self, key: str, status: str, receipt: Mapping[str, Any]) -> dict[str, Any]:
         """``reviewed`` / ``implemented`` only with an actual receipt; a card existing is not one."""
-        record = self.load(key)
-        if record is None or status not in NEXT.get(record["status"], ()) or not receipt:
-            raise ValueError(f"cannot mark {key} {status}")
-        record["status"] = status
-        record["receipts"].append({"status": status, **receipt})
-        self._write(record)
+        with self._locked():
+            record = self.load(key)
+            if record is None or status not in NEXT.get(record["status"], ()) or not receipt:
+                raise ValueError(f"cannot mark {key} {status}")
+            record["status"] = status
+            record["receipts"].append({"status": status, **receipt})
+            self._write(record)
         return record
 
     def stale_skills(self, record: Mapping[str, Any]) -> list[str]:

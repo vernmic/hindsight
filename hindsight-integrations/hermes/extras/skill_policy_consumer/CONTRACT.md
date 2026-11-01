@@ -138,7 +138,7 @@ carried `pre_skill_write` gate is not retired by W02.
   `Skill batch policy unavailable:` -> `unavailable`). No host change. It returns nothing, so no capture
   or delivery outcome can change, weaken or authorize the host decision. Calls whose `post_tool_call`
   is suppressed by the host are not observed.
-- Record: one versioned JSON file (`jev-skill-recommendation/1`) per (kind, exact proposed operations),
+- Record: one versioned JSON file (`jev-skill-recommendation/2`) per (kind, exact proposed operations),
   written atomically (temp file, fsync, replace) before capture is reported. It holds the proposed
   operations (or only their sha256 when `store_bodies: false`), refusal reason, source ids
   (session/task/tool call/turn), the current SKILL.md sha256 of each named skill (or `null`) and a
@@ -146,12 +146,21 @@ carried `pre_skill_write` gate is not retired by W02.
   the open record; a different payload is a different record even for the same skill name.
 - States: `pending_delivery` -> `delivered` (board receipt) -> `reviewed` -> `implemented`; the last two
   need an explicit receipt and never follow from a card existing. An implemented record is archived by
-  rename when the same proposal is refused again. A corrupt or foreign-schema file is renamed aside,
-  never trusted or deleted.
+  copy when the same proposal is refused again, and the new record opens a new review cycle (`cycle` id).
+  Every load validates the full record shape (field types, state, kind, receipts, operations hash);
+  undecodable or invalid content is quarantined (`*.invalid-<ms>`, reason logged), never trusted or
+  deleted, and recovery continues with the next record. Permission and other I/O errors are reported,
+  not treated as bad data.
+- Serialization: every read-modify-write (capture, delivery acknowledgement, `mark`) runs under one
+  store-wide OS file lock (`<root>/.lock`, the host's `agent.trajectory._lock_append_handle`), across
+  threads, store instances and processes sharing `root`. Board I/O runs unlocked; delivery commits to a
+  fresh read and only moves a record forward, so concurrent worker states and sightings are kept.
 - Board (optional, `board_callable: "module:attr"` returning an adapter with `find(key)` and
-  `create(key, card)`): every attempt reconciles by idempotency key before creating, so a crash or a
-  lost acknowledgement does not create a second card. An adapter without lookup by key only gives
-  at-least-once delivery. Failures leave the record pending; pending records are retried at plugin
+  `create(key, card)`): the idempotency key is `<record key>:<cycle>`, so retries within a cycle reuse
+  its card and a reopened proposal gets a new one. Every attempt reconciles by that key before creating,
+  so a crash or a lost acknowledgement does not create a second card. An adapter without lookup by key,
+  or two processes delivering the same record at the same moment against a board whose `create` is not
+  idempotent by key, only gives at-least-once delivery (one pass at a time within a process). Failures leave the record pending; pending records are retried at plugin
   start and after each new capture. With no board configured the record directory under the profile
   (`root`, default `<HERMES_HOME>/jev-skill-recommendations`) is the local recommendation route.
 - Not covered: a recommendation to review the result of a separately authorized fallback write

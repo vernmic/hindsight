@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -20,7 +22,7 @@ model_tools = pytest.importorskip("model_tools")
 pytestmark = pytest.mark.skipif("pre_skill_batch" not in plugins.VALID_HOOKS, reason="stock host")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "recommendations"))
-from store import RecommendationStore, refusal_kind  # noqa: E402
+from store import SCHEMA, RecommendationStore, refusal_kind  # noqa: E402
 from test_pr57703_host_probe import SKILL, skills_root, tree  # noqa: E402
 
 PACKAGE = Path(__file__).resolve().parents[1]
@@ -136,7 +138,86 @@ def test_corrupt_or_foreign_record_is_set_aside_not_trusted(store):
     assert store.capture("declined", "d", ARGS, SRC)["sightings"] == 1
     (store.root / f"{key}.json").write_text(json.dumps({"schema": "other/9", "key": key}), encoding="utf-8")
     assert store.load(key) is None
-    assert len(list(store.root.glob(f"{key}.json.unreadable-*"))) == 2
+    assert len(list(store.root.glob(f"{key}.json.invalid-*"))) == 2
+
+
+def test_delivery_commits_forward_while_a_worker_and_capture_run_during_board_io(store, hashes):
+    key = store.capture("declined", "d", ARGS, SRC)["key"]
+    other, board = RecommendationStore(store.root, skill_hash=hashes.get), Board()  # second instance
+    create, done = board.create, threading.Event()
+
+    def during(card_key, card):
+        receipt = create(card_key, card)
+
+        def worker():
+            other.capture("declined", "d", ARGS, SRC)
+            other.mark(key, "reviewed", {"by": "reviewer"})
+            other.mark(key, "implemented", {"commit": "abc"})
+            done.set()
+
+        threading.Thread(target=worker).start()
+        assert done.wait(10), "store lock must not be held during board I/O"
+        return receipt
+
+    board.create = during
+    assert store.deliver_pending(board) == {key: "delivered"}
+    record = store.load(key)
+    assert record["status"] == "implemented" and record["sightings"] == 2 and record["delivery"] == "delivered"
+    assert [r["status"] for r in record["receipts"]] == ["reviewed", "implemented", "delivered"]
+
+
+def test_captures_from_several_processes_are_serialized(store):
+    script = (
+        f"import sys; sys.path[:0] = {sys.path!r}; from store import RecommendationStore\n"
+        f"s = RecommendationStore({str(store.root)!r}, skill_hash=lambda n: None)\n"
+        f"for _ in range(25): s.capture('declined', 'd', {ARGS!r}, {{}})"
+    )
+    procs = [subprocess.Popen([sys.executable, "-c", script]) for _ in range(4)]
+    assert [p.wait(timeout=120) for p in procs] == [0] * 4
+    (record,) = store.records()
+    assert record["sightings"] == 100
+
+
+def test_reopened_proposal_gets_a_new_card_with_refreshed_hashes(store, hashes):
+    board = Board()
+    key = store.capture("declined", "d", ARGS, SRC)["key"]
+    store.deliver_pending(board)
+    store.mark(key, "reviewed", {"by": "reviewer"})
+    store.mark(key, "implemented", {"commit": "abc"})
+    next(iter(board.cards.values()))["done"] = True  # the board models the completed task
+    hashes["demo"] = "h2"
+    store.capture("declined", "d", ARGS, SRC)
+    assert store.capture("declined", "d", ARGS, SRC)["sightings"] == 2  # an open cycle still dedups
+    board.lose_ack = True
+    assert store.deliver_pending(board) == {key: "uncertain:TimeoutError"}
+    board.lose_ack = False
+    restarted = RecommendationStore(store.root, skill_hash=hashes.get)
+    assert restarted.deliver_pending(board) == {key: "delivered"}
+    assert board.creates == 2 and len(board.cards) == 2
+    new = [c for c in board.cards.values() if "done" not in c]
+    assert len(new) == 1 and new[0]["skill_sha256"] == {"demo": "h2"}
+    assert restarted.load(key)["receipts"] == [{"status": "delivered", "card": "card-2"}]
+    assert len(list(store.root.glob(f"{key}.json.implemented-*"))) == 1
+
+
+def test_invalid_same_version_records_are_quarantined_and_recovery_continues(store, monkeypatch):
+    good = store.capture("declined", "d", ARGS, SRC)["key"]
+    bare = "0" * 64  # sorts first: an early bad record must not block later ones
+    (store.root / f"{bare}.json").write_text(json.dumps({"schema": SCHEMA, "key": bare}), encoding="utf-8")
+    typed = store.capture("unavailable", "u", ARGS, SRC)
+    (store.root / f"{typed['key']}.json").write_text(json.dumps({**typed, "sightings": "1"}), encoding="utf-8")
+    denied = store.capture("declined", "d", {"operations": [{**ARGS["operations"][0], "content": "y"}]}, SRC)["key"]
+    read_text = Path.read_text
+
+    def guarded(self, *args, **kwargs):
+        if self.name == f"{denied}.json":
+            raise PermissionError("synthetic denied")
+        return read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", guarded)
+    assert store.deliver_pending(Board()) == {good: "delivered", denied: "error:PermissionError"}
+    assert (store.root / f"{denied}.json").exists()  # an I/O failure is not mistaken for bad data
+    assert len(list(store.root.glob("*.json.invalid-*"))) == 2
 
 
 def test_recording_failure_raises_to_the_caller_without_a_partial_record(tmp_path):
