@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import threading
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -70,10 +71,10 @@ def test_refusal_text_classification():
 def test_decline_and_unavailable_are_distinct_and_persisted_before_return(store):
     declined = store.capture("declined", "d", ARGS, SRC)
     unavailable = store.capture("unavailable", "u", ARGS, SRC)
-    assert declined["key"] != unavailable["key"]
+    assert declined.key != unavailable.key
     for record in (declined, unavailable):
-        on_disk = json.loads((store.root / f"{record['key']}.json").read_text(encoding="utf-8"))
-        assert on_disk == record and on_disk["status"] == "pending_delivery"
+        on_disk = json.loads((store.root / f"{record.key}.json").read_text(encoding="utf-8"))
+        assert on_disk == asdict(record) and on_disk["status"] == "pending_delivery"
         assert on_disk["skill_sha256"] == {"demo": "h1"} and "not an approval" in on_disk["instruction"]
         assert on_disk["operations"] == ARGS["operations"]
 
@@ -82,8 +83,8 @@ def test_duplicates_reuse_the_record_and_changed_payloads_do_not(store):
     first = store.capture("declined", "d", ARGS, SRC)
     again = store.capture("declined", "d", ARGS, SRC)
     changed = store.capture("declined", "d", {"operations": [{**ARGS["operations"][0], "content": "x"}]}, SRC)
-    assert again["key"] == first["key"] and again["sightings"] == 2
-    assert changed["key"] != first["key"] and len(list(store.records())) == 2
+    assert again.key == first.key and again.sightings == 2
+    assert changed.key != first.key and len(list(store.records())) == 2
 
 
 def test_flat_calls_capture_their_non_null_fields(store):
@@ -93,20 +94,20 @@ def test_flat_calls_capture_their_non_null_fields(store):
         {"action": "patch", "name": "demo", "content": None, "old_string": "a", "new_string": "b", "session_id": "x"},
         SRC,
     )
-    assert record["operations"] == [{"action": "patch", "name": "demo", "old_string": "a", "new_string": "b"}]
+    assert record.operations == [{"action": "patch", "name": "demo", "old_string": "a", "new_string": "b"}]
 
 
 def test_redacted_bodies_keep_only_identity(tmp_path):
     store = RecommendationStore(tmp_path, store_bodies=False, skill_hash=lambda n: None)
     record = store.capture("declined", "d", ARGS, SRC)
-    assert record["operations"] is None and len(record["operations_sha256"]) == 64
+    assert record.operations is None and len(record.operations_sha256) == 64
 
 
 def test_delivery_retries_after_restart_and_reconciles_a_lost_ack(store, tmp_path, hashes):
-    key = store.capture("declined", "d", ARGS, SRC)["key"]
+    key = store.capture("declined", "d", ARGS, SRC).key
     down = Board(fail=True)
     assert store.deliver_pending(down) == {key: "uncertain:ConnectionError"}
-    assert store.load(key)["status"] == "pending_delivery"
+    assert store.load(key).status == "pending_delivery"
     lossy = Board(lose_ack=True)
     assert store.deliver_pending(lossy)[key] == "uncertain:TimeoutError"
     restarted = RecommendationStore(store.root, skill_hash=hashes.get)
@@ -114,35 +115,68 @@ def test_delivery_retries_after_restart_and_reconciles_a_lost_ack(store, tmp_pat
     assert lossy.creates == 1 and len(lossy.cards) == 1
     assert restarted.deliver_pending(lossy) == {}
     record = restarted.load(key)
-    assert record["status"] == "delivered" and record["receipts"] == [{"status": "delivered", "card": "card-1"}]
+    assert record.status == "delivered"
+    assert record.receipts == [{"status": "delivered", "card": "card-1", "cycle": record.cycle}]
 
 
 def test_status_needs_real_receipts_and_order(store):
-    key = store.capture("declined", "d", ARGS, SRC)["key"]
+    card_key = store.capture("declined", "d", ARGS, SRC).card_key
     store.deliver_pending(Board())
     with pytest.raises(ValueError):
-        store.mark(key, "implemented", {"by": "w"})
+        store.mark(card_key, "implemented", {"by": "w"})
     with pytest.raises(ValueError):
-        store.mark(key, "reviewed", {})
-    store.mark(key, "reviewed", {"by": "reviewer"})
-    assert store.mark(key, "implemented", {"commit": "abc"})["status"] == "implemented"
+        store.mark(card_key, "reviewed", {})
+    store.mark(card_key, "reviewed", {"by": "reviewer"})
+    store.mark(card_key, "reviewed", {"by": "reviewer"})  # a retried acknowledgement changes nothing
+    record = store.mark(card_key, "implemented", {"commit": "abc"})
+    assert [r["status"] for r in record.receipts] == ["delivered", "reviewed", "implemented"]
     reopened = store.capture("declined", "d", ARGS, SRC)
-    assert reopened["status"] == "pending_delivery" and reopened["sightings"] == 1
+    assert reopened.status == "pending_delivery" and reopened.sightings == 1
     assert len(list(store.root.glob("*.json.implemented-*"))) == 1
 
 
+def test_stale_cycle_acknowledgements_are_rejected_without_change(store, hashes):
+    first = store.capture("declined", "d", ARGS, SRC)
+    store.deliver_pending(Board())
+    other = RecommendationStore(store.root, skill_hash=hashes.get)  # a worker in another store instance
+    held, go, outcome = other.load(first.key), threading.Event(), {}
+
+    def slow_worker():  # still holds its cycle-A snapshot while A completes and B opens
+        go.wait(10)
+        try:
+            other.mark(held.card_key, "reviewed", {"by": "slow worker"})
+        except ValueError as exc:
+            outcome["error"] = str(exc)
+
+    worker = threading.Thread(target=slow_worker)
+    worker.start()
+    store.mark(first.card_key, "reviewed", {"by": "reviewer"})
+    store.mark(first.card_key, "implemented", {"commit": "abc"})
+    reopened = store.capture("declined", "d", ARGS, SRC)  # cycle B, not reviewed
+    go.set()
+    worker.join(10)
+    assert "stale" in outcome["error"]
+    for status in ("reviewed", "implemented"):  # duplicate cycle-A receipts through the public API
+        with pytest.raises(ValueError, match="stale"):
+            store.mark(first.card_key, status, {"commit": "abc"})
+    current = store.load(first.key)
+    assert current.cycle == reopened.cycle != first.cycle
+    assert current.status == "pending_delivery" and current.receipts == []
+    assert store.mark(reopened.card_key, "reviewed", {"by": "reviewer"}).status == "reviewed"
+
+
 def test_corrupt_or_foreign_record_is_set_aside_not_trusted(store):
-    key = store.capture("declined", "d", ARGS, SRC)["key"]
+    key = store.capture("declined", "d", ARGS, SRC).key
     (store.root / f"{key}.json").write_text("{not json", encoding="utf-8")
     assert list(store.records()) == []
-    assert store.capture("declined", "d", ARGS, SRC)["sightings"] == 1
+    assert store.capture("declined", "d", ARGS, SRC).sightings == 1
     (store.root / f"{key}.json").write_text(json.dumps({"schema": "other/9", "key": key}), encoding="utf-8")
     assert store.load(key) is None
     assert len(list(store.root.glob(f"{key}.json.invalid-*"))) == 2
 
 
 def test_delivery_commits_forward_while_a_worker_and_capture_run_during_board_io(store, hashes):
-    key = store.capture("declined", "d", ARGS, SRC)["key"]
+    captured = store.capture("declined", "d", ARGS, SRC)
     other, board = RecommendationStore(store.root, skill_hash=hashes.get), Board()  # second instance
     create, done = board.create, threading.Event()
 
@@ -151,8 +185,8 @@ def test_delivery_commits_forward_while_a_worker_and_capture_run_during_board_io
 
         def worker():
             other.capture("declined", "d", ARGS, SRC)
-            other.mark(key, "reviewed", {"by": "reviewer"})
-            other.mark(key, "implemented", {"commit": "abc"})
+            other.mark(card_key, "reviewed", {"by": "reviewer"})
+            other.mark(card_key, "implemented", {"commit": "abc"})
             done.set()
 
         threading.Thread(target=worker).start()
@@ -160,10 +194,10 @@ def test_delivery_commits_forward_while_a_worker_and_capture_run_during_board_io
         return receipt
 
     board.create = during
-    assert store.deliver_pending(board) == {key: "delivered"}
-    record = store.load(key)
-    assert record["status"] == "implemented" and record["sightings"] == 2 and record["delivery"] == "delivered"
-    assert [r["status"] for r in record["receipts"]] == ["reviewed", "implemented", "delivered"]
+    assert store.deliver_pending(board) == {captured.key: "delivered"}
+    record = store.load(captured.key)
+    assert record.status == "implemented" and record.sightings == 2 and record.delivery == "delivered"
+    assert [r["status"] for r in record.receipts] == ["reviewed", "implemented", "delivered"]
 
 
 def test_captures_from_several_processes_are_serialized(store):
@@ -175,38 +209,41 @@ def test_captures_from_several_processes_are_serialized(store):
     procs = [subprocess.Popen([sys.executable, "-c", script]) for _ in range(4)]
     assert [p.wait(timeout=120) for p in procs] == [0] * 4
     (record,) = store.records()
-    assert record["sightings"] == 100
+    assert record.sightings == 100
 
 
 def test_reopened_proposal_gets_a_new_card_with_refreshed_hashes(store, hashes):
     board = Board()
-    key = store.capture("declined", "d", ARGS, SRC)["key"]
+    first = store.capture("declined", "d", ARGS, SRC)
     store.deliver_pending(board)
-    store.mark(key, "reviewed", {"by": "reviewer"})
-    store.mark(key, "implemented", {"commit": "abc"})
+    store.mark(first.card_key, "reviewed", {"by": "reviewer"})
+    store.mark(first.card_key, "implemented", {"commit": "abc"})
     next(iter(board.cards.values()))["done"] = True  # the board models the completed task
     hashes["demo"] = "h2"
     store.capture("declined", "d", ARGS, SRC)
-    assert store.capture("declined", "d", ARGS, SRC)["sightings"] == 2  # an open cycle still dedups
+    assert store.capture("declined", "d", ARGS, SRC).sightings == 2  # an open cycle still dedups
     board.lose_ack = True
-    assert store.deliver_pending(board) == {key: "uncertain:TimeoutError"}
+    assert store.deliver_pending(board) == {first.key: "uncertain:TimeoutError"}
     board.lose_ack = False
     restarted = RecommendationStore(store.root, skill_hash=hashes.get)
-    assert restarted.deliver_pending(board) == {key: "delivered"}
+    assert restarted.deliver_pending(board) == {first.key: "delivered"}
     assert board.creates == 2 and len(board.cards) == 2
     new = [c for c in board.cards.values() if "done" not in c]
     assert len(new) == 1 and new[0]["skill_sha256"] == {"demo": "h2"}
-    assert restarted.load(key)["receipts"] == [{"status": "delivered", "card": "card-2"}]
-    assert len(list(store.root.glob(f"{key}.json.implemented-*"))) == 1
+    record = restarted.load(first.key)
+    assert new[0]["card_key"] == record.card_key != first.card_key
+    assert record.receipts == [{"status": "delivered", "card": "card-2", "cycle": record.cycle}]
+    assert len(list(store.root.glob(f"{first.key}.json.implemented-*"))) == 1
 
 
 def test_invalid_same_version_records_are_quarantined_and_recovery_continues(store, monkeypatch):
-    good = store.capture("declined", "d", ARGS, SRC)["key"]
+    good = store.capture("declined", "d", ARGS, SRC).key
     bare = "0" * 64  # sorts first: an early bad record must not block later ones
     (store.root / f"{bare}.json").write_text(json.dumps({"schema": SCHEMA, "key": bare}), encoding="utf-8")
     typed = store.capture("unavailable", "u", ARGS, SRC)
-    (store.root / f"{typed['key']}.json").write_text(json.dumps({**typed, "sightings": "1"}), encoding="utf-8")
-    denied = store.capture("declined", "d", {"operations": [{**ARGS["operations"][0], "content": "y"}]}, SRC)["key"]
+    typed_path = store.root / f"{typed.key}.json"
+    typed_path.write_text(json.dumps({**asdict(typed), "sightings": "1"}), encoding="utf-8")
+    denied = store.capture("declined", "d", {"operations": [{**ARGS["operations"][0], "content": "y"}]}, SRC).key
     read_text = Path.read_text
 
     def guarded(self, *args, **kwargs):
@@ -218,6 +255,32 @@ def test_invalid_same_version_records_are_quarantined_and_recovery_continues(sto
     assert store.deliver_pending(Board()) == {good: "delivered", denied: "error:PermissionError"}
     assert (store.root / f"{denied}.json").exists()  # an I/O failure is not mistaken for bad data
     assert len(list(store.root.glob("*.json.invalid-*"))) == 2
+
+
+def test_missing_nullable_fields_are_quarantined_and_recovery_continues(store, hashes):
+    def plant(valid):  # copies of a valid record, each missing one nullable key, sorted ahead of it
+        for bare, missing in (("0" * 64, "operations"), ("0" * 63 + "1", "delivery")):
+            data = {**asdict(valid), "key": bare}
+            del data[missing]
+            (store.root / f"{bare}.json").write_text(json.dumps(data), encoding="utf-8")
+
+    board, first = Board(), store.capture("declined", "d", ARGS, SRC)
+    plant(first)
+    assert store.deliver_pending(board) == {first.key: "delivered"}
+    second = store.capture("unavailable", "u", ARGS, SRC)
+    plant(second)
+    restarted = RecommendationStore(store.root, skill_hash=hashes.get)
+    assert restarted.deliver_pending(board) == {second.key: "delivered"}
+    assert len(list(store.root.glob("*.json.invalid-*"))) == 4 and board.creates == 2
+    assert {r.key for r in restarted.records()} == {first.key, second.key}
+
+
+def test_non_json_board_receipt_leaves_the_record_pending(store):
+    key = store.capture("declined", "d", ARGS, SRC).key
+    board = Board()
+    board.find = lambda card_key: {"card": object()}
+    assert store.deliver_pending(board) == {key: "uncertain:TypeError"}
+    assert store.load(key).status == "pending_delivery"
 
 
 def test_recording_failure_raises_to_the_caller_without_a_partial_record(tmp_path):

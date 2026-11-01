@@ -147,10 +147,15 @@ carried `pre_skill_write` gate is not retired by W02.
 - States: `pending_delivery` -> `delivered` (board receipt) -> `reviewed` -> `implemented`; the last two
   need an explicit receipt and never follow from a card existing. An implemented record is archived by
   copy when the same proposal is refused again, and the new record opens a new review cycle (`cycle` id).
-  Every load validates the full record shape (field types, state, kind, receipts, operations hash);
-  undecodable or invalid content is quarantined (`*.invalid-<ms>`, reason logged), never trusted or
-  deleted, and recovery continues with the next record. Permission and other I/O errors are reported,
-  not treated as bad data.
+  Worker acknowledgements name the cycle: `mark(card_key, status, receipt)` takes the card's
+  `<key>:<cycle>` and is compare-and-set under the store lock, so a stale or duplicate receipt from an
+  earlier cycle is rejected and changes nothing; repeating the cycle's current status is a no-op retry.
+  Every receipt is stored as plain JSON tagged with its cycle.
+  Inside the store a record is a typed `Recommendation` dataclass; JSON exists only at the file boundary.
+  Every field is required (absent is never read as `null`), then types, state, kind, receipts and the
+  operations hash are checked. Any content that fails is quarantined (`*.invalid-<ms>`, reason
+  logged), never trusted or deleted, and recovery continues with the next record. Permission and other
+  I/O errors are reported, not treated as bad data.
 - Serialization: every read-modify-write (capture, delivery acknowledgement, `mark`) runs under one
   store-wide OS file lock (`<root>/.lock`, the host's `agent.trajectory._lock_append_handle`), across
   threads, store instances and processes sharing `root`. Board I/O runs unlocked; delivery commits to a
