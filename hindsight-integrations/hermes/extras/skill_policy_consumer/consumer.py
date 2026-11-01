@@ -225,14 +225,9 @@ class BoundedJudgeRunner:
     holds up interpreter exit. A hung judge keeps its slot until it returns, then the slot recovers;
     the provider call itself is bounded by the same timeout (see ``resolve_judge``)."""
 
-    def __init__(self, judge: Judge, settings: ConsumerSettings):
-        self._judge, self._timeout_s = judge, float(settings.timeout_s)
+    def __init__(self, judge: Judge, settings: ConsumerSettings, closed: threading.Event):
+        self._judge, self._timeout_s, self._closed = judge, float(settings.timeout_s), closed
         self._slots = threading.BoundedSemaphore(settings.max_concurrent)
-        self._closed = threading.Event()
-
-    def close(self) -> None:
-        """Unload: refuse new work; running workers are abandoned and their results discarded."""
-        self._closed.set()
 
     def run(self, request: JudgeRequest) -> JudgeResult:
         if self._closed.is_set():
@@ -260,8 +255,8 @@ class BoundedJudgeRunner:
             ok, value, completed_at = results.get(timeout=self._timeout_s)
         except queue.Empty:
             return _failed("timeout")
-        if completed_at > deadline or self._closed.is_set():
-            return _failed("timeout" if completed_at > deadline else "unloaded")
+        if completed_at > deadline:
+            return _failed("timeout")
         return parse_judge_output(value) if ok else _failed(type(value).__name__)
 
 
@@ -271,10 +266,12 @@ class SkillPolicyConsumer:
     def __init__(self, judge: Judge, settings: ConsumerSettings):
         self.settings = settings
         self.outcomes: list[Outcome] = []
-        self._runner = BoundedJudgeRunner(judge, settings)
+        self._closed = threading.Event()
+        self._runner = BoundedJudgeRunner(judge, settings, self._closed)
 
     def close(self) -> None:
-        self._runner.close()
+        """Unload: no call finishing after this returns a verdict; the judge is not started again."""
+        self._closed.set()
 
     def __call__(self, *, operations, payload_digest, **_ignored):
         request = JudgeRequest(
@@ -290,6 +287,8 @@ class SkillPolicyConsumer:
             result = JudgeResult("allow", None, "skipped")
         else:
             result = self._runner.run(request)
+        if self._closed.is_set():  # one admission gate for both paths, after any in-flight close
+            result = _failed("unloaded")
         wire = self._wire(result, request)
         self.outcomes.append(Outcome(request, result, None if wire is None else MappingProxyType(dict(wire))))
         return wire

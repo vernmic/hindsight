@@ -116,7 +116,8 @@ carried `pre_skill_write` gate is not retired by W02.
   daemon worker per call under `max_concurrent` slots and no queue. With every slot held, a call fails
   `busy` immediately and never starts later. A timed-out judge keeps its slot until it returns, then the
   slot recovers; its late result is discarded. Daemon workers do not hold up interpreter exit. Unload
-  (`ctx.on_unload`) refuses new calls (`failed:unloaded`) and discards results of running ones. A
+  (`ctx.on_unload`) is one consumer-level gate: any call that finishes after close, on the judged path or
+  the attended `unattended_only` shortcut, returns `failed:unloaded` (no approval), and no judge starts. A
   Python callable that never returns is not killed; it costs one slot until process exit.
 - Attendedness: `unattended_only` skips the judge only when the host's `is_unattended_review()` is
   readable and false: foreground writes and explicitly attended background reviews (`/refine`,

@@ -71,12 +71,25 @@ def test_hung_judge_does_not_block_process_exit():
     assert time.monotonic() - started < 20
 
 
-def test_unloaded_consumer_refuses_new_work_without_calling_the_judge():
+@pytest.mark.parametrize("unattended_only", [False, True])
+def test_unloaded_consumer_refuses_new_work_without_calling_the_judge(unattended_only):
     calls = []
-    consumer = make(lambda request: calls.append(request) or {"verdict": "allow"})
+    consumer = make(lambda request: calls.append(request) or {"verdict": "allow"}, unattended_only=unattended_only)
     consumer.close()
     assert call(consumer) is None
     assert consumer.outcomes[0].result.status == "failed:unloaded" and calls == []
+
+
+def test_close_during_an_in_flight_judgment_discards_its_verdict():
+    entered, release, results = threading.Event(), threading.Event(), []
+    consumer = make(lambda request: entered.set() or release.wait(10) and {"verdict": "allow"}, timeout_s=5)
+    worker = threading.Thread(target=lambda: results.append(call(consumer)))
+    worker.start()
+    assert entered.wait(5)
+    consumer.close()
+    release.set()
+    worker.join(5)
+    assert results == [None] and consumer.outcomes[0].result.status == "failed:unloaded"
 
 
 @pytest.mark.parametrize(

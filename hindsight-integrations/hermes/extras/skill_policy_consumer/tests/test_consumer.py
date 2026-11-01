@@ -192,10 +192,12 @@ ATTENDANCE = {
 }
 
 
+@pytest.mark.parametrize("closed", [False, True], ids=["loaded", "closed"])
 @pytest.mark.parametrize("case", list(ATTENDANCE))
-def test_unattended_only_follows_host_attendedness(tmp_path, hermes_home, monkeypatch, case):
+def test_unattended_only_follows_host_attendedness(tmp_path, hermes_home, monkeypatch, case, closed):
     """``unattended_only`` uses ``is_unattended_review()``, not the curator actor label: an explicitly
-    attended ``/refine`` review keeps background origin and curator actor but is not judged."""
+    attended ``/refine`` review keeps background origin and curator actor but is not judged. A closed
+    consumer approves nothing on any path, including the attended shortcut (W02-R5)."""
     provenance = pytest.importorskip("tools.skill_provenance")
     background, attended, judged = ATTENDANCE[case]
     if case == "attendedness_unavailable":
@@ -207,11 +209,17 @@ def test_unattended_only_follows_host_attendedness(tmp_path, hermes_home, monkey
         with skills_root(tmp_path) as root:
             judge = Judge({"verdict": "block", "reason": "judged and refused"})
             consumer = install(judge, unattended_only=True)
+            if closed:
+                consumer.close()
             result = batch(ops())
             written = "probe-skill/SKILL.md" in tree(root)
     finally:
         provenance.reset_review_attended(attendance)
         provenance.reset_current_write_origin(origin)
+    if closed:
+        assert judge.requests == [] and consumer.outcomes[0].result.status == "failed:unloaded"
+        assert not written and result["success"] is False, result
+        return
     assert len(judge.requests) == int(judged)
     assert consumer.outcomes[0].result.status == ("ok" if judged else "skipped")
     assert written is (not judged) and result["success"] is (not judged), result
