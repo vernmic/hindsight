@@ -294,14 +294,9 @@ class ScriptedConsumer(Consumer):
 
 
 @proposed_host
-def test_sole_delete_batch_is_judged_twice_native_gap(tmp_path, hermes_home):
-    """W01-R1: observed native gap, NOT a one-call contract.
-
-    ``operations=[delete]`` runs the batch gate, then delegates to flat
-    ``skill_manage(action='delete')``, whose flat gate runs again. The two payloads
-    differ (the flat shape adds ``replace_all: false``), so the digests differ. A
-    corrected host must make this exactly one judgment; update this probe then.
-    """
+def test_sole_delete_batch_is_judged_once(tmp_path, hermes_home):
+    """W02-H1 corrected host: ``operations=[delete]`` is ONE judgment, on the flat-equivalent
+    payload (``replace_all: false`` added) that the flat path also binds into staging."""
     with skills_root(tmp_path) as root:
         set_required(hermes_home, None)
         seed(root, "delete")
@@ -312,34 +307,11 @@ def test_sole_delete_batch_is_judged_twice_native_gap(tmp_path, hermes_home):
         final = tree(root)
     assert result["success"] is True, result
     assert final == []
-    payloads = [c["kwargs"]["operations"] for c in consumer.calls]
-    digests = [c["kwargs"]["payload_digest"] for c in consumer.calls]
-    assert payloads == [
-        [{"name": "probe-skill", "action": "delete"}],
-        [{"name": "probe-skill", "action": "delete", "replace_all": False}],
-    ]
-    assert digests == [smt._skill_batch_payload_digest(p) for p in payloads]
-    assert digests[0] != digests[1]
-    # Both judgments happen before the deletion.
-    assert all(c["tree_at_call"] == ["probe-skill/SKILL.md"] for c in consumer.calls)
-
-
-@proposed_host
-def test_sole_delete_batch_second_judgment_can_refuse_after_first_approved(tmp_path, hermes_home):
-    """W01-R1 consequence: one user call can be approved by the batch gate and then
-    denied by the flat gate. The refusal holds and nothing is deleted."""
-    with skills_root(tmp_path) as root:
-        set_required(hermes_home, None)
-        seed(root, "delete")
-        set_required(hermes_home, "pre_skill_batch")
-        consumer = ScriptedConsumer(["approve", "block"], root)
-        register(consumer)
-        result = run_batch([{"name": "probe-skill", "action": "delete"}])
-        final = tree(root)
-    assert len(consumer.calls) == 2
-    assert result["success"] is False
-    assert result["error"].startswith("Skill batch policy denied:")
-    assert final == ["probe-skill/SKILL.md"]
+    (call,) = consumer.calls
+    flat = [{"name": "probe-skill", "action": "delete", "replace_all": False}]
+    assert call["kwargs"]["operations"] == flat
+    assert call["kwargs"]["payload_digest"] == smt._skill_batch_payload_digest(flat)
+    assert call["tree_at_call"] == ["probe-skill/SKILL.md"]  # judged before the deletion
 
 
 @proposed_host
