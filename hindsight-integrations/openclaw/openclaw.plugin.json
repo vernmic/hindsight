@@ -340,6 +340,10 @@
         "type": "string",
         "description": "Path to JSONL file for buffering failed retains. Default: ~/.openclaw/data/hindsight-retain-queue.jsonl"
       },
+      "retainNonBlocking": {
+        "type": "boolean",
+        "description": "Deprecated and ignored. agent_end always returns once the turn's retain is durably queued; delivery runs in the background. Accepted so existing configs keep validating."
+      },
       "retainQueueMaxAgeMs": {
         "type": "number",
         "description": "Max age in ms for queued retain items. -1 = keep forever.",
@@ -633,6 +637,9 @@
     "retainQueueFlushIntervalMs": {
       "label": "Retain Queue Flush Interval (ms)",
       "placeholder": "60000"
+    },
+    "retainNonBlocking": {
+      "label": "Retain Non-Blocking (deprecated, ignored)"
     },
     "ignoreSessionPatterns": {
       "label": "Ignore Session Patterns",

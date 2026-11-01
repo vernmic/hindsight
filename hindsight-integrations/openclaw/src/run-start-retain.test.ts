@@ -36,9 +36,26 @@ async function loadPlugin(extraConfig: Record<string, unknown> = {}) {
         return Response.json({ api_version: "1.1.0", features: { store_document_text: true } });
       }
       if (request.method === "POST" && request.url.includes("/memories")) {
-        const body = (await request.json()) as { items: Array<{ content: string }> };
+        const body = (await request.json()) as {
+          items: Array<{ content: string }>;
+          operation_id?: string;
+        };
         retained.push(...body.items.map((item) => item.content));
-        return Response.json({ success: true, bank_id: "b", items_count: 1, async: true });
+        // Durable delivery (P4): async acceptance names its operation; status reports terminal.
+        return Response.json({
+          success: true,
+          bank_id: "b",
+          items_count: 1,
+          async: true,
+          operation_id: body.operation_id ?? "op-legacy",
+        });
+      }
+      const operation = /\/operations\/([^/?]+)$/.exec(request.url);
+      if (operation) {
+        return Response.json({
+          operation_id: decodeURIComponent(operation[1]),
+          status: "completed",
+        });
       }
       return Response.json({});
     })
@@ -113,7 +130,8 @@ describe("retain saves the whole run (#5569)", () => {
       ctx
     );
 
-    expect(retained).toHaveLength(1);
+    // agent_end returns once the retain is queued; delivery runs in the background.
+    await vi.waitFor(() => expect(retained).toHaveLength(1));
     expect(retained[0]).toContain("Research flights to Lisbon");
     expect(retained[0]).toContain("Searching the airline sites now.");
     expect(retained[0]).toContain("Only direct flights please");
@@ -139,7 +157,8 @@ describe("retain saves the whole run (#5569)", () => {
       ctx
     );
 
-    expect(retained).toHaveLength(1);
+    // agent_end returns once the retain is queued; delivery runs in the background.
+    await vi.waitFor(() => expect(retained).toHaveLength(1));
     expect(retained[0]).toContain("Research flights to Lisbon");
   });
 
@@ -151,13 +170,14 @@ describe("retain saves the whole run (#5569)", () => {
       ctx
     );
     await hooks.get("agent_end")!({ success: true, messages: run1 }, ctx);
+    await vi.waitFor(() => expect(retained).toHaveLength(1));
     await hooks.get("before_prompt_build")!(
       { messages: run1, currentUserMessage: steer.content },
       ctx
     );
     await hooks.get("agent_end")!({ success: true, messages: [...run1, steer, answer] }, ctx);
 
-    expect(retained).toHaveLength(2);
+    await vi.waitFor(() => expect(retained).toHaveLength(2));
     expect(retained[1]).toContain("Only direct flights please");
     expect(retained[1]).not.toContain("Research flights to Lisbon");
   });

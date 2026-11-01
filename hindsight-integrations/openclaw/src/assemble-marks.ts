@@ -66,7 +66,9 @@ export function decodeTranscriptEventJson(row: {
     }
   ).zstdDecompressSync;
   if (typeof zstdDecompressSync !== "function") {
-    throw new Error("Cannot decode compressed transcript payload: this runtime lacks zstd support");
+    throw new Error(
+      `Cannot decode compressed transcript payload: zlib Zstd requires Node >= 22.15.0 or >= 23.8.0 (running ${process.versions.node})`
+    );
   }
   const decoded = zstdDecompressSync.call(zlib, bytes, { maxOutputLength: rawBytes });
   if (decoded.byteLength !== rawBytes) {
