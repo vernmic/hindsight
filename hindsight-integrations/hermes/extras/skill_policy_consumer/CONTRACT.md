@@ -1,4 +1,4 @@
-# Skill-policy consumer: PR 57703 host contract (W01)
+# Skill-policy consumer: PR 57703 host contract (W01 map, W02 consumer)
 
 Status: **proposal-dependent reference**. Mapped against NousResearch/hermes-agent PR 57703
 head `117c521bed76631c0761e7925ff0977acfbe9be0` (base `085f562af53a6fedadac3681e2c498fc71316132`),
@@ -27,7 +27,7 @@ evidence, not current-main qualification.
 | Optional mode | Only an explicit block refuses; every other outcome fails open. |
 | Timeout | Bounded by the dispatcher's generic hook timeout (`plugins.hook_callback_timeout`); not fail-closed at dispatch, the gate decides from the failed-callback list. |
 | Invalid names | If any op name fails validation the gate returns no decision and native validation rejects the call; the policy is never consulted. |
-| Staged replay | A digest-bound staged record is re-hashed on `/skills approve`; a modified or subset payload is refused. A staged record **without** a digest replays unchanged under `_skill_gate_bypass` with no policy decision, even if required mode is now set (see "Entry points the policy gate does not cover"). |
+| Staged replay | A digest-bound staged record is re-hashed on `/skills approve`; a modified or subset payload is refused. With the W02 host fix, a staged record **without** a digest is refused while `skill_policy.required` is set (stage again for a fresh decision); with no required policy it replays unchanged as before. |
 | Callback context | Arguments are only operations, digest and telemetry version. The `session_id` argument of `skill_manage` is **not** forwarded. The callback runs on a bounded worker thread started with `contextvars.copy_context()`, so host ContextVars are readable: task-local session id (`gateway.session_context`), write origin and attendedness (`tools.skill_provenance`), ledger actor (`tools.skill_ledger.derive_actor`). Probed A -> B -> A. There is **no evidence carrier**. |
 
 ## Shape coverage: flat calls versus `operations[]`
@@ -39,56 +39,36 @@ evidence, not current-main qualification.
 | `operations[]` full rewrite | `patch` with `content` (there is no batch `edit`) | 1 | As submitted |
 | `operations=[{action: edit}]` | **Rejected** natively: `unknown action 'edit'` | 0 | none |
 | `operations[]` mixing delete with anything | **Rejected** natively: `delete must be the SOLE op` | 0 | none |
-| `operations=[{action: delete}]` (sole delete) | delete | **2 (native gap, see below)** | First the submitted op; then the flat-shape op with `replace_all: false` added, so a different digest |
+| `operations=[{action: delete}]` (sole delete) | delete | **1** (W02 host fix) | The flat-equivalent op (`replace_all: false` added); that digest is bound into staging |
 
-### Native contract gap: sole-delete batch is judged twice
+### Sole-delete batch: one judgment (W02-H1)
 
-`_skill_manage_batch` calls `_gate_skill_batch(operations)` for the sole-delete shape and then
-delegates to flat `skill_manage(action="delete")`, whose flat gate runs `_gate_skill_batch` again
-on the flat-equivalent payload. The first approval digest is discarded, so the decision bound into
-staging is the second one. Consequences (probed): one user call produces two judgments with
-different digests, and the first can approve while the second refuses (the refusal holds and
-nothing is deleted).
+Host commit `79001dcf2d449cca5fc782468672028946f95fdf` (local branch `w02/skill-batch-consumer-c7da41dd`)
+removes the batch-side `_gate_skill_batch` call from the sole-delete branch of `_skill_manage_batch`.
+The delegated flat `delete` makes the single judgment on the flat-equivalent payload
+(`_flat_gate_operation`), and the flat write gate binds that digest into staging, so replay
+re-verifies the same digest. No `_skill_gate_bypass`, no hand-off flag; validation,
+`_background_review_preflight`, locks, the recoverable archive and `post_skill_delete` are unchanged.
+Host tests: one call, native staging plus `/skills approve` replay succeeds, a tampered staged record
+is refused (`payload binding`), no-policy behavior unchanged.
 
-**Bounded host correction required before W02 can claim one decision per call** (local design
-requirement only; not submitted upstream):
+## Entry-point boundary (W02 decision)
 
-1. The sole-delete `operations[]` call must make exactly one `pre_skill_batch` judgment.
-2. That one decision must still feed the human write-approval staging gate, and the digest bound
-   into the staged record must be the one replay re-verifies (`_verify_staged_batch_digest`). A flat
-   staged delete is re-hashed from the flat shape, so the judged payload and the staged payload must
-   be built by the same rule (`_flat_gate_operation`).
-3. Native validation, `_background_review_preflight`, mutation locks, the recoverable-archive delete
-   path and `post_skill_delete` bookkeeping must run unchanged.
-4. It must **not** set the broad `_skill_gate_bypass` flag to suppress the second callback; that
-   flag also bypasses the write-approval gate.
-5. Acceptable shapes: either judge the sole delete once on the flat-equivalent payload and let the
-   flat path carry that digest into its write gate (for example a narrow "policy already decided
-   for digest D" hand-off consumed only by the flat policy step), or keep the batch-shape judgment
-   and stage a batch-shape record. Either needs focused host tests: one call, staged replay of the
-   approved delete succeeds, a tampered staged record is refused, no-policy behavior is unchanged.
+Required mode is enforced where `_gate_skill_batch` runs (`skill_manage`, flat and `operations[]`)
+and, after host commit `a60c9f83355b027940aaf99f1897a063fb48fdee`, at undigested staged replay.
 
-Until that correction exists, a consumer must tolerate two calls for one sole-delete batch: treat
-each call as an independent judgment of its own digest, never reuse the first decision for the
-second, and record both. W02 must not count them as two user proposals.
+| Entry point | Mode | Behavior |
+| --- | --- | --- |
+| Agent `skill_manage` (flat, `operations[]`, sole delete) | **covered** | one `pre_skill_batch` judgment per call, digest bound into native staging |
+| `/skills approve` replay of a digest-bound record | **covered** | re-hashed; mismatch refused; no second judgment (the staged decision is the one) |
+| `/skills approve` replay of an undigested record while required | **covered (refused)** | refused with a re-stage instruction; no policy call, no silent replay |
+| Undigested replay with no required policy | unchanged legacy | replays as before |
+| Dashboard `POST /api/skills`, `PUT /api/skills/content` -> `_create_skill`/`_edit_skill` | **excluded: human edit** | authenticated dashboard write is the user; native approval unchanged; tested through the real create route (PUT by source inspection only, its profile scoping is not modeled) |
+| `agent/learning_mutations.edit_node` -> `_edit_skill` | **excluded: human edit** | user-initiated journey edit; tested through the real caller |
 
-## Entry points the policy gate does not cover
+Excluded modes make no policy call. No claim of unattended equivalence is made for them, and the
+carried `pre_skill_write` gate is not retired by W02.
 
-Required mode is enforced only where `_gate_skill_batch` runs, i.e. inside `skill_manage` (flat and
-`operations[]`). At the integrated host `5618e16704e3b18325e0aec56c7771859bc8263c` the following mutate
-skills without a `pre_skill_batch` decision even when `skill_policy.required` is set and no consumer
-is present. Both are demonstrated by host probes `test_gap_direct_handlers_bypass_required_policy` and
-`test_gap_legacy_staged_replay_without_digest_skips_required_policy` (real helpers, temporary skill
-root); their green result **confirms the gap**, it is not coverage.
-
-| Entry point | Who calls it | Mutation without policy | Planned handling |
-| --- | --- | --- | --- |
-| `_create_skill` / `_edit_skill` called directly | Dashboard `POST /api/skills` and `PUT /api/skills/content` (`hermes_cli/web_routers/skills.py`); `agent/learning_mutations.py` `edit_node` -> `_edit_skill` | create, full-rewrite edit | **Boundary decision owed in W02, not presumed.** Authenticated dashboard writes are documented upstream as deliberate human edits ("an authenticated dashboard write IS the user") and skip the write-approval gate by design; this contract does not label that a vulnerability or assume it must be policy-gated. Learning-mutation edits need their actor/attendedness confirmed on the real caller path. W02 either covers the unattended caller paths it claims (tested through the real callers, not only the helpers) or lists them as an explicit excluded mode. Until then no claim of equivalent unattended enforcement is made and the carried `pre_skill_write` gate is not retired. |
-| `apply_skill_pending` replay of a staged record with no `payload_digest` | `/skills approve` on records staged before digest binding existed or before required mode was set | any staged action, via `_skill_gate_bypass` | `_verify_staged_batch_digest` returns no error for a missing/empty digest, so required mode does not by itself force a fresh decision. These are human-approved legacy records; native approval and legacy replay semantics are preserved. W02 decides and tests one of: a fresh `pre_skill_batch` decision for undigested replay when required mode is set, or an explicitly documented excluded legacy mode. W03 records refusals/unavailability for whichever path refuses. |
-
-Neither row is fixed by this map, and neither fix may become a competing writer or a broad
-suppression of `_skill_gate_bypass`. Actual dashboard/learning reach is from source inspection, not an
-end-to-end HTTP/agent run.
 
 ## Mapping from the existing Jev `pre_skill_write` consumer
 
@@ -102,6 +82,22 @@ end-to-end HTTP/agent run.
 | Uses `proposal.evidence` | No carrier. Do not add keys to `operations` (that changes the digest and fails native validation). A missing evidence input stays an explicit unavailable result; if needed, a separate optional host-context argument is a separately reviewed host change. |
 | Legacy proposals with action `edit` | Flat `edit` is fine. When building or replaying an `operations[]` call, map a full rewrite to `patch` + `content`; never emit `edit` inside `operations[]`. |
 | Previews skill files "under the host's mutation lock" | The hook fires **before** locks; a preview is advisory and can race a concurrent writer. |
-| Required only for unattended actors (`skills.unattended_write_policy_required`) | Host required mode applies to every actor **on calls that reach `_gate_skill_batch`** (`skill_manage` flat and `operations[]`); it does not cover the direct-helper or undigested-replay entry points listed above; an unattended-only policy must decide inside the consumer (approve attended writes), or the operator accepts global enforcement. W02 must report this scope difference. |
+| Required only for unattended actors (`skills.unattended_write_policy_required`) | Host required mode applies to every actor **on calls that reach `_gate_skill_batch`** (`skill_manage` flat and `operations[]`); the excluded human-edit modes above make no policy call; an unattended-only policy must decide inside the consumer (approve attended writes), or the operator accepts global enforcement. W02 must report this scope difference. |
 | Shadow mode returns allow | Shadow must return `approve` + digest (or `None` in optional mode). |
 | Recommendation on unavailable policy | An absent consumer cannot record its own absence, and a refused call fires no `post_skill_*`. W03 needs a capture owner that runs when policy is absent/failed (see W03 dependency in the promotion packet). |
+
+## W02 consumer (`consumer.py`)
+
+- Setting: required mode needs `skill_policy.required: pre_skill_batch` exactly; `register(...,
+  required=True)` raises on any other value or when the host lacks the hook. Optional registration on
+  a host without the hook returns `False` (native behavior).
+- Wire: judge `allow` -> `{"action":"approve","payload_digest":<this call's digest>}`;
+  `block`/`modify`/`require_approval` -> `{"action":"block","reason":...}` (nonempty reason, fallback
+  names verdict, policy revision and request id). Crash, invalid output, timeout -> `None`, so the
+  host decides (unavailable when required, native when optional). A late result after the deadline
+  is discarded. Each call is judged on its own digest; nothing is cached across operations.
+- Context: `trusted_context()` reads the task-local session id, write origin, attendedness and
+  ledger actor through the copied ContextVars; an unbound value is reported unavailable (no
+  `os.environ` fallback); evidence is always unavailable.
+- `unattended_only=True` approves attended writes without calling the judge.
+- Durability: the consumer keeps only an in-memory `outcomes` list. Durable capture is W03.
