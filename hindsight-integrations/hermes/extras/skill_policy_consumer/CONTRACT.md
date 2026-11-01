@@ -27,7 +27,7 @@ evidence, not current-main qualification.
 | Optional mode | Only an explicit block refuses; every other outcome fails open. |
 | Timeout | Bounded by the dispatcher's generic hook timeout (`plugins.hook_callback_timeout`); not fail-closed at dispatch, the gate decides from the failed-callback list. |
 | Invalid names | If any op name fails validation the gate returns no decision and native validation rejects the call; the policy is never consulted. |
-| Staged replay | A digest-bound staged record is re-hashed on `/skills approve`; a modified or subset payload is refused. |
+| Staged replay | A digest-bound staged record is re-hashed on `/skills approve`; a modified or subset payload is refused. A staged record **without** a digest replays unchanged under `_skill_gate_bypass` with no policy decision, even if required mode is now set (see "Entry points the policy gate does not cover"). |
 | Callback context | Arguments are only operations, digest and telemetry version. The `session_id` argument of `skill_manage` is **not** forwarded. The callback runs on a bounded worker thread started with `contextvars.copy_context()`, so host ContextVars are readable: task-local session id (`gateway.session_context`), write origin and attendedness (`tools.skill_provenance`), ledger actor (`tools.skill_ledger.derive_actor`). Probed A -> B -> A. There is **no evidence carrier**. |
 
 ## Shape coverage: flat calls versus `operations[]`
@@ -72,6 +72,24 @@ Until that correction exists, a consumer must tolerate two calls for one sole-de
 each call as an independent judgment of its own digest, never reuse the first decision for the
 second, and record both. W02 must not count them as two user proposals.
 
+## Entry points the policy gate does not cover
+
+Required mode is enforced only where `_gate_skill_batch` runs, i.e. inside `skill_manage` (flat and
+`operations[]`). At the integrated host `5618e16704e3b18325e0aec56c7771859bc8263c` the following mutate
+skills without a `pre_skill_batch` decision even when `skill_policy.required` is set and no consumer
+is present. Both are demonstrated by host probes `test_gap_direct_handlers_bypass_required_policy` and
+`test_gap_legacy_staged_replay_without_digest_skips_required_policy` (real helpers, temporary skill
+root); their green result **confirms the gap**, it is not coverage.
+
+| Entry point | Who calls it | Mutation without policy | Planned handling |
+| --- | --- | --- | --- |
+| `_create_skill` / `_edit_skill` called directly | Dashboard `POST /api/skills` and `PUT /api/skills/content` (`hermes_cli/web_routers/skills.py`); `agent/learning_mutations.py` `edit_node` -> `_edit_skill` | create, full-rewrite edit | **Boundary decision owed in W02, not presumed.** Authenticated dashboard writes are documented upstream as deliberate human edits ("an authenticated dashboard write IS the user") and skip the write-approval gate by design; this contract does not label that a vulnerability or assume it must be policy-gated. Learning-mutation edits need their actor/attendedness confirmed on the real caller path. W02 either covers the unattended caller paths it claims (tested through the real callers, not only the helpers) or lists them as an explicit excluded mode. Until then no claim of equivalent unattended enforcement is made and the carried `pre_skill_write` gate is not retired. |
+| `apply_skill_pending` replay of a staged record with no `payload_digest` | `/skills approve` on records staged before digest binding existed or before required mode was set | any staged action, via `_skill_gate_bypass` | `_verify_staged_batch_digest` returns no error for a missing/empty digest, so required mode does not by itself force a fresh decision. These are human-approved legacy records; native approval and legacy replay semantics are preserved. W02 decides and tests one of: a fresh `pre_skill_batch` decision for undigested replay when required mode is set, or an explicitly documented excluded legacy mode. W03 records refusals/unavailability for whichever path refuses. |
+
+Neither row is fixed by this map, and neither fix may become a competing writer or a broad
+suppression of `_skill_gate_bypass`. Actual dashboard/learning reach is from source inspection, not an
+end-to-end HTTP/agent run.
+
 ## Mapping from the existing Jev `pre_skill_write` consumer
 
 | Jev today | Port requirement |
@@ -84,6 +102,6 @@ second, and record both. W02 must not count them as two user proposals.
 | Uses `proposal.evidence` | No carrier. Do not add keys to `operations` (that changes the digest and fails native validation). A missing evidence input stays an explicit unavailable result; if needed, a separate optional host-context argument is a separately reviewed host change. |
 | Legacy proposals with action `edit` | Flat `edit` is fine. When building or replaying an `operations[]` call, map a full rewrite to `patch` + `content`; never emit `edit` inside `operations[]`. |
 | Previews skill files "under the host's mutation lock" | The hook fires **before** locks; a preview is advisory and can race a concurrent writer. |
-| Required only for unattended actors (`skills.unattended_write_policy_required`) | Host required mode is global for all actors; an unattended-only policy must decide inside the consumer (approve attended writes), or the operator accepts global enforcement. W02 must report this scope difference. |
+| Required only for unattended actors (`skills.unattended_write_policy_required`) | Host required mode applies to every actor **on calls that reach `_gate_skill_batch`** (`skill_manage` flat and `operations[]`); it does not cover the direct-helper or undigested-replay entry points listed above; an unattended-only policy must decide inside the consumer (approve attended writes), or the operator accepts global enforcement. W02 must report this scope difference. |
 | Shadow mode returns allow | Shadow must return `approve` + digest (or `None` in optional mode). |
 | Recommendation on unavailable policy | An absent consumer cannot record its own absence, and a refused call fires no `post_skill_*`. W03 needs a capture owner that runs when policy is absent/failed (see W03 dependency in the promotion packet). |
