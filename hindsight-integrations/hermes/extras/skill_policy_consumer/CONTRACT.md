@@ -84,7 +84,7 @@ carried `pre_skill_write` gate is not retired by W02.
 | Previews skill files "under the host's mutation lock" | The hook fires **before** locks; a preview is advisory and can race a concurrent writer. |
 | Required only for unattended actors (`skills.unattended_write_policy_required`) | Host required mode applies to every actor **on calls that reach `_gate_skill_batch`** (`skill_manage` flat and `operations[]`); the excluded human-edit modes above make no policy call; an unattended-only policy must decide inside the consumer (approve attended writes), or the operator accepts global enforcement. W02 must report this scope difference. |
 | Shadow mode returns allow | Shadow must return `approve` + digest (or `None` in optional mode). |
-| Recommendation on unavailable policy | An absent consumer cannot record its own absence, and a refused call fires no `post_skill_*`. W03 needs a capture owner that runs when policy is absent/failed (see W03 dependency in the promotion packet). |
+| Recommendation on unavailable policy | An absent consumer cannot record its own absence, and a refused call fires no `post_skill_*`. The capture owner is the separate `jev-skill-recommendations` plugin on the upstream `post_tool_call` hook (W03, below). |
 
 ## W02 consumer (`consumer.py`, native plugin `jev-skill-policy`)
 
@@ -128,4 +128,31 @@ carried `pre_skill_write` gate is not retired by W02.
 - Context: task-local session id, write origin, attendedness and ledger actor through the copied
   ContextVars; an unbound value is reported unavailable (no `os.environ` fallback); evidence is always
   unavailable.
-- Durability: only the in-memory `outcomes` list. Durable blocked/unavailable capture is W03.
+- Durability: only the in-memory `outcomes` list; durable capture is the W03 plugin below.
+
+## W03 recommendations (`recommendations/`, native plugin `jev-skill-recommendations`)
+
+- Capture owner: a separate plugin so it runs when `jev-skill-policy` is absent, disabled or failed to
+  start. It observes the host's own refusal on the existing upstream `post_tool_call` hook
+  (`tool_name == "skill_manage"`, result error prefixed `Skill batch policy denied:` -> `declined`,
+  `Skill batch policy unavailable:` -> `unavailable`). No host change. It returns nothing, so no capture
+  or delivery outcome can change, weaken or authorize the host decision. Calls whose `post_tool_call`
+  is suppressed by the host are not observed.
+- Record: one versioned JSON file (`jev-skill-recommendation/1`) per (kind, exact proposed operations),
+  written atomically (temp file, fsync, replace) before capture is reported. It holds the proposed
+  operations (or only their sha256 when `store_bodies: false`), refusal reason, source ids
+  (session/task/tool call/turn), the current SKILL.md sha256 of each named skill (or `null`) and a
+  worker instruction to revalidate and go through `skill_manage` afresh. Same kind and payload re-sights
+  the open record; a different payload is a different record even for the same skill name.
+- States: `pending_delivery` -> `delivered` (board receipt) -> `reviewed` -> `implemented`; the last two
+  need an explicit receipt and never follow from a card existing. An implemented record is archived by
+  rename when the same proposal is refused again. A corrupt or foreign-schema file is renamed aside,
+  never trusted or deleted.
+- Board (optional, `board_callable: "module:attr"` returning an adapter with `find(key)` and
+  `create(key, card)`): every attempt reconciles by idempotency key before creating, so a crash or a
+  lost acknowledgement does not create a second card. An adapter without lookup by key only gives
+  at-least-once delivery. Failures leave the record pending; pending records are retried at plugin
+  start and after each new capture. With no board configured the record directory under the profile
+  (`root`, default `<HERMES_HOME>/jev-skill-recommendations`) is the local recommendation route.
+- Not covered: a recommendation to review the result of a separately authorized fallback write
+  (none exists in this path), retention/expiry of old records, and production board adapters.

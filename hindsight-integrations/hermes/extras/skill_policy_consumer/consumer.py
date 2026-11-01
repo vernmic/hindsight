@@ -4,7 +4,7 @@ Loaded by the native plugin loader (``plugin.yaml`` + ``register(ctx)``) with se
 profile's ``plugins.entries.jev-skill-policy.settings``. Trusted host context and the batch go in; a
 digest-bound wire response comes out. The judge is advisory: it returns ``{"verdict", "reason"?}`` only
 and holds no authority field. Every call is judged afresh. ``outcomes`` is an in-memory audit of what
-this process decided; durable blocked/unavailable capture and recovery are W03 and NOT provided here.
+this process decided; durable capture of refusals is the separate ``recommendations`` plugin (W03).
 """
 
 from __future__ import annotations

@@ -1,0 +1,5 @@
+name: jev-skill-recommendations
+version: 0.1.0
+description: Durable local recommendations for skill proposals the host refused (W03 reference, proposal-dependent).
+provides_hooks:
+  - post_tool_call
