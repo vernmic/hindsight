@@ -13,6 +13,11 @@ import {
   type MinScores,
 } from "@vectorize-io/hindsight-client";
 import { RetainQueue } from "./retain-queue.js";
+import {
+  createRetainTransport,
+  reconcileRetainQueue,
+  type RetainTransport,
+} from "./retain-delivery.js";
 import { createMemoryProviderRuntime } from "./memory-provider.js";
 import { createHindsightTools, HINDSIGHT_TOOL_NAMES } from "./tools.js";
 import { compileSessionPatterns, matchesSessionPattern } from "./session-patterns.js";
@@ -79,35 +84,43 @@ const debug = (...args: unknown[]) => {
 };
 
 // Module-level state
-let hindsightServer: HindsightServer | null = null;
-let client: HindsightClient | null = null;
-let clientOptions: HindsightClientOptions | null = null;
-let initPromise: Promise<void> | null = null;
-let isInitialized = false;
-let usingExternalApi = false; // Track if using external API (skip daemon management)
 
 // Capability detected once per service.start() against `<apiUrl>/version`.
 // `true` when the Hindsight API supports `update_mode: 'append'` (added in
 // 0.5.0 — see vectorize-io/hindsight#932) and stores document text. When false,
 // retain falls back to a per-turn document id so prior turns aren't silently
 // overwritten or rejected by text-disabled deployments.
-let supportsUpdateModeAppend = false;
-let appendCapabilityProbed = false;
 const MIN_VERSION_FOR_UPDATE_MODE_APPEND = "0.5.0";
 
 /** Whether retain is currently using session-scoped documents + `update_mode: 'append'`. */
 export function isAppendModeSupported(): boolean {
-  return supportsUpdateModeAppend;
+  return currentLifecycle().supportsUpdateModeAppend;
 }
 
 export type AsyncRetainOperationIdCapability = "supported" | "unsupported" | "unknown";
-let asyncRetainOperationIdCapability: AsyncRetainOperationIdCapability = "unknown";
 const MIN_VERSION_FOR_ASYNC_RETAIN_OPERATION_ID = "0.8.6";
 
 // Store the current plugin config for bank ID derivation
-let currentPluginConfig: PluginConfig | null = null;
-let serviceGeneration = 0;
-let serviceAbortController: AbortController | null = null;
+// P3: the service lifecycle, client, init and retain queue live in the per-host-root authority
+// (see lifecycle-authority.ts). R14.1: each registration binds its OWN authority - never a
+// module-wide pointer a later registration could retarget. Its service, hooks, memory runtime and
+// tools run inside lifecycleScope, so module-level helpers resolve that registration's authority.
+// Registrations without a resolvable state root share this copy's private unrooted record (never a
+// rooted one). Calls outside any registration scope (tests, the global facade from a foreign
+// caller) fall back to the most recent registration's authority, as before.
+const unrootedLifecycle: LifecycleAuthority = newLifecycleAuthority();
+let lastRegisteredLifecycle: LifecycleAuthority = unrootedLifecycle;
+const lifecycleScope = sharedLifecycleScope();
+function currentLifecycle(): LifecycleAuthority {
+  return lifecycleScope.getStore() ?? lastRegisteredLifecycle;
+}
+/** Run fn (now and for every async continuation) under one registration's authority. */
+function bindLifecycle<A extends unknown[], R>(
+  authority: LifecycleAuthority,
+  fn: (...args: A) => R
+): (...args: A) => R {
+  return (...args: A) => lifecycleScope.run(authority, () => fn(...args));
+}
 // External-API hooks can lazy-initialize before the first service.start(). Keep
 // that lifetime cancellable: the first start() or stop() aborts it.
 //
@@ -116,34 +129,40 @@ let serviceAbortController: AbortController | null = null;
 // service.start() on the first one, so the hooks that actually run often belong
 // to a copy that is never started. Recall worked there and retain returned at its
 // lifecycle guard without a log line, so memory silently stopped growing. (#4828)
-const preServiceController = new AbortController();
 
 /**
  * Snapshot the lifecycle a hook runs under: the started service's, or the
- * pre-start one when this module copy was never started. `isCurrent()` turns
+ * pre-start one when no copy for this host root has been started. `isCurrent()` turns
  * false once a later start() or stop() replaces it, so in-flight work can bail.
  * After an explicit stop() there is no lifecycle and hooks do nothing.
  */
 function captureHookLifecycle(): { signal: AbortSignal | undefined; isCurrent: () => boolean } {
-  const generation = serviceGeneration;
-  const controller = serviceAbortController ?? (generation === 0 ? preServiceController : null);
+  const authority = currentLifecycle();
+  const generation = authority.generation;
+  const controller =
+    authority.serviceController ?? (generation === 0 ? authority.preServiceController : null);
   return {
     signal: controller?.signal,
     isCurrent: () =>
       controller !== null &&
-      (serviceAbortController ?? preServiceController) === controller &&
-      generation === serviceGeneration &&
+      (authority.serviceController ?? authority.preServiceController) === controller &&
+      generation === authority.generation &&
       !controller.signal.aborted,
   };
 }
 
 // Track which banks have had configured defaults applied (missions + bank config).
-const banksWithDefaultsApplied = new Set<string>();
 
 // In-flight recall deduplication: concurrent recalls for the same bank reuse one promise
 import type { RecallResponse } from "./types.js";
 import { marksPolicyFromConfig, registerHindsightContextEngine } from "./context-engine.js";
-import { resolveHostStateRoot } from "./host-paths.js";
+import { resolveHostStateRoot, resolveRetainQueuePath } from "./host-paths.js";
+import {
+  lifecycleAuthorityFor,
+  lifecycleScope as sharedLifecycleScope,
+  newLifecycleAuthority,
+  type LifecycleAuthority,
+} from "./lifecycle-authority.js";
 const inflightRecalls = new Map<string, Promise<RecallResponse>>();
 
 // Lightweight bank-scoped facade over HindsightClient. Created per-request via
@@ -182,7 +201,7 @@ export interface BankMissionsUpdate {
 export function scopeClient(c: HindsightClient, bankId: string): BankScopedClient {
   return {
     bankId,
-    async retain(req, capability = asyncRetainOperationIdCapability, signal) {
+    async retain(req, capability = currentLifecycle().asyncRetainOperationIdCapability, signal) {
       await c.retain(bankId, req.content, {
         documentId: req.documentId,
         context: req.context,
@@ -258,15 +277,22 @@ export function scopeClient(c: HindsightClient, bankId: string): BankScopedClien
 }
 
 async function ensureBankDefaultsApplied(bankId: string, config: PluginConfig): Promise<void> {
-  if (!client || !clientOptions || !hasConfiguredBankDefaults(config)) {
+  const lifecycle = currentLifecycle();
+  if (!lifecycle.client || !lifecycle.clientOptions || !hasConfiguredBankDefaults(config)) {
     return;
   }
-  if (banksWithDefaultsApplied.has(bankId)) {
+  // R23.1: the record belongs to the client that did the work, so a late finish can never mark
+  // a bank on a newer client. R24.1: install the client's one set before any await so concurrent
+  // first uses of different banks all record into it.
+  const client = lifecycle.client;
+  let applied = lifecycle.banksWithDefaultsApplied.get(client);
+  if (!applied) lifecycle.banksWithDefaultsApplied.set(client, (applied = new Set<string>()));
+  if (applied.has(bankId)) {
     return;
   }
   try {
-    await applyConfiguredBankDefaults(client, bankId, config, clientOptions);
-    banksWithDefaultsApplied.add(bankId);
+    await applyConfiguredBankDefaults(client, bankId, config, lifecycle.clientOptions);
+    applied.add(bankId);
     debug(`[Hindsight] Applied configured defaults for bank: ${bankId}`);
   } catch (error) {
     log.warn(
@@ -351,14 +377,9 @@ export function getDocumentIdBootToken(): string {
 }
 
 // Cooldown + guard to prevent concurrent reinit attempts
-let lastReinitAttempt = 0;
-let isReinitInProgress = false;
 const REINIT_COOLDOWN_MS = 30_000;
 
 // Retain queue (both external-API and local-daemon mode)
-let retainQueue: RetainQueue | null = null;
-let retainQueueFlushTimer: ReturnType<typeof setInterval> | null = null;
-let isFlushInProgress = false;
 const DEFAULT_FLUSH_INTERVAL_MS = 60_000; // 1 min
 
 /**
@@ -373,23 +394,25 @@ function initRetainQueue(
   expectedGeneration: number,
   signal: globalThis.AbortSignal
 ): void {
+  const lifecycle = currentLifecycle();
   // service.start() can run again without an intervening stop() (gateway
   // reloads); don't leak the previous generation's timer onto the new one.
-  if (retainQueueFlushTimer) {
-    clearInterval(retainQueueFlushTimer);
-    retainQueueFlushTimer = null;
+  if (lifecycle.flushTimer) {
+    clearInterval(lifecycle.flushTimer);
+    lifecycle.flushTimer = null;
   }
   try {
-    const queueDir = pluginConfig.retainQueuePath
-      ? dirname(pluginConfig.retainQueuePath)
-      : join(homedir(), ".openclaw", "data");
-    mkdirSync(queueDir, { recursive: true });
-    const queuePath =
-      pluginConfig.retainQueuePath || join(queueDir, "hindsight-retain-queue.jsonl");
+    // ebce1ee8c: the default queue is instance-relative; an inherited home is not instance identity.
+    // Hosts without runtime.state.resolveStateDir keep the legacy home default.
+    const queuePath = lifecycle.stateRoot
+      ? resolveRetainQueuePath(lifecycle.stateRoot, pluginConfig.retainQueuePath)
+      : pluginConfig.retainQueuePath ||
+        join(homedir(), ".openclaw", "data", "hindsight-retain-queue.jsonl");
+    mkdirSync(dirname(queuePath), { recursive: true });
     const queueFlushInterval = pluginConfig.retainQueueFlushIntervalMs ?? DEFAULT_FLUSH_INTERVAL_MS;
     const queueMaxAge = pluginConfig.retainQueueMaxAgeMs ?? -1;
-    retainQueue = new RetainQueue({ filePath: queuePath, maxAgeMs: queueMaxAge });
-    const pending = retainQueue.size();
+    lifecycle.queue = new RetainQueue({ filePath: queuePath, maxAgeMs: queueMaxAge });
+    const pending = lifecycle.queue.size();
     if (pending > 0) {
       log.info(`retain queue: ${pending} items pending from previous session, will flush shortly`);
     }
@@ -397,111 +420,83 @@ function initRetainQueue(
 
     // Periodic flush timer
     if (queueFlushInterval > 0) {
-      retainQueueFlushTimer = setInterval(() => {
+      lifecycle.flushTimer = setInterval(() => {
         void flushRetainQueue(undefined, undefined, undefined, expectedGeneration, signal);
       }, queueFlushInterval);
-      retainQueueFlushTimer.unref?.();
+      lifecycle.flushTimer.unref?.();
     }
   } catch (error) {
-    retainQueue = null;
+    lifecycle.queue = null;
     log.warn(`could not initialize retain queue, continuing without it: ${error}`);
   }
 }
 
 /**
- * Attempt to flush pending retains from the queue.
- * Each item is sent exactly as it would have been originally — same bank, payload, metadata.
+ * One bounded background reconciliation pass over the durable retain queue (e8cb94b7a,
+ * ae3d09089): submit with the persisted operation id, poll terminal status, and acknowledge a
+ * row only after the server reports it completed. Pending work stays queued for the next pass.
  */
 export async function flushRetainQueue(
   queueOverride?: RetainQueue,
   clientOverride?: HindsightClient,
   capabilityOverride?: AsyncRetainOperationIdCapability,
-  expectedGeneration = serviceGeneration,
-  signal: globalThis.AbortSignal | undefined = serviceAbortController?.signal
+  expectedGeneration = currentLifecycle().generation,
+  signal: globalThis.AbortSignal | undefined = currentLifecycle().serviceController?.signal,
+  transportOverride?: RetainTransport
 ): Promise<void> {
-  const activeQueue = queueOverride ?? retainQueue;
-  const activeClient = clientOverride ?? client;
-  if (
-    !activeQueue ||
-    isFlushInProgress ||
-    expectedGeneration !== serviceGeneration ||
-    signal?.aborted
-  )
-    return;
-
-  isFlushInProgress = true;
-  let flushed = 0;
-  let failed = 0;
-
+  const lifecycle = currentLifecycle();
+  const activeQueue = queueOverride ?? lifecycle.queue;
+  const activeClient = clientOverride ?? lifecycle.client;
+  const isCurrent = () => expectedGeneration === lifecycle.generation && !signal?.aborted;
+  if (!activeQueue || lifecycle.flushInProgress || !isCurrent()) return;
+  lifecycle.flushInProgress = true;
   try {
-    // Nothing queued means nothing to be idempotent about, so don't spend a
-    // /version round trip: this runs on a timer *and* after every successful
-    // retain, and probing an empty queue put a request behind every turn. The
-    // capability is re-read here whenever there is actually work to replay,
-    // which is the only moment it changes the outcome.
-    const pending = activeQueue.size();
-    if (pending === 0) return;
+    if (!activeQueue.size()) return;
     const capability =
       capabilityOverride ?? (await refreshQueueOperationIdCapability(expectedGeneration, signal));
-    if (expectedGeneration !== serviceGeneration || signal?.aborted) return;
+    if (!isCurrent() || (!activeClient && !transportOverride)) return;
     if (capability === "unknown") {
-      // Held back on purpose: a replay without operation_id is the one path that
-      // can duplicate durable memories. Warn rather than debug — if /version
-      // stays unreachable the queue grows without ever draining, and that must
-      // not be silent.
-      log.warn(
-        `retain queue flush deferred (${pending} queued): server operation-id capability unknown`
-      );
-      return;
-    }
-    if (!activeClient) return; // no client yet — can't flush
-
-    // Cleanup expired items first
-    activeQueue.cleanup();
-
-    const items = activeQueue.peek(50);
-    for (const item of items) {
-      try {
-        if (expectedGeneration !== serviceGeneration || signal?.aborted) return;
-        const operationId =
-          capability === "supported"
-            ? activeQueue.ensureOperationId(item.id, randomUUID())
-            : undefined;
-        await activeClient.retain(item.bankId, item.content, {
-          documentId: item.documentId,
-          context: item.context,
-          metadata: toStringMetadata(item.metadata),
-          tags: item.tags,
-          updateMode: item.updateMode,
-          async: true,
-          signal,
-          ...(operationId ? { operationId } : {}),
-        });
-
-        if (expectedGeneration !== serviceGeneration || signal?.aborted) return;
-        // Checkpoint each acknowledgement before the next network await. A
-        // later abort must not replay already-accepted work on legacy servers.
-        activeQueue.remove(item.id);
-        flushed++;
-      } catch {
-        if (expectedGeneration !== serviceGeneration || signal?.aborted) return;
-        // API still down — stop trying this batch
-        failed++;
-        break;
+      if (lifecycle.capabilityWarningGeneration !== expectedGeneration) {
+        lifecycle.capabilityWarningGeneration = expectedGeneration;
+        log.warn(
+          "retain operation-id capability is unknown; new submissions remain durably queued while accepted operations reconcile"
+        );
       }
+    } else {
+      lifecycle.capabilityWarningGeneration = null;
     }
-
-    if (expectedGeneration !== serviceGeneration || signal?.aborted) return;
-    const remaining = activeQueue.size();
-    if (flushed > 0) {
-      log.info(
-        `queue flush: ${flushed} queued retains delivered${remaining > 0 ? `, ${remaining} still pending` : ", queue empty"}`
+    const transport =
+      transportOverride ?? createRetainTransport(activeClient!, getActiveApiEndpoint(), USER_AGENT);
+    const completed = await reconcileRetainQueue({
+      queue: activeQueue,
+      transport,
+      capability,
+      signal,
+      isCurrent,
+      // R19.1: the completion-action writer (session-state markers) is not ported yet (P4 slice 3,
+      // unreviewed). A row carrying an action must NOT be acknowledged: failing its local
+      // application keeps the terminal receipt queued until a reviewed writer exists.
+      applyCompletion: (item) => {
+        if (item.completion) {
+          throw new Error(
+            "completion action held: no reviewed completion writer in this build; receipt kept queued"
+          );
+        }
+        const messages = Number(item.metadata.message_count ?? 0);
+        log.trackRetain(item.bankId, Number.isFinite(messages) ? messages : 0);
+      },
+      onIssue: (message) => log.warn(message),
+    });
+    if (completed && isCurrent()) {
+      log.info(`queue flush: ${completed} retains completed; ${activeQueue.size()} still pending`);
+    }
+  } catch (error) {
+    if (isCurrent())
+      log.warn(
+        `retain reconciliation deferred; durable queue preserved: ${error instanceof Error ? error.message : String(error)}`
       );
-    } else if (failed > 0) {
-      debug(`[Hindsight] Queue flush: API still unreachable, ${remaining} retains pending`);
-    }
   } finally {
-    isFlushInProgress = false;
+    lifecycle.flushInProgress = false;
   }
 }
 
@@ -597,80 +592,110 @@ export function formatCurrentTimeForRecall(date = new Date()): string {
  * Only works if initialization was attempted at least once (isInitialized guard).
  */
 async function lazyReinit(configOverride?: PluginConfig): Promise<void> {
+  const lifecycle = currentLifecycle();
   const now = Date.now();
-  if (now - lastReinitAttempt < REINIT_COOLDOWN_MS || isReinitInProgress) {
+  if (now - lifecycle.lastReinitAttempt < REINIT_COOLDOWN_MS || lifecycle.isReinitInProgress) {
     return;
   }
 
-  const config = configOverride ?? currentPluginConfig;
+  const config = configOverride ?? lifecycle.config;
   if (!config) {
     debug("[Hindsight] lazyReinit skipped - no plugin config available");
     return;
   }
 
   // Persist config if we only have it from the live hook registration path.
-  currentPluginConfig = config;
+  lifecycle.config = config;
 
-  isReinitInProgress = true;
-  lastReinitAttempt = now;
+  // R14.2: capture the lifetime this attempt serves; a start()/stop() that supersedes it while it
+  // awaits must not have its client/options/queue replaced, nor a newer attempt's flag cleared.
+  const attempt = {};
+  const generation = lifecycle.generation;
+  const controller = lifecycle.serviceController ?? lifecycle.preServiceController;
+  const attemptIsCurrent = () =>
+    lifecycle.reinitAttempt === attempt &&
+    lifecycle.generation === generation &&
+    (lifecycle.serviceController ?? lifecycle.preServiceController) === controller &&
+    !controller.signal.aborted;
+  lifecycle.isReinitInProgress = true;
+  lifecycle.reinitAttempt = attempt;
+  lifecycle.lastReinitAttempt = now;
   const externalApi = detectExternalApi(config);
   if (!externalApi.apiUrl) {
-    isReinitInProgress = false;
+    lifecycle.isReinitInProgress = false;
+    lifecycle.reinitAttempt = null;
     return; // Only external API mode supports lazy reinit
   }
 
   debug("[Hindsight] Attempting lazy re-initialization...");
   try {
     await checkExternalApiHealth(externalApi.apiUrl, externalApi.apiToken);
-    await detectAppendCapability(externalApi.apiUrl, externalApi.apiToken);
+    await detectAppendCapability(
+      externalApi.apiUrl,
+      externalApi.apiToken,
+      attemptIsCurrent,
+      controller.signal
+    );
+    if (!attemptIsCurrent()) {
+      debug("[Hindsight] lazy re-init superseded by a newer lifecycle - not publishing");
+      return;
+    }
 
     const llmConfig = detectLLMConfig(config);
-    clientOptions = buildClientOptions(llmConfig, config, externalApi);
-    banksWithDefaultsApplied.clear();
-    client = new HindsightClient(clientOptions);
+    lifecycle.clientOptions = buildClientOptions(llmConfig, config, externalApi);
+    lifecycle.client = new HindsightClient(lifecycle.clientOptions);
 
     if (usesStaticBank(config)) {
       await ensureBankDefaultsApplied(getStaticBankId(config), config);
     }
+    if (!attemptIsCurrent()) return;
 
-    usingExternalApi = true;
-    isInitialized = true;
+    lifecycle.usingExternalApi = true;
+    lifecycle.isInitialized = true;
     // A copy that was never started has no retain queue, so a failed retain
     // would be dropped instead of replayed. (#4537)
     // ponytail: the started copy may hold the same file, so both can replay one
     // item; the persisted operation id keeps that idempotent on API >= 0.8.6.
     // Share one queue per process via globalThis if duplicates show up on older APIs.
-    if (!retainQueue && serviceGeneration === 0 && !preServiceController.signal.aborted) {
-      initRetainQueue(config, 0, preServiceController.signal);
+    if (
+      !lifecycle.queue &&
+      lifecycle.generation === 0 &&
+      !lifecycle.preServiceController.signal.aborted
+    ) {
+      initRetainQueue(config, 0, lifecycle.preServiceController.signal);
     }
     // Replace the rejected initPromise with a resolved one
-    initPromise = Promise.resolve();
+    lifecycle.initPromise = Promise.resolve();
     debug("[Hindsight] ✓ Lazy re-initialization succeeded");
   } catch (error) {
     log.warn(
       `lazy re-init failed (retry in ${REINIT_COOLDOWN_MS / 1000}s): ${error instanceof Error ? error.message : error}`
     );
   } finally {
-    isReinitInProgress = false;
+    if (lifecycle.reinitAttempt === attempt) {
+      lifecycle.isReinitInProgress = false;
+      lifecycle.reinitAttempt = null;
+    }
   }
 }
 
 // Global access for hooks (Moltbot loads hooks separately)
 if (typeof global !== "undefined") {
   (global as any).__hindsightClient = {
-    getClient: () => client,
+    getClient: () => currentLifecycle().client,
     waitForReady: async () => {
-      if (isInitialized) {
+      const lifecycle = currentLifecycle();
+      if (lifecycle.isInitialized) {
         return;
       }
       // If initPromise is null, it means service.start() hasn't been called yet
       // (CLI mode, not gateway mode). Hooks should gracefully no-op.
-      if (!initPromise) {
-        if (currentPluginConfig) {
+      if (!lifecycle.initPromise) {
+        if (lifecycle.config) {
           log.warn(
             "waitForReady called before service.start() — attempting lazy initialization fallback"
           );
-          await lazyReinit(currentPluginConfig);
+          await lazyReinit(lifecycle.config);
           return;
         }
         log.warn(
@@ -679,12 +704,12 @@ if (typeof global !== "undefined") {
         return;
       }
       try {
-        await initPromise;
+        await lifecycle.initPromise;
       } catch {
         // Init failed (e.g., health check timeout at startup).
         // Attempt lazy re-initialization so Hindsight recovers
         // once the API becomes reachable again.
-        if (!isInitialized) {
+        if (!lifecycle.isInitialized) {
           await lazyReinit();
         }
       }
@@ -697,20 +722,21 @@ if (typeof global !== "undefined") {
     getClientForContext: async (
       ctx: PluginHookAgentContext | undefined
     ): Promise<BankScopedClient | null> => {
-      if (!client) return null;
-      const config = currentPluginConfig || {};
+      const lifecycle = currentLifecycle();
+      if (!lifecycle.client) return null;
+      const config = lifecycle.config || {};
       // deriveBankId already returns the static bank when dynamicBankId is false,
       // so the branch that used to stand here was redundant — and it routed around
       // the agentBankMap lookup for static configs. (#3890)
       const bankId = deriveBankId(ctx, config);
-      const scoped = scopeClient(client, bankId);
+      const scoped = scopeClient(lifecycle.client, bankId);
 
       // Stamp configured defaults onto this bank on first use (recall or retain).
       await ensureBankDefaultsApplied(bankId, config);
 
       return scoped;
     },
-    getPluginConfig: () => currentPluginConfig,
+    getPluginConfig: () => currentLifecycle().config,
   };
 }
 
@@ -762,8 +788,11 @@ async function readyClient(): Promise<{
   client: HindsightClient;
   options: HindsightClientOptions;
 } | null> {
+  const lifecycle = currentLifecycle();
   await (global as any).__hindsightClient?.waitForReady();
-  return client && clientOptions ? { client, options: clientOptions } : null;
+  return lifecycle.client && lifecycle.clientOptions
+    ? { client: lifecycle.client, options: lifecycle.clientOptions }
+    : null;
 }
 
 function authHeaders(options: HindsightClientOptions): Record<string, string> {
@@ -1820,9 +1849,20 @@ export function detectExternalApi(pluginConfig?: PluginConfig): {
  * (#3686)
  */
 function getActiveApiEndpoint(): { apiUrl: string | null; apiToken: string | null } {
-  const externalApi = detectExternalApi(currentPluginConfig ?? undefined);
-  if (externalApi.apiUrl) return externalApi;
-  return { apiUrl: hindsightServer?.getBaseUrl() ?? null, apiToken: null };
+  // R17.1: the endpoint of the root authority's ACTIVE client - never this module copy's own
+  // config, which may name a different endpoint than the client every copy is serving through.
+  const lifecycle = currentLifecycle();
+  if (lifecycle.client && lifecycle.clientOptions?.baseUrl) {
+    return {
+      apiUrl: lifecycle.clientOptions.baseUrl,
+      apiToken: lifecycle.clientOptions.apiKey ?? null,
+    };
+  }
+  return { apiUrl: lifecycle.hindsightServer?.getBaseUrl() ?? null, apiToken: null };
+}
+
+function sameEndpoint(a: string | null | undefined, b: string | null | undefined): boolean {
+  return (a ?? "").replace(/\/+$/, "") === (b ?? "").replace(/\/+$/, "");
 }
 
 /**
@@ -1978,28 +2018,38 @@ async function fetchHindsightApiCapabilities(
 export async function refreshAsyncRetainOperationIdCapability(
   apiUrl: string,
   apiToken?: string | null,
-  expectedGeneration = serviceGeneration,
-  signal: globalThis.AbortSignal | undefined = serviceAbortController?.signal
+  expectedGeneration = currentLifecycle().generation,
+  signal: globalThis.AbortSignal | undefined = currentLifecycle().serviceController?.signal
 ): Promise<AsyncRetainOperationIdCapability> {
+  const lifecycle = currentLifecycle();
+  const clientAtProbe = lifecycle.client;
   const capabilities = await fetchHindsightApiCapabilities(apiUrl, apiToken, signal);
   const capability = asyncRetainOperationIdCapabilityFromCapabilities(capabilities);
-  if (expectedGeneration !== serviceGeneration || signal?.aborted) return "unknown";
-  asyncRetainOperationIdCapability = capability;
+  if (expectedGeneration !== lifecycle.generation || signal?.aborted) return "unknown";
+  // R17.1: publish only for the client this answer describes - the same live client, at this endpoint.
+  if (
+    lifecycle.clientOptions &&
+    (lifecycle.client !== clientAtProbe || !sameEndpoint(lifecycle.clientOptions.baseUrl, apiUrl))
+  ) {
+    return "unknown";
+  }
+  lifecycle.asyncRetainOperationIdCapability = capability;
   return capability;
 }
 
 async function refreshQueueOperationIdCapability(
-  expectedGeneration = serviceGeneration,
-  signal: globalThis.AbortSignal | undefined = serviceAbortController?.signal
+  expectedGeneration = currentLifecycle().generation,
+  signal: globalThis.AbortSignal | undefined = currentLifecycle().serviceController?.signal
 ): Promise<AsyncRetainOperationIdCapability> {
-  if (expectedGeneration !== serviceGeneration || signal?.aborted) return "unknown";
-  if (!currentPluginConfig) {
-    asyncRetainOperationIdCapability = "unknown";
+  const lifecycle = currentLifecycle();
+  if (expectedGeneration !== lifecycle.generation || signal?.aborted) return "unknown";
+  if (!lifecycle.config) {
+    lifecycle.asyncRetainOperationIdCapability = "unknown";
     return "unknown";
   }
   const endpoint = getActiveApiEndpoint();
   if (!endpoint.apiUrl) {
-    asyncRetainOperationIdCapability = "unknown";
+    lifecycle.asyncRetainOperationIdCapability = "unknown";
     return "unknown";
   }
   return refreshAsyncRetainOperationIdCapability(
@@ -2025,18 +2075,22 @@ async function refreshQueueOperationIdCapability(
  */
 async function detectAppendCapability(
   apiUrl: string,
-  apiToken?: string | null,
-  expectedGeneration = serviceGeneration,
-  signal: globalThis.AbortSignal | undefined = serviceAbortController?.signal
+  apiToken: string | null | undefined,
+  isCurrent: () => boolean,
+  signal: globalThis.AbortSignal
 ): Promise<void> {
+  // R20.1: the caller's captured lifetime - a superseded attempt neither probes nor publishes.
+  const lifecycle = currentLifecycle();
+  if (!isCurrent()) return;
   const capabilities = await fetchHindsightApiCapabilities(apiUrl, apiToken, signal);
-  if (expectedGeneration !== serviceGeneration || signal?.aborted) return;
+  if (!isCurrent()) return;
   const supported = supportsAppendFromCapabilities(capabilities);
-  asyncRetainOperationIdCapability = asyncRetainOperationIdCapabilityFromCapabilities(capabilities);
-  const transitionedToUnsupported = supportsUpdateModeAppend && !supported;
-  const firstProbe = !appendCapabilityProbed;
-  appendCapabilityProbed = true;
-  supportsUpdateModeAppend = supported;
+  lifecycle.asyncRetainOperationIdCapability =
+    asyncRetainOperationIdCapabilityFromCapabilities(capabilities);
+  const transitionedToUnsupported = lifecycle.supportsUpdateModeAppend && !supported;
+  const firstProbe = !lifecycle.appendCapabilityProbed;
+  lifecycle.appendCapabilityProbed = true;
+  lifecycle.supportsUpdateModeAppend = supported;
   if (supported && capabilities) {
     debug(
       `[Hindsight] API version ${capabilities.version} supports update_mode=append with stored document text`
@@ -2285,6 +2339,19 @@ export function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
 const _registeredApis = new WeakSet<MoltbotPluginAPI>();
 
 export default function (api: MoltbotPluginAPI) {
+  // P3 (e8cb F1): every copy for this host instance shares one lifecycle, client and queue.
+  let hostStateRoot: string | undefined;
+  try {
+    hostStateRoot = resolveHostStateRoot(api);
+  } catch {
+    hostStateRoot = undefined;
+  }
+  // R14.1: this registration's own authority, captured lexically by everything registered below.
+  const lifecycle = hostStateRoot ? lifecycleAuthorityFor(hostStateRoot) : unrootedLifecycle;
+  lastRegisteredLifecycle = lifecycle;
+  const scoped = <A extends unknown[], R>(fn: (...args: A) => R) => bindLifecycle(lifecycle, fn);
+  const onScoped = (event: string, handler: Parameters<MoltbotPluginAPI["on"]>[1]) =>
+    api.on(event, scoped(handler));
   if (_registeredApis.has(api)) {
     debug("[Hindsight] Plugin entry skipped (this api instance already registered)");
     return;
@@ -2308,22 +2375,17 @@ export default function (api: MoltbotPluginAPI) {
       logSummaryIntervalMs: pluginConfig.logSummaryIntervalMs,
     });
 
-    // Store config globally for bank ID derivation in hooks
-    currentPluginConfig = pluginConfig;
+    // R20.2: config (bank mapping, policy) is bound to this registration's root, like its client.
+    lifecycle.config = pluginConfig;
 
     // Register the Hindsight context engine (non-durable shell; see context-engine.ts).
     // Inert unless plugins.slots.contextEngine selects "hindsight-openclaw".
     // Mark application needs the host instance root; without it assembly stays pass-through.
-    let engineStateRoot: string | undefined;
-    try {
-      engineStateRoot = resolveHostStateRoot(api);
-    } catch {
-      engineStateRoot = undefined;
-    }
+    const engineStateRoot = hostStateRoot;
     // Admission knobs ride the apply context from the live plugin config (re-read per assemble,
     // so a config reinit is honoured).
     registerHindsightContextEngine(api, log, engineStateRoot, () =>
-      marksPolicyFromConfig(currentPluginConfig)
+      marksPolicyFromConfig(lifecycle.config)
     );
 
     debug("[Hindsight] Plugin loaded successfully (deferred heavy init to gateway start)");
@@ -2334,15 +2396,24 @@ export default function (api: MoltbotPluginAPI) {
     // not on every CLI command.
     debug("[Hindsight] Registering service...");
     log.info("registering plugin service");
+    // e8cb R1: the owner is this service registration, not the module copy - one evaluated
+    // module can register for two plugin APIs.
+    const serviceOwner = {};
     api.registerService({
       id: "hindsight-memory",
-      async start() {
-        preServiceController.abort();
-        serviceAbortController?.abort();
+      start: scoped(async () => {
+        lifecycle.preServiceController.abort();
+        lifecycle.serviceController?.abort();
         inflightRecalls.clear();
         const serviceController = new AbortController();
-        serviceAbortController = serviceController;
-        const startGeneration = ++serviceGeneration;
+        lifecycle.serviceController = serviceController;
+        lifecycle.owner = serviceOwner;
+        const startGeneration = ++lifecycle.generation;
+        // R14.2: async init publishes only while this start still owns the lifecycle.
+        const startIsCurrent = () =>
+          lifecycle.generation === startGeneration &&
+          lifecycle.serviceController === serviceController &&
+          !serviceController.signal.aborted;
         log.info("service.start invoked");
         debug("[Hindsight] Service start called - beginning heavy initialization...");
 
@@ -2385,7 +2456,17 @@ export default function (api: MoltbotPluginAPI) {
 
         // Detect external API mode
         const externalApi = detectExternalApi(pluginConfig);
-        usingExternalApi = Boolean(externalApi.apiUrl);
+        lifecycle.usingExternalApi = Boolean(externalApi.apiUrl);
+        // R17.2: a daemon manager an earlier owner started for this root is now ours to dispose -
+        // an external-mode owner would otherwise leave it recorded and never stopped.
+        if (lifecycle.usingExternalApi && lifecycle.hindsightServer) {
+          const prior = lifecycle.hindsightServer;
+          lifecycle.hindsightServer = null;
+          await prior
+            .stop()
+            .catch((error: unknown) => log.warn(`prior daemon stop failed: ${error}`));
+          if (!startIsCurrent()) return;
+        }
 
         // Get API port from config (default: 9077)
         const apiPort = pluginConfig.apiPort || 9077;
@@ -2397,7 +2478,7 @@ export default function (api: MoltbotPluginAPI) {
 
         if (externalApi.apiUrl) {
           // External API mode - skip local daemon
-          usingExternalApi = true;
+          lifecycle.usingExternalApi = true;
           debug(`[Hindsight] ✓ Using external API: ${externalApi.apiUrl}`);
 
           if (externalApi.apiToken) {
@@ -2409,19 +2490,24 @@ export default function (api: MoltbotPluginAPI) {
 
         // Initialize (runs synchronously in service.start())
         debug("[Hindsight] Starting initialization...");
-        initPromise = (async () => {
+        lifecycle.initPromise = (async () => {
           try {
-            if (usingExternalApi && externalApi.apiUrl) {
+            if (lifecycle.usingExternalApi && externalApi.apiUrl) {
               // External API mode - check health, skip daemon startup
               debug("[Hindsight] External API mode - skipping local daemon...");
               await checkExternalApiHealth(externalApi.apiUrl, externalApi.apiToken);
-              await detectAppendCapability(externalApi.apiUrl, externalApi.apiToken);
+              await detectAppendCapability(
+                externalApi.apiUrl,
+                externalApi.apiToken,
+                startIsCurrent,
+                serviceController.signal
+              );
+              if (!startIsCurrent()) return;
 
               // Initialize client for external API
               debug("[Hindsight] Creating HindsightClient (external API)...");
-              clientOptions = buildClientOptions(llmConfig, pluginConfig, externalApi);
-              banksWithDefaultsApplied.clear();
-              client = new HindsightClient(clientOptions);
+              lifecycle.clientOptions = buildClientOptions(llmConfig, pluginConfig, externalApi);
+              lifecycle.client = new HindsightClient(lifecycle.clientOptions);
 
               const defaultBankId = deriveBankId(undefined, pluginConfig);
               debug(`[Hindsight] Default bank: ${defaultBankId}`);
@@ -2432,8 +2518,9 @@ export default function (api: MoltbotPluginAPI) {
                 debug(`[Hindsight] Applying configured bank defaults...`);
                 await ensureBankDefaultsApplied(defaultBankId, pluginConfig);
               }
+              if (!startIsCurrent()) return;
 
-              if (!isInitialized) {
+              if (!lifecycle.isInitialized) {
                 const mode = "external API";
                 const autoRecall = pluginConfig.autoRecall !== false;
                 const autoRetain = pluginConfig.autoRetain !== false;
@@ -2441,12 +2528,12 @@ export default function (api: MoltbotPluginAPI) {
                   `initialized (mode: ${mode}, bank: ${defaultBankId}, autoRecall: ${autoRecall}, autoRetain: ${autoRetain})`
                 );
               }
-              isInitialized = true;
+              lifecycle.isInitialized = true;
               debug("[Hindsight] ✓ Ready (external API mode)");
             } else {
               // Local daemon mode - start hindsight-embed daemon
               debug("[Hindsight] Creating HindsightServer...");
-              hindsightServer = new HindsightServer({
+              lifecycle.hindsightServer = new HindsightServer({
                 profile: "openclaw",
                 port: apiPort,
                 embedVersion: pluginConfig.embedVersion,
@@ -2463,18 +2550,23 @@ export default function (api: MoltbotPluginAPI) {
 
               // Start the embedded server
               debug("[Hindsight] Starting embedded server...");
-              await hindsightServer.start();
+              await lifecycle.hindsightServer.start();
 
               // The daemon is a Hindsight API like any other: probe it for the
               // same capabilities as an external one, or retains here silently
               // fall back to per-turn document ids. (#3686)
-              await detectAppendCapability(hindsightServer.getBaseUrl());
+              await detectAppendCapability(
+                lifecycle.hindsightServer.getBaseUrl(),
+                null,
+                startIsCurrent,
+                serviceController.signal
+              );
+              if (!startIsCurrent()) return;
 
               // Initialize client pointed at the local daemon URL
               debug("[Hindsight] Creating HindsightClient (local daemon)...");
-              clientOptions = { baseUrl: hindsightServer.getBaseUrl() };
-              banksWithDefaultsApplied.clear();
-              client = new HindsightClient(clientOptions);
+              lifecycle.clientOptions = { baseUrl: lifecycle.hindsightServer.getBaseUrl() };
+              lifecycle.client = new HindsightClient(lifecycle.clientOptions);
 
               const defaultBankId = deriveBankId(undefined, pluginConfig);
               debug(`[Hindsight] Default bank: ${defaultBankId}`);
@@ -2485,8 +2577,9 @@ export default function (api: MoltbotPluginAPI) {
                 debug(`[Hindsight] Applying configured bank defaults...`);
                 await ensureBankDefaultsApplied(defaultBankId, pluginConfig);
               }
+              if (!startIsCurrent()) return;
 
-              if (!isInitialized) {
+              if (!lifecycle.isInitialized) {
                 const mode = "local daemon";
                 const autoRecall = pluginConfig.autoRecall !== false;
                 const autoRetain = pluginConfig.autoRetain !== false;
@@ -2494,7 +2587,7 @@ export default function (api: MoltbotPluginAPI) {
                   `initialized (mode: ${mode}, bank: ${defaultBankId}, autoRecall: ${autoRecall}, autoRetain: ${autoRetain})`
                 );
               }
-              isInitialized = true;
+              lifecycle.isInitialized = true;
               debug("[Hindsight] ✓ Ready");
             }
           } catch (error) {
@@ -2505,83 +2598,104 @@ export default function (api: MoltbotPluginAPI) {
 
         // Wait for initialization to complete
         try {
-          await initPromise;
+          await lifecycle.initPromise;
         } catch (error) {
           log.error("initial initialization failed", error);
           // Continue to health check below
         }
+        if (!startIsCurrent()) return;
 
         // External API mode: check external API health
-        if (usingExternalApi) {
+        if (lifecycle.usingExternalApi) {
           const externalApi = detectExternalApi(pluginConfig);
-          if (externalApi.apiUrl && isInitialized) {
+          if (externalApi.apiUrl && lifecycle.isInitialized) {
             try {
               await checkExternalApiHealth(externalApi.apiUrl, externalApi.apiToken);
-              await detectAppendCapability(externalApi.apiUrl, externalApi.apiToken);
+              await detectAppendCapability(
+                externalApi.apiUrl,
+                externalApi.apiToken,
+                startIsCurrent,
+                serviceController.signal
+              );
               debug("[Hindsight] External API is healthy");
               return;
             } catch (error) {
+              if (!startIsCurrent()) return;
               log.error("external API health check failed", error);
               // Reset state for reinitialization attempt
-              client = null;
-              clientOptions = null;
-              banksWithDefaultsApplied.clear();
-              isInitialized = false;
+              lifecycle.client = null;
+              lifecycle.clientOptions = null;
+              lifecycle.isInitialized = false;
             }
           }
         } else {
           // Local daemon mode: check daemon health (handles SIGUSR1 restart case)
-          if (hindsightServer && isInitialized) {
-            const healthy = await hindsightServer.checkHealth();
+          if (lifecycle.hindsightServer && lifecycle.isInitialized) {
+            const healthy = await lifecycle.hindsightServer.checkHealth();
+            if (!startIsCurrent()) return;
             if (healthy) {
               // Same re-probe the external branch does after its health check:
               // the daemon may have been restarted (SIGUSR1) onto a different
               // embed version since we last looked. (#3686)
-              await detectAppendCapability(hindsightServer.getBaseUrl());
+              await detectAppendCapability(
+                lifecycle.hindsightServer.getBaseUrl(),
+                null,
+                startIsCurrent,
+                serviceController.signal
+              );
               debug("[Hindsight] Daemon is healthy");
               return;
             }
 
             debug("[Hindsight] Daemon is not responding - reinitializing...");
             // Reset state for reinitialization
-            hindsightServer = null;
-            client = null;
-            clientOptions = null;
-            banksWithDefaultsApplied.clear();
-            isInitialized = false;
+            lifecycle.hindsightServer = null;
+            lifecycle.client = null;
+            lifecycle.clientOptions = null;
+            lifecycle.isInitialized = false;
           }
         }
 
         // Reinitialize if needed (fresh start or recovery)
-        if (!isInitialized) {
+        if (!lifecycle.isInitialized) {
           debug("[Hindsight] Reinitializing...");
           const reinitPluginConfig = getPluginConfig(api);
-          currentPluginConfig = reinitPluginConfig;
+          lifecycle.config = reinitPluginConfig;
           const llmConfig = detectLLMConfig(reinitPluginConfig);
           const externalApi = detectExternalApi(reinitPluginConfig);
           const apiPort = reinitPluginConfig.apiPort || 9077;
 
           if (externalApi.apiUrl) {
             // External API mode
-            usingExternalApi = true;
+            lifecycle.usingExternalApi = true;
 
             await checkExternalApiHealth(externalApi.apiUrl, externalApi.apiToken);
-            await detectAppendCapability(externalApi.apiUrl, externalApi.apiToken);
+            await detectAppendCapability(
+              externalApi.apiUrl,
+              externalApi.apiToken,
+              startIsCurrent,
+              serviceController.signal
+            );
+            if (!startIsCurrent()) return;
 
-            clientOptions = buildClientOptions(llmConfig, reinitPluginConfig, externalApi);
-            banksWithDefaultsApplied.clear();
-            client = new HindsightClient(clientOptions);
+            lifecycle.clientOptions = buildClientOptions(
+              llmConfig,
+              reinitPluginConfig,
+              externalApi
+            );
+            lifecycle.client = new HindsightClient(lifecycle.clientOptions);
             const defaultBankId = deriveBankId(undefined, reinitPluginConfig);
 
             if (usesStaticBank(reinitPluginConfig)) {
               await ensureBankDefaultsApplied(defaultBankId, reinitPluginConfig);
             }
+            if (!startIsCurrent()) return;
 
-            isInitialized = true;
+            lifecycle.isInitialized = true;
             debug("[Hindsight] Reinitialization complete (external API mode)");
           } else {
             // Local daemon mode
-            hindsightServer = new HindsightServer({
+            lifecycle.hindsightServer = new HindsightServer({
               profile: "openclaw",
               port: apiPort,
               embedVersion: reinitPluginConfig.embedVersion,
@@ -2598,69 +2712,85 @@ export default function (api: MoltbotPluginAPI) {
               logger: embedLogger,
             });
 
-            await hindsightServer.start();
-            await detectAppendCapability(hindsightServer.getBaseUrl());
+            await lifecycle.hindsightServer.start();
+            await detectAppendCapability(
+              lifecycle.hindsightServer.getBaseUrl(),
+              null,
+              startIsCurrent,
+              serviceController.signal
+            );
+            if (!startIsCurrent()) return;
 
-            clientOptions = { baseUrl: hindsightServer.getBaseUrl() };
-            banksWithDefaultsApplied.clear();
-            client = new HindsightClient(clientOptions);
+            lifecycle.clientOptions = { baseUrl: lifecycle.hindsightServer.getBaseUrl() };
+            lifecycle.client = new HindsightClient(lifecycle.clientOptions);
             const defaultBankId = deriveBankId(undefined, reinitPluginConfig);
 
             if (usesStaticBank(reinitPluginConfig)) {
               await ensureBankDefaultsApplied(defaultBankId, reinitPluginConfig);
             }
+            if (!startIsCurrent()) return;
 
-            isInitialized = true;
+            lifecycle.isInitialized = true;
             debug("[Hindsight] Reinitialization complete");
           }
         }
-      },
+      }),
 
-      async stop() {
+      stop: scoped(async () => {
+        // e8cb F1/R1: only the registration that started the current lifecycle (or any
+        // registration before a first start) ends it. Another registration's stop() is a no-op:
+        // its hooks already run under the owner's lifecycle, and tearing down the shared client
+        // would break the owner's retains.
+        if (lifecycle.owner !== null && lifecycle.owner !== serviceOwner) {
+          debug(
+            "[Hindsight] Service stop on a registration that does not own the lifecycle - ignored"
+          );
+          return;
+        }
         try {
-          serviceGeneration++;
-          preServiceController.abort();
-          serviceAbortController?.abort();
-          serviceAbortController = null;
+          const stopGeneration = ++lifecycle.generation;
+          lifecycle.preServiceController.abort();
+          lifecycle.serviceController?.abort();
+          lifecycle.serviceController = null;
+          lifecycle.owner = null;
           inflightRecalls.clear();
           debug("[Hindsight] Service stopping...");
 
-          // Only stop daemon if in local mode
-          if (!usingExternalApi && hindsightServer) {
-            await hindsightServer.stop();
-            hindsightServer = null;
-          }
+          // R20.3: detach everything this stop disposes before its one await, so a newer owner that
+          // starts meanwhile keeps its own client, queue and daemon. R17.2: whatever the client mode.
+          const server = lifecycle.hindsightServer;
+          lifecycle.hindsightServer = null;
 
           // Close retain queue
-          if (retainQueueFlushTimer) {
-            clearInterval(retainQueueFlushTimer);
-            retainQueueFlushTimer = null;
+          if (lifecycle.flushTimer) {
+            clearInterval(lifecycle.flushTimer);
+            lifecycle.flushTimer = null;
           }
-          if (retainQueue) {
-            const pending = retainQueue.size();
+          if (lifecycle.queue) {
+            const pending = lifecycle.queue.size();
             if (pending > 0) {
               debug(
                 `[Hindsight] Service stopping with ${pending} queued retains (will resume on next start)`
               );
             }
-            retainQueue.close();
-            retainQueue = null;
+            lifecycle.queue.close();
+            lifecycle.queue = null;
           }
 
-          client = null;
-          clientOptions = null;
-          asyncRetainOperationIdCapability = "unknown";
-          usingExternalApi = false;
-          banksWithDefaultsApplied.clear();
-          isInitialized = false;
+          lifecycle.client = null;
+          lifecycle.clientOptions = null;
+          lifecycle.asyncRetainOperationIdCapability = "unknown";
+          lifecycle.usingExternalApi = false;
+          lifecycle.isInitialized = false;
 
-          stopLogger();
+          await server?.stop();
+          if (lifecycle.generation === stopGeneration) stopLogger();
           debug("[Hindsight] Service stopped");
         } catch (error) {
           log.error("service stop error", error);
           throw error;
         }
-      },
+      }),
     });
 
     debug("[Hindsight] Plugin loaded successfully");
@@ -2684,7 +2814,7 @@ export default function (api: MoltbotPluginAPI) {
     // to start or resume a Goal while any plugin holds `before_dispatch` (it can't
     // replay it after a restart), so the plugin blocked Goals. `message_received`
     // fires earlier on the same inbound path and is not on that list. (#5177)
-    api.on("message_received", async (event: any, ctx?: PluginHookAgentContext) => {
+    onScoped("message_received", async (event: any, ctx?: PluginHookAgentContext) => {
       try {
         const sessionKey =
           ctx?.sessionKey ?? (typeof event?.sessionKey === "string" ? event.sessionKey : undefined);
@@ -2738,7 +2868,7 @@ export default function (api: MoltbotPluginAPI) {
 
     // Auto-recall: Inject relevant memories before agent processes the message
     // Hook signature: (event, ctx) where event has {prompt, messages?} and ctx has agent context
-    api.on("before_prompt_build", async (event: any, ctx?: PluginHookAgentContext) => {
+    onScoped("before_prompt_build", async (event: any, ctx?: PluginHookAgentContext) => {
       const recallLifecycle = captureHookLifecycle();
       const isCurrentRecall = recallLifecycle.isCurrent;
       if (!isCurrentRecall()) return;
@@ -3038,7 +3168,7 @@ ${memoriesFormatted}
     ): Promise<void> => {
       const force = retainOptions.force === true;
       const hookName = retainOptions.hookName;
-      const retainGeneration = serviceGeneration;
+      const retainGeneration = lifecycle.generation;
       const { signal: retainSignal, isCurrent: retainLifecycleIsCurrent } = captureHookLifecycle();
       if (!retainLifecycleIsCurrent()) return;
       // Optional perf instrumentation (#1406). Only emitted when an actual
@@ -3308,9 +3438,9 @@ ${memoriesFormatted}
         // request in front of every turn, and the answer changes at most once
         // per server restart — the queue flush re-probes on its own timer.
         const retainOperationIdCapability =
-          asyncRetainOperationIdCapability === "unknown"
+          lifecycle.asyncRetainOperationIdCapability === "unknown"
             ? await refreshQueueOperationIdCapability(retainGeneration, retainSignal)
-            : asyncRetainOperationIdCapability;
+            : lifecycle.asyncRetainOperationIdCapability;
         if (!retainLifecycleIsCurrent()) return;
         const retainNow = Date.now();
         const retainRequest = buildRetainRequest(
@@ -3325,7 +3455,7 @@ ${memoriesFormatted}
               ? (pluginConfig.retainEveryNTurns ?? 1) + (pluginConfig.retainOverlapTurns ?? 0)
               : undefined,
             tags: inlineRetainTags,
-            appendSupported: supportsUpdateModeAppend,
+            appendSupported: lifecycle.supportsUpdateModeAppend,
             operationId: createAsyncRetainOperationId(),
           }
         );
@@ -3335,55 +3465,41 @@ ${memoriesFormatted}
           `[Hindsight] Retaining to bank ${bankId}, document: ${retainRequest.documentId}, chars: ${transcript.length}\n---\n${transcript.substring(0, 500)}${transcript.length > 500 ? "\n...(truncated)" : ""}\n---`
         );
 
-        const retainStart = pluginConfig.debugPerfTiming ? Date.now() : 0;
-        let retainElapsedMs = 0;
-        let retainOutcome: "ok" | "queued" | "error" = "error";
-        try {
-          // An unknown capability does not hold up the first send: there is
-          // nothing on the server yet for it to duplicate, so omitting the wire
-          // field is exactly today's behaviour. The id is still allocated and
-          // persisted with the request, so a *replay* can be idempotent once the
-          // capability is known — that is where duplicates actually come from.
-          await client.retain(retainRequest, retainOperationIdCapability, retainSignal);
-          if (!retainLifecycleIsCurrent()) return;
-          retainElapsedMs = pluginConfig.debugPerfTiming ? Date.now() - retainStart : 0;
-          retainOutcome = "ok";
-          log.trackRetain(bankId, messageCount);
-          debug(
-            `[Hindsight] Retained ${messageCount} messages to bank ${bankId} for session ${retainRequest.documentId}`
-          );
-
-          // After a successful retain, try flushing any queued items
-          if (retainQueue) {
-            flushRetainQueue(undefined, undefined, undefined, retainGeneration, retainSignal).catch(
-              () => {}
-            );
-          }
-        } catch (retainError) {
-          if (!retainLifecycleIsCurrent()) return;
-          retainElapsedMs = pluginConfig.debugPerfTiming ? Date.now() - retainStart : 0;
-          // Queue the failed retain for later delivery
-          if (retainQueue) {
-            retainQueue.enqueue(bankId, retainRequest, retainRequest.metadata);
-            retainOutcome = "queued";
-            const pending = retainQueue.size();
-            log.warn(
-              `API unreachable — retain queued (${pending} pending, bank: ${bankId}): ${retainError instanceof Error ? retainError.message : retainError}`
-            );
-          } else {
-            log.error("error retaining messages", retainError);
-          }
+        if (!lifecycle.queue) {
+          throw new Error("Retain queue is unavailable; refusing an untracked memory submission");
         }
-
+        const rawClient = lifecycle.client;
+        if (!rawClient) throw new Error("Retain client is unavailable");
+        const transport = createRetainTransport(rawClient, getActiveApiEndpoint(), USER_AGENT);
+        if (!retainLifecycleIsCurrent()) return;
+        // Durable capture precedes every network await (e8cb94b7a): the queue line is written
+        // synchronously before the hook can return.
+        lifecycle.queue.enqueue(
+          bankId,
+          { ...retainRequest, targetFingerprint: transport.targetFingerprint },
+          retainRequest.metadata
+        );
         if (pluginConfig.debugPerfTiming) {
           log.info(
             formatHookPerf(hookName, Date.now() - perfHookStart, {
-              retain: `${retainElapsedMs}ms`,
-              outcome: retainOutcome,
+              outcome: "queued",
               bank: bankId,
               messages: messageCount,
             })
           );
+        }
+        // Ruling 2026-11-01 (Vern + Claude): agent_end never waits for delivery; the pass runs in
+        // the background and pending work stays queued. session_end's one bounded awaited pass
+        // (5 s budget) is owned by its hook, whether or not this close captured a tail (R21.1).
+        if (hookName === "agent_end") {
+          void flushRetainQueue(
+            undefined,
+            rawClient,
+            retainOperationIdCapability,
+            retainGeneration,
+            retainSignal,
+            transport
+          ).catch(() => {});
         }
       } catch (error) {
         log.error("error retaining messages", error);
@@ -3391,15 +3507,19 @@ ${memoriesFormatted}
     };
 
     // Hook signature: (event, ctx) where event has {messages, success, error?, durationMs?}
-    api.on("agent_end", async (event: any, ctx?: PluginHookAgentContext) => {
+    onScoped("agent_end", async (event: any, ctx?: PluginHookAgentContext) => {
       await runRetain(event, ctx, { hookName: "agent_end" });
     });
 
     // session_end fires once per OpenClaw session close. We force-flush so
     // short conversations (fewer turns than `retainEveryNTurns`) and the
     // un-retained tail of long conversations are not silently dropped. (#1726)
-    api.on("session_end", async (event: any, ctx?: PluginHookAgentContext) => {
+    onScoped("session_end", async (event: any, ctx?: PluginHookAgentContext) => {
       await runRetain(event, ctx, { hookName: "session_end", force: true });
+      // R19.2/R21.1: the close's single bounded awaited pass over everything queued, including a
+      // tail captured just above. If a pass is already running this returns at once; that pass or
+      // the timer finishes the row.
+      await flushRetainQueue().catch(() => undefined);
     });
     debug("[Hindsight] Hooks registered");
     log.info("agent hooks registered");
@@ -3409,11 +3529,11 @@ ${memoriesFormatted}
     api.registerMemoryCapability?.({
       providerRuntime: createMemoryProviderRuntime({
         providerId: "hindsight-openclaw",
-        agentBank: (agentId) => agentOnlyBankId(agentId, currentPluginConfig || pluginConfig),
+        agentBank: (agentId) => agentOnlyBankId(agentId, lifecycle.config || pluginConfig),
         recall: async (bankId, query, signal) => {
-          const live = await readyClient();
+          const live = await scoped(readyClient)();
           if (!live) throw new Error("Hindsight client is not initialized");
-          const config = currentPluginConfig || pluginConfig;
+          const config = lifecycle.config || pluginConfig;
           const response = await scopeClient(live.client, bankId).recall(
             {
               query,
@@ -3431,7 +3551,7 @@ ${memoriesFormatted}
           }));
         },
         getMemory: async (bankId, memoryId, signal) => {
-          const live = await readyClient();
+          const live = await scoped(readyClient)();
           if (!live) throw new Error("Hindsight client is not initialized");
           const res = await fetch(
             `${live.options.baseUrl.replace(/\/$/, "")}/v1/default/banks/${encodeURIComponent(bankId)}/memories/${encodeURIComponent(memoryId)}`,
@@ -3443,7 +3563,7 @@ ${memoriesFormatted}
           return typeof body.text === "string" ? body.text : null;
         },
         healthy: async () => {
-          const live = await readyClient().catch(() => null);
+          const live = await scoped(readyClient)().catch(() => null);
           if (!live) return false;
           // Bounded: OpenClaw's status call waits on this, and a hung API must read
           // as unavailable rather than hang the Memory page.
@@ -3462,7 +3582,7 @@ ${memoriesFormatted}
         createHindsightTools(
           {
             bankFor: (ctx) => {
-              const config = currentPluginConfig || pluginConfig;
+              const config = lifecycle.config || pluginConfig;
               // The same identity resolution auto-recall runs, so the tools land on its bank.
               const { resolvedCtx, skipReason } = resolveAndCacheIdentity({
                 sessionKey: ctx.sessionKey,
@@ -3479,12 +3599,12 @@ ${memoriesFormatted}
                 : { bankId: deriveBankId(resolvedCtx, config) };
             },
             clientFor: async (bankId) => {
-              const live = await readyClient();
+              const live = await scoped(readyClient)();
               if (!live) throw new Error("Hindsight client is not initialized");
-              await ensureBankDefaultsApplied(bankId, currentPluginConfig || pluginConfig);
+              await scoped(ensureBankDefaultsApplied)(bankId, lifecycle.config || pluginConfig);
               return live.client;
             },
-            config: () => currentPluginConfig || pluginConfig,
+            config: () => lifecycle.config || pluginConfig,
           },
           toolCtx
         ),
@@ -3936,5 +4056,5 @@ export function sliceLastTurnsByUserBoundary(messages: any[], turns: number): an
 }
 
 export function getClient() {
-  return client;
+  return currentLifecycle().client;
 }

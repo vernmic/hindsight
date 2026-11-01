@@ -191,6 +191,8 @@ export interface PluginConfig {
   logLevel?: "off" | "error" | "warning" | "info" | "debug"; // Console log verbosity (default: 'info').
   logSummaryIntervalMs?: number; // Batch retain/recall log summaries over this interval in ms. 0 = log every event. Default: 300000 (5 min).
   retainQueuePath?: string; // Path to JSONL file for buffering failed retains. Default: ~/.openclaw/data/hindsight-retain-queue.jsonl
+  /** @deprecated Ignored. agent_end always returns once the retain is durably queued; delivery runs in the background. */
+  retainNonBlocking?: boolean;
   retainQueueMaxAgeMs?: number; // Max age in ms for queued items. -1 = keep forever (default: -1)
   retainQueueFlushIntervalMs?: number; // How often to attempt flushing the queue in ms. Default: 60000 (1 min)
   /**
