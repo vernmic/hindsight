@@ -1,0 +1,5 @@
+name: jev-skill-policy
+version: 0.2.0
+description: Jev skill-policy judge for the proposed pre_skill_batch hook (W02 reference, proposal-dependent).
+provides_hooks:
+  - pre_skill_batch

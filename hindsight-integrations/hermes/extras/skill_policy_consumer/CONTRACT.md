@@ -78,7 +78,7 @@ carried `pre_skill_write` gate is not retired by W02.
 | Returns `{"action": "allow"}` | Must return `approve` with the echoed digest. `allow` is ignored: no decision (fail-open optional / unavailable required). |
 | Returns `block` + `message` + `gate` | `block` + `reason`; the `gate` record is not consumed by the host and must be journaled by the consumer. |
 | Uses `session_id` | Not passed. Readable from the task-local session ContextVar on the real dispatch path (probed); W02 must confirm it is bound on every caller path it relies on and report "unavailable" otherwise, not guess from `os.environ` or files. |
-| Uses `derive_actor()` / `is_unattended_review()` | Readable in the callback through the copied context (probed). |
+| Uses `derive_actor()` / `is_unattended_review()` | Readable in the callback through the copied context (probed). Attendedness decisions use `is_unattended_review()` only, never the actor label. |
 | Uses `proposal.evidence` | No carrier. Do not add keys to `operations` (that changes the digest and fails native validation). A missing evidence input stays an explicit unavailable result; if needed, a separate optional host-context argument is a separately reviewed host change. |
 | Legacy proposals with action `edit` | Flat `edit` is fine. When building or replaying an `operations[]` call, map a full rewrite to `patch` + `content`; never emit `edit` inside `operations[]`. |
 | Previews skill files "under the host's mutation lock" | The hook fires **before** locks; a preview is advisory and can race a concurrent writer. |
@@ -86,18 +86,45 @@ carried `pre_skill_write` gate is not retired by W02.
 | Shadow mode returns allow | Shadow must return `approve` + digest (or `None` in optional mode). |
 | Recommendation on unavailable policy | An absent consumer cannot record its own absence, and a refused call fires no `post_skill_*`. W03 needs a capture owner that runs when policy is absent/failed (see W03 dependency in the promotion packet). |
 
-## W02 consumer (`consumer.py`)
+## W02 consumer (`consumer.py`, native plugin `jev-skill-policy`)
 
-- Setting: required mode needs `skill_policy.required: pre_skill_batch` exactly; `register(...,
-  required=True)` raises on any other value or when the host lacks the hook. Optional registration on
-  a host without the hook returns `False` (native behavior).
-- Wire: judge `allow` -> `{"action":"approve","payload_digest":<this call's digest>}`;
-  `block`/`modify`/`require_approval` -> `{"action":"block","reason":...}` (nonempty reason, fallback
-  names verdict, policy revision and request id). Crash, invalid output, timeout -> `None`, so the
-  host decides (unavailable when required, native when optional). A late result after the deadline
-  is discarded. Each call is judged on its own digest; nothing is cached across operations.
-- Context: `trusted_context()` reads the task-local session id, write origin, attendedness and
-  ledger actor through the copied ContextVars; an unbound value is reported unavailable (no
-  `os.environ` fallback); evidence is always unavailable.
-- `unattended_only=True` approves attended writes without calling the judge.
-- Durability: the consumer keeps only an in-memory `outcomes` list. Durable capture is W03.
+- Loading: `plugin.yaml` + `__init__.py` make the package a directory plugin. Copied to a profile's
+  `plugins/jev-skill-policy` and listed in `plugins.enabled`, the native loader calls `register(ctx)`,
+  which reads `plugins.entries.jev-skill-policy.settings` for the active profile, validates them,
+  builds the judge and registers the hook. Not enabled means not loaded. Tested from a disposable
+  profile through `discover_plugins` (`tests/test_plugin_loading.py`); this is not a W04
+  distribution package or an installed production plugin.
+- Settings: `policy_revision` (required, non-empty), `required` (bool, default false),
+  `timeout_seconds` (finite, 0 < t <= 120, default 10), `max_concurrent` (int 1..16, default 4),
+  `unattended_only` (bool), `judge_callable` (`module:attr`, the deterministic injection seam; trusted
+  profile config), `judge_provider` / `judge_model` (optional overrides, still gated by the host's
+  `plugins.entries.<id>.llm.allow_*_override`), `instructions`. Any invalid value raises in `register`,
+  so the plugin does not load; under host required mode the host then reports policy unavailable.
+- Required mode: `required: true` also demands `skill_policy.required: pre_skill_batch` exactly and a
+  host with the hook, else startup fails. Optional on a host without the hook registers nothing.
+- Judge: by default the host's `ctx.llm.complete_structured` with a fixed JSON schema and
+  `timeout=timeout_seconds`, so the provider call itself is bounded by the host. The judge receives a
+  fresh detached dict; the engine keeps its own frozen `JudgeRequest` / `TrustedContext` (read-only
+  availability mapping) and a read-only copy of the wire in each `Outcome`.
+- Output: exactly `{"verdict": allow|block|modify|require_approval, "reason"?: str|null}`. Any other
+  shape, key, or type (including unhashable verdicts) is `failed:invalid`.
+- Wire: `allow` -> `{"action":"approve","payload_digest":<this call's digest>}`;
+  `block`/`modify`/`require_approval` -> `{"action":"block","reason":...}` (nonempty; fallback names
+  verdict, policy revision and request id). Every failure -> `None`, so the host decides
+  (unavailable when required, native when optional). Nothing is cached across operations.
+- Execution bounds (the pattern of `hermes_cli.approval_transport.invoke_approval_transport`): one
+  daemon worker per call under `max_concurrent` slots and no queue. With every slot held, a call fails
+  `busy` immediately and never starts later. A timed-out judge keeps its slot until it returns, then the
+  slot recovers; its late result is discarded. Daemon workers do not hold up interpreter exit. Unload
+  (`ctx.on_unload`) refuses new calls (`failed:unloaded`) and discards results of running ones. A
+  Python callable that never returns is not killed; it costs one slot until process exit.
+- Attendedness: `unattended_only` skips the judge only when the host's `is_unattended_review()` is
+  readable and false: foreground writes and explicitly attended background reviews (`/refine`,
+  `set_review_attended(True)`). Unattended background reviews and an unreadable value are judged. The
+  curator actor label is reported as context but not used for this decision. Writes whose origin is
+  not a background review (for example cron or subagent writes) are not unattended for this host
+  predicate, so `unattended_only` does not judge them; W02 does not redefine their authority.
+- Context: task-local session id, write origin, attendedness and ledger actor through the copied
+  ContextVars; an unbound value is reported unavailable (no `os.environ` fallback); evidence is always
+  unavailable.
+- Durability: only the in-memory `outcomes` list. Durable blocked/unavailable capture is W03.
