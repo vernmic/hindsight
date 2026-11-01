@@ -26,6 +26,12 @@ import { join } from "node:path";
 import type { MarksAdmissionPolicy } from "./assemble-marks.js";
 import { ENGINE_ID } from "./engine-compat.js";
 import { loadSessionStateCached } from "./session-state.js";
+import {
+  lifecycleAuthorityFor,
+  newLifecycleAuthority,
+  type AssembleFact,
+  type LifecycleAuthority,
+} from "./lifecycle-authority.js";
 
 type Logger = { info(msg: string): void; warn(msg: string): void };
 
@@ -85,6 +91,50 @@ export type MarksReadSide = {
   estimateTokensHost(list: unknown[]): number;
 };
 
+/**
+ * PLAN section 4 runtime gate: package engines stay ">=22", but adaptive context
+ * (the host transcript ledger read side) needs node:sqlite, which Node ships from
+ * 22.5.0. Returns a specific compatibility error, or null when supported. Zstd
+ * frames are gated at decode time (assemble-marks.ts decodeTranscriptEventJson).
+ */
+export function adaptiveContextRuntimeError(
+  nodeVersion: string = process.versions.node
+): string | null {
+  const [major, minor] = nodeVersion.split(".").map((p) => Number.parseInt(p, 10) || 0);
+  if (major > 22 || (major === 22 && minor >= 5)) return null;
+  return (
+    `adaptive context requires Node >= 22.5.0 for node:sqlite (running ${nodeVersion}); ` +
+    `marks are disabled, prompts pass through unchanged`
+  );
+}
+
+/**
+ * R16.1: a version number does not prove node:sqlite loads - it is unflagged only from 22.13.0
+ * (22.5-22.12 need --experimental-sqlite) and --no-experimental-sqlite disables it on any version.
+ * Probe the builtin itself, once per process; null when it loads, else a specific diagnostic.
+ */
+export async function probeNodeSqlite(
+  importSqlite: () => Promise<unknown> = () => import("node:sqlite")
+): Promise<string | null> {
+  try {
+    await importSqlite();
+    return null;
+  } catch (e) {
+    const code = (e as { code?: unknown })?.code;
+    const detail = `${typeof code === "string" ? code + ": " : ""}${(e as Error)?.message ?? e}`;
+    return (
+      `adaptive context requires node:sqlite, which this runtime does not load (${detail}); ` +
+      `it is unflagged from Node 22.13.0 (22.5-22.12 need --experimental-sqlite) and ` +
+      `--no-experimental-sqlite disables it; marks are disabled, prompts pass through unchanged`
+    );
+  }
+}
+
+let sqliteProbe: Promise<string | null> | null = null;
+function cachedSqliteProbe(): Promise<string | null> {
+  return (sqliteProbe ??= probeNodeSqlite());
+}
+
 async function loadMarksReadSide(): Promise<MarksReadSide> {
   const [ledger, marks] = await Promise.all([
     import("./session-ledger.js"),
@@ -106,6 +156,10 @@ export type ContextEngineOptions = {
   loadMarks?: () => Promise<MarksReadSide>;
   /** Admission overrides from plugin config (`astinusMarks`); DEFAULT_MARKS_POLICY otherwise. */
   getPolicy?: () => Partial<MarksAdmissionPolicy> | undefined;
+  /** Runtime version override for the compatibility gate (tests). */
+  nodeVersion?: string;
+  /** node:sqlite availability probe (tests); default probes the real builtin once per process. */
+  probeSqlite?: () => Promise<string | null>;
 };
 
 /** Plugin config `astinusMarks` -> admission overrides (e8cb index.ts astinusMarksPolicy). */
@@ -127,36 +181,18 @@ export function hostDbPathFor(hostStateRoot: string, sessionKey: string): string
   return join(hostStateRoot, "agents", agentId, "agent", "openclaw-agent.sqlite");
 }
 
-/** Last-resort marks per host root + session (e8cb astinusMarksIndex, generalized): refilled by
- *  every successful ledger read and used when the ledger read fails, or not at all on a cold start.
- *  R11.1: keyed by host state root AND session key, so a failed read in one root can never reuse
- *  another root's sequence ranges (separate transcripts share seq numbers and session keys). */
-const marksIndex = new Map<string, unknown[]>();
 const MARKS_INDEX_MAX_SESSIONS = 2000;
 const MAX_TRACKED_SESSIONS = 10_000;
 
-/** What assemble() records per session (e8cb AstinusAssembleFact): the serving signal and the
- *  pass pressure inputs (view_tokens / token_budget / estimator / window_first_seq). */
-export type AssembleFact = {
-  at: number;
-  viewTokens: number;
-  tokenBudget: number | null;
-  estimator: "host" | "plugin";
-  windowFirstSeq: number | null;
-};
+export type { AssembleFact };
 
-// e8cb R2 (2026-10-25): the map is shared by every plugin copy of one host instance, so it lives in
-// a process-wide registry keyed by host state root (e8cb lifecycle.lastAssemble via Symbol.for).
-const LAST_ASSEMBLE = Symbol.for("@vectorize-io/hindsight-openclaw/last-assemble");
-function lastAssembleFor(stateRoot: string): Map<string, AssembleFact> {
-  const g = globalThis as unknown as Record<symbol, Map<string, Map<string, AssembleFact>>>;
-  const all = (g[LAST_ASSEMBLE] ??= new Map());
-  let m = all.get(stateRoot);
-  if (!m) {
-    m = new Map();
-    all.set(stateRoot, m);
-  }
-  return m;
+// P3: the last-assemble facts (e8cb R2) and the last-resort marks index (e8cb astinusMarksIndex)
+// live in the ONE per-host-root lifecycle authority shared by every module copy, so a fresh copy
+// sees the facts and cached marks the serving copy recorded, and roots never share an entry
+// (R11.1). An engine without a resolvable root keeps a private per-module record.
+const unrootedAuthority: LifecycleAuthority = newLifecycleAuthority();
+function authorityFor(stateRoot: string | undefined): LifecycleAuthority {
+  return stateRoot ? lifecycleAuthorityFor(stateRoot) : unrootedAuthority;
 }
 
 /** Read side for the future pass payload (commit path, not ported yet). */
@@ -164,12 +200,15 @@ export function getLastAssembleFact(
   stateRoot: string,
   sessionKey: string
 ): AssembleFact | undefined {
-  return lastAssembleFor(stateRoot).get(sessionKey);
+  return authorityFor(stateRoot).lastAssemble.get(sessionKey);
 }
 
 export function createContextEngine(log: Logger, options: ContextEngineOptions = {}) {
   const loadDelegate = options.loadDelegate ?? loadRuntimeDelegate;
   const loadMarks = options.loadMarks ?? loadMarksReadSide;
+  let runtimeError = adaptiveContextRuntimeError(options.nodeVersion ?? process.versions.node);
+  const probeSqlite = options.probeSqlite ?? cachedSqliteProbe;
+  let runtimeErrorReported = false;
   const info = Object.freeze({
     id: ENGINE_ID,
     name: "Hindsight Context Engine",
@@ -199,15 +238,29 @@ export function createContextEngine(log: Logger, options: ContextEngineOptions =
       let marksInEffect = 0;
       const key = params.sessionKey ?? params.sessionId;
       const hostDbPath = key ? hostDbPathFor(options.hostStateRoot ?? "", key) : "";
-      if (key && hostDbPath && typeof params.sessionId === "string" && params.sessionId) {
+      const marksSelected =
+        key && hostDbPath && typeof params.sessionId === "string" && params.sessionId;
+      // R16.1: only a selected path probes, so unselected/ordinary memory stays load-safe.
+      if (marksSelected && !runtimeError) runtimeError = await probeSqlite();
+      if (marksSelected && runtimeError && !runtimeErrorReported) {
+        runtimeErrorReported = true;
+        log.warn(`[hindsight-engine] ${runtimeError}`);
+      }
+      if (
+        !runtimeError &&
+        key &&
+        hostDbPath &&
+        typeof params.sessionId === "string" &&
+        params.sessionId
+      ) {
         try {
           const side = await loadMarks();
           const read = side.readMarksCached(key, (m) => log.warn(m));
-          const cacheKey = JSON.stringify([options.hostStateRoot ?? "", key]);
-          let marks: unknown[] = marksIndex.get(cacheKey) ?? [];
+          const marksIndex = authorityFor(options.hostStateRoot).marksIndex;
+          let marks: unknown[] = marksIndex.get(key) ?? [];
           if (read.ok) {
             marks = read.marks;
-            marksIndex.set(cacheKey, marks);
+            marksIndex.set(key, marks);
             if (marksIndex.size > MARKS_INDEX_MAX_SESSIONS) {
               const oldest = marksIndex.keys().next().value;
               if (oldest !== undefined) marksIndex.delete(oldest);
@@ -284,7 +337,7 @@ export function createContextEngine(log: Logger, options: ContextEngineOptions =
       }
       if (key) {
         // Record this session's last assemble; touch-on-write so the cap behaves LRU (e8cb m1).
-        const facts = lastAssembleFor(options.hostStateRoot ?? "");
+        const facts = authorityFor(options.hostStateRoot).lastAssemble;
         facts.delete(key);
         facts.set(key, {
           at: Date.now(),

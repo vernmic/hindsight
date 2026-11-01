@@ -1,5 +1,5 @@
 /**
- * JSONL-backed retain queue for buffering failed HTTP retains.
+ * JSONL-backed retain owner: requests, server operations and unapplied completion receipts.
  *
  * When the Hindsight API is unreachable, retain requests are stashed in a local
  * JSONL file and flushed later. Used in both modes: a locally spawned daemon is
@@ -18,8 +18,26 @@ import {
 } from "fs";
 import { randomBytes } from "crypto";
 
+/** Applied only after the server's terminal completion proof is durable. */
+export type RetainCompletionAction = {
+  sessionKey: string;
+  generation: string | null;
+  marker?: {
+    seq: number;
+    hashes: string[];
+    ranges: Array<{ start: number; end: number }>;
+    /** Owned legacy turns this retain delivers (fork, 2026-10-25); cleared on completion. */
+    legacyIds?: string[];
+  };
+  segment?: { segment: number; unitsDelta: number };
+};
+
+export type RetainDeliveryState = "submitting" | "submitted" | "completed" | "failed" | "uncertain";
+
 /** The subset of a retain payload the queue needs to persist and replay. */
 export interface QueuedRetainPayload {
+  targetFingerprint?: string;
+  completion?: RetainCompletionAction;
   content: string;
   documentId?: string;
   context?: string;
@@ -30,6 +48,12 @@ export interface QueuedRetainPayload {
 }
 
 export interface QueuedRetain {
+  targetFingerprint?: string;
+  completion?: RetainCompletionAction;
+  deliveryState?: RetainDeliveryState;
+  serverOperationIds?: string[];
+  idempotentSubmission?: boolean;
+  lastError?: string;
   id: string;
   bankId: string;
   content: string;
@@ -60,11 +84,17 @@ export class RetainQueue {
     this.cachedSize = this.readAll().length;
   }
 
-  /** Append a failed retain for later delivery. */
-  enqueue(bankId: string, request: QueuedRetainPayload, metadata?: Record<string, unknown>): void {
+  /** Capture a retain durably before its first network submission. */
+  enqueue(
+    bankId: string,
+    request: QueuedRetainPayload,
+    metadata?: Record<string, unknown>
+  ): string {
     const item: QueuedRetain = {
       id: `${Date.now()}-${randomBytes(4).toString("hex")}`,
       bankId,
+      targetFingerprint: request.targetFingerprint,
+      completion: request.completion,
       content: request.content,
       documentId: request.documentId || "conversation",
       context: request.context,
@@ -76,6 +106,7 @@ export class RetainQueue {
     };
     appendFileSync(this.filePath, JSON.stringify(item) + "\n", "utf8");
     this.cachedSize++;
+    return item.id;
   }
 
   /** Get up to `limit` oldest pending items (FIFO). */
@@ -113,17 +144,50 @@ export class RetainQueue {
     return operationId;
   }
 
+  /** Persist state before a network await or local completion application. */
+  update(
+    id: string,
+    patch: Partial<
+      Pick<
+        QueuedRetain,
+        "deliveryState" | "serverOperationIds" | "idempotentSubmission" | "lastError"
+      >
+    >
+  ): QueuedRetain {
+    const items = this.readAll();
+    const item = items.find((candidate) => candidate.id === id);
+    if (!item) throw new Error(`queued retain not found: ${id}`);
+    Object.assign(item, patch);
+    this.writeAll(items);
+    return item;
+  }
+
+  /** Raw ranges already held by this owner must not be submitted again. */
+  pendingForSession(sessionKey: string, generation: string | null): QueuedRetain[] {
+    return this.readAll().filter(
+      (item) =>
+        item.completion?.sessionKey === sessionKey && item.completion.generation === generation
+    );
+  }
+
   /** Number of items waiting (cached, O(1)). */
   size(): number {
     return this.cachedSize;
   }
 
-  /** Drop items older than `maxAgeMs`. No-op when `maxAgeMs < 0`. */
+  /** Expire only unambiguously unsent payloads; never erase operation/source debt. */
   cleanup(): number {
     if (this.maxAgeMs < 0) return 0;
     const cutoff = Date.now() - this.maxAgeMs;
     const items = this.readAll();
-    const kept = items.filter((i) => new Date(i.createdAt).getTime() >= cutoff);
+    const kept = items.filter(
+      (i) =>
+        i.deliveryState !== undefined ||
+        i.completion !== undefined ||
+        i.operationId !== undefined ||
+        !i.targetFingerprint ||
+        new Date(i.createdAt).getTime() >= cutoff
+    );
     const removed = items.length - kept.length;
     if (removed > 0) this.writeAll(kept);
     return removed;
@@ -142,11 +206,29 @@ export class RetainQueue {
     if (!content) return [];
     const items: QueuedRetain[] = [];
     for (const line of content.split("\n")) {
+      if (!line.trim()) continue;
+      let item: QueuedRetain;
       try {
-        items.push(JSON.parse(line) as QueuedRetain);
+        item = JSON.parse(line) as QueuedRetain;
       } catch {
-        // skip malformed lines
+        throw new Error("Retain queue contains malformed JSON; reconciliation required");
       }
+      if (
+        !item ||
+        typeof item !== "object" ||
+        typeof item.id !== "string" ||
+        typeof item.bankId !== "string" ||
+        typeof item.content !== "string" ||
+        typeof item.documentId !== "string" ||
+        typeof item.createdAt !== "string" ||
+        !Number.isFinite(Date.parse(item.createdAt)) ||
+        !item.metadata ||
+        typeof item.metadata !== "object" ||
+        Array.isArray(item.metadata)
+      ) {
+        throw new Error("Retain queue row has an invalid shape; reconciliation required");
+      }
+      items.push(item);
     }
     return items;
   }
@@ -156,8 +238,8 @@ export class RetainQueue {
     if (items.length === 0) {
       try {
         unlinkSync(this.filePath);
-      } catch {
-        /* already gone */
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       }
       this.cachedSize = 0;
       return;
