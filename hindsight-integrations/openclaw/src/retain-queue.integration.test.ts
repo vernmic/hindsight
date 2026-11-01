@@ -140,6 +140,14 @@ function installFakeServer(initial: AsyncRetainOperationIdCapability): FakeServe
         { status: 200, headers: { "content-type": "application/json" } }
       );
     }
+    // P4 durable delivery: a queued row is acknowledged only after its operation is terminal.
+    if (request.method === "GET" && request.url.includes("/operations/")) {
+      const id = decodeURIComponent(request.url.split("/").at(-1) ?? "");
+      return new Response(JSON.stringify({ operation_id: id, status: "completed" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
     if (request.method === "POST" && request.url.includes("/memories")) {
       const body = JSON.parse(await request.clone().text()) as Record<string, unknown>;
       retainBodies.push(body);
@@ -243,9 +251,10 @@ describe("retain queue idempotent replay", () => {
     const { event, ctx } = conversation("My favourite colour is ultramarine.", "integration");
     await first.agentEnd()(event, ctx);
 
+    // agent_end returns once the retain is queued; the delivery pass runs in the background.
     // The server saw the request and processed it; only the acknowledgement was
     // lost. Without an operation id the replay below would store it a second time.
-    expect(server.retainBodies).toHaveLength(1);
+    await vi.waitFor(() => expect(server.retainBodies).toHaveLength(1));
     const sentId = server.retainBodies[0].operation_id;
     expect(sentId).toMatch(UUID_RE);
 
@@ -260,42 +269,33 @@ describe("retain queue idempotent replay", () => {
     await secondService.start();
     await vi.advanceTimersByTimeAsync(1_000);
 
+    await vi.waitFor(() => expect(readQueue(queuePath)).toHaveLength(0));
     expect(server.retainBodies).toHaveLength(2);
     expect(server.retainBodies[1].operation_id).toBe(sentId);
-    expect(readQueue(queuePath)).toHaveLength(0);
     await secondService.stop();
   });
 
-  it("still sends the first attempt when /version is unreachable, then holds the replay until it answers", async () => {
+  it("durably holds the first attempt while idempotency capability is unknown", async () => {
+    // e8cb94b7a: an unknown capability holds the queued row instead of sending it without an id.
     vi.useFakeTimers();
     const queuePath = makeQueuePath();
     const server = installFakeServer("unknown");
-
     const api = makeApi(queuePath, 1_000);
     const service = api.service();
     await service.start();
-
-    server.failRetains(1);
     const { event, ctx } = conversation("Remember this while /version is down.", "integration");
     await api.agentEnd()(event, ctx);
-
-    // An unknown capability must not cost the user their turn: nothing is stored
-    // server-side yet, so the first attempt goes out — just without the field.
-    expect(server.retainBodies).toHaveLength(1);
-    expect(server.retainBodies[0].operation_id).toBeUndefined();
+    expect(server.retainBodies).toHaveLength(0);
     const queued = readQueue(queuePath);
     expect(queued).toHaveLength(1);
     expect(queued[0].operationId).toMatch(UUID_RE);
-
-    // The replay is the half that can duplicate, so it waits for a real answer.
     await vi.advanceTimersByTimeAsync(1_000);
-    expect(server.retainBodies).toHaveLength(1);
-    expect(readQueue(queuePath)).toHaveLength(1);
-
+    expect(server.retainBodies).toHaveLength(0);
     server.setCapability("supported");
     await vi.advanceTimersByTimeAsync(1_000);
-    expect(server.retainBodies).toHaveLength(2);
-    expect(server.retainBodies[1].operation_id).toBe(queued[0].operationId);
+    await vi.waitFor(() => expect(readQueue(queuePath)).toHaveLength(0));
+    expect(server.retainBodies).toHaveLength(1);
+    expect(server.retainBodies[0].operation_id).toBe(queued[0].operationId);
     await service.stop();
   });
 
@@ -310,11 +310,13 @@ describe("retain queue idempotent replay", () => {
 
     const first = conversation("First turn.", "probe-1");
     await api.agentEnd()(first.event, first.ctx);
+    await vi.waitFor(() => expect(server.retainBodies).toHaveLength(1));
     const afterFirstRetain = server.versionRequests();
     expect(afterFirstRetain).toBeGreaterThan(0); // resolved "unknown" once
 
     const second = conversation("Second turn.", "probe-2");
     await api.agentEnd()(second.event, second.ctx);
+    await vi.waitFor(() => expect(readQueue(queuePath)).toHaveLength(0));
     // Cached capability, empty queue: a turn must not cost an extra round trip.
     expect(server.versionRequests()).toBe(afterFirstRetain);
 
@@ -518,7 +520,7 @@ describe("agentBankMap routes retains to the mapped bank", () => {
     await api.agentEnd()(oneTurn("Campaigns ship on Tuesday."), ctxFor("outbound", "s2"));
     await api.agentEnd()(oneTurn("This agent is not in the map."), ctxFor("stranger", "s3"));
 
-    expect(server.retainUrls).toHaveLength(3);
+    await vi.waitFor(() => expect(server.retainUrls).toHaveLength(3), { timeout: 5_000 });
     // Two different agents, one named bank.
     expect(server.retainUrls[0]).toContain("/banks/ps-technology/");
     expect(server.retainUrls[1]).toContain("/banks/ps-technology/");
@@ -543,7 +545,7 @@ describe("agentBankMap routes retains to the mapped bank", () => {
     await api.agentEnd()(oneTurn("The crew starts at 06:00."), ctxFor("limpieza", "s1"));
     await api.agentEnd()(oneTurn("Anything else."), ctxFor("other", "s2"));
 
-    expect(server.retainUrls).toHaveLength(2);
+    await vi.waitFor(() => expect(server.retainUrls).toHaveLength(2), { timeout: 5_000 });
     expect(server.retainUrls[0]).toContain("/banks/ps-limpieza/");
     expect(server.retainUrls[1]).toContain("/banks/integration-bank/");
 
