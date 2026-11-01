@@ -278,6 +278,230 @@ def test_changed_content_cannot_reuse_digest(tmp_path, hermes_home):
     assert result["error"].startswith("Skill batch policy unavailable:")
 
 
+# ------------------------------------------- operation shapes (review 1: W01-R1/R2)
+
+
+class ScriptedConsumer(Consumer):
+    """Returns the next scripted decision on each call (records like ``Consumer``)."""
+
+    def __init__(self, decisions, root):
+        super().__init__(None, root)
+        self.decisions = list(decisions)
+
+    def __call__(self, **kwargs):
+        self.decision = self.decisions.pop(0) if self.decisions else None
+        return super().__call__(**kwargs)
+
+
+@proposed_host
+def test_sole_delete_batch_is_judged_twice_native_gap(tmp_path, hermes_home):
+    """W01-R1: observed native gap, NOT a one-call contract.
+
+    ``operations=[delete]`` runs the batch gate, then delegates to flat
+    ``skill_manage(action='delete')``, whose flat gate runs again. The two payloads
+    differ (the flat shape adds ``replace_all: false``), so the digests differ. A
+    corrected host must make this exactly one judgment; update this probe then.
+    """
+    with skills_root(tmp_path) as root:
+        set_required(hermes_home, None)
+        seed(root, "delete")
+        set_required(hermes_home, "pre_skill_batch")
+        consumer = Consumer("approve", root)
+        register(consumer)
+        result = run_batch([{"name": "probe-skill", "action": "delete"}])
+        final = tree(root)
+    assert result["success"] is True, result
+    assert final == []
+    payloads = [c["kwargs"]["operations"] for c in consumer.calls]
+    digests = [c["kwargs"]["payload_digest"] for c in consumer.calls]
+    assert payloads == [
+        [{"name": "probe-skill", "action": "delete"}],
+        [{"name": "probe-skill", "action": "delete", "replace_all": False}],
+    ]
+    assert digests == [smt._skill_batch_payload_digest(p) for p in payloads]
+    assert digests[0] != digests[1]
+    # Both judgments happen before the deletion.
+    assert all(c["tree_at_call"] == ["probe-skill/SKILL.md"] for c in consumer.calls)
+
+
+@proposed_host
+def test_sole_delete_batch_second_judgment_can_refuse_after_first_approved(tmp_path, hermes_home):
+    """W01-R1 consequence: one user call can be approved by the batch gate and then
+    denied by the flat gate. The refusal holds and nothing is deleted."""
+    with skills_root(tmp_path) as root:
+        set_required(hermes_home, None)
+        seed(root, "delete")
+        set_required(hermes_home, "pre_skill_batch")
+        consumer = ScriptedConsumer(["approve", "block"], root)
+        register(consumer)
+        result = run_batch([{"name": "probe-skill", "action": "delete"}])
+        final = tree(root)
+    assert len(consumer.calls) == 2
+    assert result["success"] is False
+    assert result["error"].startswith("Skill batch policy denied:")
+    assert final == ["probe-skill/SKILL.md"]
+
+
+@proposed_host
+def test_flat_delete_is_judged_once(tmp_path, hermes_home):
+    """Flat delete (not operations[]) is a single judgment over the flat-shape payload."""
+    with skills_root(tmp_path) as root:
+        set_required(hermes_home, None)
+        seed(root, "delete")
+        set_required(hermes_home, "pre_skill_batch")
+        consumer = Consumer("approve", root)
+        register(consumer)
+        result = run_flat("delete")
+    assert result["success"] is True, result
+    assert [c["kwargs"]["operations"] for c in consumer.calls] == [
+        [{"name": "probe-skill", "action": "delete", "replace_all": False}]
+    ]
+
+
+@proposed_host
+def test_edit_inside_operations_is_rejected_before_policy(tmp_path, hermes_home):
+    """W01-R2: ``edit`` is a flat legacy alias only; operations[] rejects it natively."""
+    with skills_root(tmp_path) as root:
+        set_required(hermes_home, None)
+        seed(root, "edit")
+        before = {p: (root / p).read_bytes() for p in tree(root)}
+        set_required(hermes_home, "pre_skill_batch")
+        consumer = Consumer("approve", root)
+        register(consumer)
+        result = run_batch([{"name": "probe-skill", "action": "edit", "content": SKILL_V2}])
+        after = {p: (root / p).read_bytes() for p in tree(root)}
+    assert result["success"] is False
+    assert "unknown action 'edit'" in result["error"]
+    assert consumer.calls == []
+    assert after == before
+
+
+@proposed_host
+def test_delete_mixed_with_other_ops_is_rejected_before_policy(tmp_path, hermes_home):
+    """W01-R2: delete is legal only as the sole operation."""
+    with skills_root(tmp_path) as root:
+        set_required(hermes_home, None)
+        seed(root, "delete")
+        before = {p: (root / p).read_bytes() for p in tree(root)}
+        set_required(hermes_home, "pre_skill_batch")
+        consumer = Consumer("approve", root)
+        register(consumer)
+        result = run_batch(
+            [
+                {"name": "probe-skill", "action": "patch", "old_string": "original.", "new_string": "x."},
+                {"name": "probe-skill", "action": "delete"},
+            ]
+        )
+        after = {p: (root / p).read_bytes() for p in tree(root)}
+    assert result["success"] is False
+    assert "delete must be the SOLE op" in result["error"]
+    assert consumer.calls == []
+    assert after == before
+
+
+@proposed_host
+def test_full_rewrite_inside_operations_uses_patch_content(tmp_path, hermes_home):
+    """W01-R2: the supported operations[] full-rewrite shape is ``patch`` + ``content``;
+    it is judged once with that exact shape."""
+    ops = [{"name": "probe-skill", "action": "patch", "content": SKILL_V2}]
+    with skills_root(tmp_path) as root:
+        set_required(hermes_home, None)
+        seed(root, "patch")
+        set_required(hermes_home, "pre_skill_batch")
+        consumer = Consumer("approve", root)
+        register(consumer)
+        result = run_batch(ops)
+        text = (root / "probe-skill" / "SKILL.md").read_text(encoding="utf-8")
+    assert result["success"] is True, result
+    assert [c["kwargs"]["operations"] for c in consumer.calls] == [ops]
+    assert "rewritten." in text
+
+
+@proposed_host
+@pytest.mark.parametrize("action", ["create", "patch", "write_file", "remove_file"])
+def test_each_batchable_action_alone_in_operations_is_judged_once(tmp_path, hermes_home, action):
+    """W01-R2: the actual ``_BATCH_OP_ACTIONS`` set, each as a one-op operations[] call."""
+    op = {"name": "probe-skill", "action": action, **FLAT_ARGS[action]}
+    with skills_root(tmp_path) as root:
+        set_required(hermes_home, None)
+        seed(root, action)
+        set_required(hermes_home, "pre_skill_batch")
+        consumer = Consumer("approve", root)
+        register(consumer)
+        result = run_batch([op])
+    assert result["success"] is True, result
+    assert [c["kwargs"]["operations"] for c in consumer.calls] == [[op]]
+
+
+@proposed_host
+def test_batchable_action_set_matches_the_map():
+    from tools import skill_manager_batch as smb
+
+    assert smb._BATCH_OP_ACTIONS == {"create", "patch", "write_file", "remove_file"}
+
+
+# ------------------------------------------- host context reach (review 1 answer 2)
+
+
+@proposed_host
+def test_host_context_survives_into_the_bounded_policy_callback_a_b_a(tmp_path, hermes_home, monkeypatch):
+    """Preparatory W02 check: which authoritative host context a ``pre_skill_batch``
+    callback can read on the real bounded dispatch path, alternating A -> B -> A.
+
+    The callback receives only operations/digest/telemetry version. Write origin,
+    attendedness, ledger actor and the task-local session id are ContextVars that the
+    dispatcher's worker thread inherits through ``contextvars.copy_context()``. The
+    ``session_id`` argument of ``skill_manage`` itself is not forwarded.
+    """
+    session_context = pytest.importorskip("gateway.session_context")
+    provenance = pytest.importorskip("tools.skill_provenance")
+    ledger = pytest.importorskip("tools.skill_ledger")
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    seen = []
+
+    def callback(**kwargs):
+        import threading
+
+        seen.append(
+            {
+                "session": session_context.get_session_env("HERMES_SESSION_ID"),
+                "origin": provenance.get_current_write_origin(),
+                "unattended": provenance.is_unattended_review(),
+                "actor": ledger.derive_actor(),
+                "thread": threading.current_thread().name,
+                "keys": sorted(kwargs),
+            }
+        )
+        return {"action": "approve", "payload_digest": kwargs["payload_digest"]}
+
+    contexts = [
+        ("session-A", provenance.BACKGROUND_REVIEW, "probe-a"),
+        ("session-B", "foreground", "probe-b"),
+        ("session-A", provenance.BACKGROUND_REVIEW, "probe-c"),
+    ]
+    set_required(hermes_home, "pre_skill_batch")
+    with skills_root(tmp_path):
+        register(callback)
+        for session, origin, name in contexts:
+            token = provenance.set_current_write_origin(origin)
+            try:
+                with session_context.scoped_current_session_id(session):
+                    ops = [{"name": name, "action": "create", "content": SKILL.replace("probe-skill", name)}]
+                    result = json.loads(
+                        smt.skill_manage(action="", name="", operations=ops, session_id="arg-" + session)
+                    )
+            finally:
+                provenance.reset_current_write_origin(token)
+            assert result["success"] is True, result
+    assert [(s["session"], s["origin"]) for s in seen] == [(c[0], c[1]) for c in contexts]
+    assert [s["actor"] for s in seen] == ["curator", "agent", "curator"]
+    assert [s["unattended"] for s in seen] == [True, False, True]
+    # The skill_manage(session_id=...) argument never reaches the callback.
+    assert all(s["keys"] == ["operations", "payload_digest", "telemetry_schema_version"] for s in seen)
+    assert all("arg-" not in str(s) for s in seen)
+    print(json.dumps({"w01_context_probe": seen}))
+
+
 # ---------------------------------------------------------------- stock host
 
 
