@@ -244,25 +244,26 @@ def test_invalid_same_version_records_are_quarantined_and_recovery_continues(sto
     typed_path = store.root / f"{typed.key}.json"
     typed_path.write_text(json.dumps({**asdict(typed), "sightings": "1"}), encoding="utf-8")
     denied = store.capture("declined", "d", {"operations": [{**ARGS["operations"][0], "content": "y"}]}, SRC).key
-    read_text = Path.read_text
+    read_bytes = Path.read_bytes
 
     def guarded(self, *args, **kwargs):
         if self.name == f"{denied}.json":
             raise PermissionError("synthetic denied")
-        return read_text(self, *args, **kwargs)
+        return read_bytes(self, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "read_text", guarded)
+    monkeypatch.setattr(Path, "read_bytes", guarded)
     assert store.deliver_pending(Board()) == {good: "delivered", denied: "error:PermissionError"}
     assert (store.root / f"{denied}.json").exists()  # an I/O failure is not mistaken for bad data
     assert len(list(store.root.glob("*.json.invalid-*"))) == 2
 
 
 def test_missing_nullable_fields_are_quarantined_and_recovery_continues(store, hashes):
-    def plant(valid):  # copies of a valid record, each missing one nullable key, sorted ahead of it
+    def plant(valid):  # bad copies of a valid record, sorted ahead of it
         for bare, missing in (("0" * 64, "operations"), ("0" * 63 + "1", "delivery")):
             data = {**asdict(valid), "key": bare}
             del data[missing]
             (store.root / f"{bare}.json").write_text(json.dumps(data), encoding="utf-8")
+        (store.root / f"{'0' * 62}ff.json").write_bytes(b"\xff")  # undecodable bytes, also ahead of it
 
     board, first = Board(), store.capture("declined", "d", ARGS, SRC)
     plant(first)
@@ -271,7 +272,9 @@ def test_missing_nullable_fields_are_quarantined_and_recovery_continues(store, h
     plant(second)
     restarted = RecommendationStore(store.root, skill_hash=hashes.get)
     assert restarted.deliver_pending(board) == {second.key: "delivered"}
-    assert len(list(store.root.glob("*.json.invalid-*"))) == 4 and board.creates == 2
+    quarantined = sorted(store.root.glob("*.json.invalid-*"))
+    assert len(quarantined) == 6 and board.creates == 2
+    assert [q.read_bytes() for q in quarantined if q.name.startswith("0" * 62 + "ff")] == [b"\xff"] * 2
     assert {r.key for r in restarted.records()} == {first.key, second.key}
 
 

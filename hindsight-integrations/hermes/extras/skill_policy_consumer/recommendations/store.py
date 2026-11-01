@@ -183,11 +183,11 @@ class RecommendationStore:
         and other I/O errors are raised, not mistaken for bad data."""
         path = self._path(key)
         try:
-            text = path.read_text(encoding="utf-8")
+            raw = path.read_bytes()
         except FileNotFoundError:
             return None
         try:
-            return Recommendation.from_json(text, key)
+            return Recommendation.from_json(raw.decode("utf-8"), key)
         except Exception as exc:  # malformed content of any shape: never trusted, never fatal
             problem = f"{type(exc).__name__}: {exc}"
         quarantine = path.with_name(f"{path.name}.invalid-{int(time.time() * 1000)}")
