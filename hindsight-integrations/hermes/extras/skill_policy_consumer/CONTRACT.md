@@ -2,10 +2,16 @@
 
 Status: **proposal-dependent reference**. Mapped against NousResearch/hermes-agent PR 57703
 head `117c521bed76631c0761e7925ff0977acfbe9be0` (base `085f562af53a6fedadac3681e2c498fc71316132`),
-open and unmerged. No released Hermes version provides this contract. The same three proposal
-commits were also cherry-picked onto official Hermes main `d33d4fd9e7b57e16316ca953523bba596e4f6d5e`
-(local integration only; tree `c1a9b8219f8892c88cbae29be881e95d0b5e2b95`). The hook files apply
-unchanged there and the probes below pass on both.
+open and unmerged. No released Hermes version provides this contract.
+
+Current-host integration (local only, not pushed): the PR head merged with authorship preserved
+onto official Hermes main `c7da41dd522dc19cc08bbfcfa69d4b078224b45d` (merge
+`d019776d384b9d5253813ff88e32ae341ac0311f`; with the host probe tests,
+`5618e16704e3b18325e0aec56c7771859bc8263c` / tree `cec289e904cdcb8fcfce061368667ee282de1b08`). Only a
+docs table conflicted; the hook, dispatch and skill-manager files merged cleanly, and the probes
+below pass there. An earlier integration onto `d33d4fd9e7b57e16316ca953523bba596e4f6d5e` (tree
+`c1a9b8219f8892c88cbae29be881e95d0b5e2b95`) and the pinned PR-head run are kept as historical
+evidence, not current-main qualification.
 
 ## Host surface used
 
@@ -15,7 +21,7 @@ unchanged there and the probes below pass on both.
 | When | Before the write-approval gate, snapshots, locks and the first mutation. Skipped while an approved staged write is replayed (`_skill_gate_bypass`). See the call-count table below: it is **not** once per call for every shape. |
 | Digest | SHA-256 of canonical JSON (sorted keys, no whitespace) of the ordered operations list the gate was given. |
 | Approve | `{"action": "approve", "payload_digest": <echoed digest>}` (or `payload_hash`). A missing/mismatched echo is not an approval. |
-| Block | `{"action": "block", "reason"\|"message": str}`. A block wins over any approval. |
+| Block | `{"action": "block", "reason"\|"message": str}`. A block wins over any approval. This is the skill-gate contract only: the generic `pre_tool_call` parser ignores a block without a nonempty `message`, so a generic adapter must always send `message`. |
 | Required mode | `skill_policy.required` in `config.yaml`, re-read on every call. The examples use `required: pre_skill_batch`, the hook it names. The PR treats **any non-blank string** as the switch; the value is not matched against a hook name (probed). |
 | Refusal text | `Skill batch policy denied: ...` (decided no) vs `Skill batch policy unavailable: ...` (absent, raise, timeout, invalid/no decision, dispatch failure). A block accompanied by failed callbacks under required mode is reported as unavailable. |
 | Optional mode | Only an explicit block refuses; every other outcome fails open. |
