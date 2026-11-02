@@ -25,6 +25,9 @@ export type LedgerMark = {
 };
 
 const PRESERVE_USER_TURNS = 8;
+/** F2 (design A.14): one setting, `turnMiddleAgeTurns`, is both the pass's proposal cutoff and
+ *  the tail floor turn_middle marks apply under. Other mark kinds keep the 8-turn tail. */
+export const DEFAULT_TURN_MIDDLE_AGE_TURNS = 6;
 const LOAD_CHUNK = 5000;
 
 // Host transcript payload contract (OpenClaw v2026.10.3 / a20345f3
@@ -369,6 +372,7 @@ export type ApplyContext = {
   tokenBudget: number;
   turnCounter: number; // monotonic (lastCommittedSeq), NOT the capped committedKeys length
   policy?: Partial<MarksAdmissionPolicy>; // `astinus.marks.*`; DEFAULT_MARKS_POLICY otherwise
+  turnMiddleAgeTurns?: number; // F2: the turn_middle tail floor (default 6)
 };
 
 export type ApplyResult = {
@@ -412,12 +416,12 @@ function isToolResult(m: unknown): boolean {
 
 /** The index of the first message inside the preserved tail: the last PRESERVE_USER_TURNS user
  *  turns (M3), not a fixed message count. */
-function preservedFloorIdx(messages: unknown[]): number {
+function preservedFloorIdx(messages: unknown[], keep = PRESERVE_USER_TURNS): number {
   let userTurns = 0;
   for (let i = messages.length - 1; i >= 0; i--) {
     if (((messages[i] ?? {}) as Record<string, unknown>).role === "user") {
       userTurns++;
-      if (userTurns >= PRESERVE_USER_TURNS) return i;
+      if (userTurns >= keep) return i;
     }
   }
   return 0;
@@ -572,17 +576,25 @@ export function applyMarks(
   );
   const floorIdx = firstUser < 0 ? 0 : firstUser;
   const tailFloor = preservedFloorIdx(messages);
+  const turnMiddleFloor = preservedFloorIdx(
+    messages,
+    ctx.turnMiddleAgeTurns ?? DEFAULT_TURN_MIDDLE_AGE_TURNS
+  );
   let list = messages.slice();
 
   const ordered = [...toApply].sort((a, b) => b.seq_start - a.seq_start);
   for (const mark of ordered) {
     const lo = Number(mark.seq_start);
     const hi = Number(mark.seq_end);
+    const isTurnMiddle =
+      mark.action === "turn_middle" ||
+      (typeof mark.reason === "string" && mark.reason.indexOf("turn_middle") === 0);
+    const floor = isTurnMiddle ? turnMiddleFloor : tailFloor;
     // A mark may partially overlap the preserved tail; the in-view part applies, the tail
     // part is protected by construction (it has no eligible index below tailFloor).
     const idxs: number[] = [];
     for (let i = floorIdx + 1; i < list.length; i++) {
-      if (i >= tailFloor) continue;
+      if (i >= floor) continue;
       const s = seqs[i];
       if (s !== null && s >= lo && s <= hi) idxs.push(i);
     }
@@ -613,13 +625,13 @@ export function applyMarks(
           start--;
           for (const cid of toolResultCallIds(list[start + 1])) needIds.add(cid);
           for (const cid of toolCallIdsOf(list[start])) needIds.add(cid);
-        } else if (isToolResult(prev) && start - 1 < tailFloor) {
+        } else if (isToolResult(prev) && start - 1 < floor) {
           start--; // absorb an immediately preceding result so it is not orphaned
         } else break;
       }
       // P2: forward extension NEVER crosses tailFloor — pruning inside the preserved tail is
       // worse than leaving a mark unapplied.
-      while (end + 1 < list.length && end + 1 < tailFloor) {
+      while (end + 1 < list.length && end + 1 < floor) {
         const next = list[end + 1];
         const linked = toolCallIdsOf(next).some((id) => needIds.has(id));
         if (linked) {
@@ -631,7 +643,7 @@ export function applyMarks(
       }
       // P2 guard: if completing any needed pair would enter the tail, leave BOTH messages.
       let neededInTail = false;
-      for (let i = tailFloor; i < list.length && !neededInTail; i++) {
+      for (let i = floor; i < list.length && !neededInTail; i++) {
         if (toolResultCallIds(list[i]).some((cid) => needIds.has(cid))) neededInTail = true;
         else if (toolCallIdsOf(list[i]).some((cid) => needIds.has(cid))) neededInTail = true;
       }
@@ -645,10 +657,7 @@ export function applyMarks(
     if (mark.action === "drop") {
       list.splice(start, end - start + 1);
       out.changed = true;
-    } else if (
-      mark.action === "turn_middle" ||
-      (typeof mark.reason === "string" && mark.reason.indexOf("turn_middle") === 0)
-    ) {
+    } else if (isTurnMiddle) {
       // Turn-middle redaction (design A.11; Vern #5502/#5503): preserve the span boundaries
       // and every steer (user input) inside; replace the model interior - reasoning, calls,
       // results - with tombstone segments carrying counts and the ledger lookup pointer.
