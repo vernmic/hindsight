@@ -1,11 +1,13 @@
 // Context engine registration, ported from the maintained plugin
 // (e8cb94b7 src/index.ts:3130-3250 registration, :3286 assemble fallback,
-// :3566-3587 compact delegation). This wave ports the NON-durable engine shell:
+// :3566-3587 compact delegation) and the durable turn commit (9c76cbda9 commitTurn):
 //
-// - info: ownsCompaction false, no hostRequirements, and NO transcriptSemantics /
-//   commitTurn. Without the durable-turn declaration no host hands this engine
-//   turn ownership, so the ordinary agent_end capture stays the only capture on
-//   every host and the wave-4 ownership predicate is intentionally not wired yet.
+// - info: ownsCompaction false. Durable turns are OFF by default: the engine then declares no
+//   transcriptSemantics, no commitTurn and no hostRequirements, so no host hands it a turn and
+//   the ordinary agent_end capture stays the only capture. With `durableTurns` on it declares
+//   the atomic-idempotent turn contract and commitTurn, and requires the host capability
+//   agent-end-context-engine-turn-v1 (agent-run), so a host that would also capture owned turns
+//   at agent_end refuses the engine instead of double-capturing.
 // - ingest: no-op (statement<->topic mapping lands with the session state port).
 // - assemble: the maintained read side (e8cb :3274-3470): read the session's marks from an
 //   ALREADY-OPEN ledger (readMarksCached), apply them to the view (assemble-marks.ts) and stamp
@@ -16,16 +18,17 @@
 // - compact: the maintained delegation to the runtime's built-in compaction.
 //   Owner compaction is not ported and stays unavailable.
 //
-// TODO(host-capability): when commitTurn is ported, declare
-//   hostRequirements["agent-run"].requiredCapabilities = ["agent-end-context-engine-turn-v1"]
-// only after Vern confirms the host contract to Grokbot (see package 6).
-//
 // ENGINE ID = PLUGIN ID ("hindsight-openclaw"): the host reads
 // plugins.slots.contextEngine both as the owning plugin id and as the engine id.
 import { join } from "node:path";
 import type { MarksAdmissionPolicy } from "./assemble-marks.js";
 import { ENGINE_ID } from "./engine-compat.js";
-import { loadSessionStateCached } from "./session-state.js";
+import {
+  appendPendingRange,
+  loadSessionState,
+  loadSessionStateCached,
+  updateSessionState,
+} from "./session-state.js";
 import {
   lifecycleAuthorityFor,
   newLifecycleAuthority,
@@ -160,6 +163,20 @@ export type ContextEngineOptions = {
   nodeVersion?: string;
   /** node:sqlite availability probe (tests); default probes the real builtin once per process. */
   probeSqlite?: () => Promise<string | null>;
+  /**
+   * Durable turns (config `durableTurns`, default OFF). When on, the engine declares the
+   * atomic-idempotent turn contract and commitTurn, and requires the host capability
+   * agent-end-context-engine-turn-v1, so a host that would also capture owned turns at
+   * agent_end refuses the engine.
+   */
+  durableTurns?: boolean;
+  /** Ledger writer override (tests); default the lazily loaded session-ledger module. */
+  loadLedger?: () => Promise<LedgerWriter>;
+};
+
+export type LedgerWriter = {
+  configureSessionLedger(workspaceRoot: string): void;
+  insertCommittedTurn: typeof import("./session-ledger.js").insertCommittedTurn;
 };
 
 /** Plugin config `astinusMarks` -> admission overrides (e8cb index.ts astinusMarksPolicy). */
@@ -209,13 +226,28 @@ export function createContextEngine(log: Logger, options: ContextEngineOptions =
   let runtimeError = adaptiveContextRuntimeError(options.nodeVersion ?? process.versions.node);
   const probeSqlite = options.probeSqlite ?? cachedSqliteProbe;
   let runtimeErrorReported = false;
+  const durable = options.durableTurns === true;
   const info = Object.freeze({
     id: ENGINE_ID,
     name: "Hindsight Context Engine",
     ownsCompaction: false,
+    ...(durable
+      ? {
+          transcriptSemantics: {
+            currentTurnFence: "before-current-turn-entry-v1",
+            turnAdvancementIdempotency: "atomic-idempotent-v1",
+          },
+          hostRequirements: {
+            "agent-run": { requiredCapabilities: ["agent-end-context-engine-turn-v1"] },
+          },
+        }
+      : {}),
   });
   return {
     info,
+    ...(durable
+      ? { commitTurn: (params: CommitTurnParams) => commitTurn(log, options, params) }
+      : {}),
     async ingest(_params: unknown): Promise<{ ingested: boolean }> {
       return { ingested: false };
     },
@@ -379,12 +411,133 @@ export function createContextEngine(log: Logger, options: ContextEngineOptions =
   };
 }
 
+export type CommitTurnParams = {
+  advancementKey?: string;
+  messages?: unknown[];
+  sessionKey?: string;
+  sessionId?: string;
+  admission?: { rawSeq?: number; agentId?: string; storePath?: string };
+  terminal?: { rawSeq?: number; generation?: string };
+  isHeartbeat?: boolean;
+};
+
+/**
+ * Ported from 9c76cbda9 commitTurn: records the accepted turn (rawSeq + generation and the
+ * admission..terminal range) for the retain loop to drain. THROWS on a state failure so the host
+ * retries the same key; it never reports "committed" for a turn it did not persist. Not ported
+ * here: the topic mapping (no classifier in this plugin), the sidecar pass spawn (package 28)
+ * and the in-process F13 lag check.
+ */
+async function commitTurn(
+  log: Logger,
+  options: ContextEngineOptions,
+  params: CommitTurnParams
+): Promise<{ status: "committed" | "duplicate" }> {
+  const key = params.sessionKey ?? params.sessionId;
+  const advancementKey = typeof params.advancementKey === "string" ? params.advancementKey : "";
+  const root = options.hostStateRoot;
+  if (!key || !advancementKey || !root) {
+    // The host contract requires both keys; a rootless engine has nowhere durable to write.
+    throw new Error("hindsight commitTurn: missing session key, advancementKey or state root");
+  }
+  if (loadSessionState(root, key, true).committedKeys.includes(advancementKey)) {
+    return { status: "duplicate" };
+  }
+  const messages = Array.isArray(params.messages) ? params.messages : [];
+  const heartbeat = params.isHeartbeat === true;
+  const startSeq = typeof params.admission?.rawSeq === "number" ? params.admission.rawSeq : null;
+  const endSeq = typeof params.terminal?.rawSeq === "number" ? params.terminal.rawSeq : null;
+  const generation =
+    typeof params.terminal?.generation === "string" ? params.terminal.generation : null;
+  // 1. Ledger write FIRST - best-effort, never throws (R1). The state-document write below is
+  //    the sole acknowledgement and the only thing that may throw.
+  let ledgerOk = false;
+  try {
+    const ledger = await (options.loadLedger ?? loadLedgerWriter)();
+    ledger.configureSessionLedger(root);
+    ledgerOk = ledger.insertCommittedTurn(
+      {
+        sessionKey: key,
+        agentId: typeof params.admission?.agentId === "string" ? params.admission.agentId : "",
+        hostDbPath:
+          typeof params.admission?.storePath === "string" ? params.admission.storePath : "",
+        sessionId: typeof params.sessionId === "string" ? params.sessionId : key,
+        seqStart: startSeq ?? 0,
+        seqEnd: endSeq ?? 0,
+        generation: generation ?? "",
+        advancementKey,
+        heartbeat,
+      },
+      (m) => log.warn(m)
+    ).ok;
+  } catch (e) {
+    log.warn(`[hindsight-engine] commitTurn: ledger unavailable: ${(e as Error)?.message ?? e}`);
+  }
+  // Only conversational roles feed the pending-retain queue - tool output is noise (Q1.7).
+  const conversational = messages
+    .filter((m) => {
+      const role = (m as { role?: string } | null | undefined)?.role;
+      return role === "user" || role === "assistant";
+    })
+    .map((m) => ({ role: (m as { role: string }).role, content: messageText(m) }))
+    .filter((m) => m.content.length > 0);
+  const now = Date.now();
+  // R27.1: the duplicate decision and the append are one synchronous read-modify-write. A retry
+  // that overlapped this one across the awaited ledger load (in any engine copy in this process)
+  // finds the key here and records nothing. A failed write records no key, so a retry still works.
+  let duplicate = false;
+  updateSessionState(root, key, (s) => {
+    if (s.committedKeys.includes(advancementKey)) {
+      duplicate = true;
+      return s;
+    }
+    return {
+      ...s,
+      committedKeys: [...s.committedKeys, advancementKey],
+      lastCommittedSeq: endSeq ?? s.lastCommittedSeq,
+      lastCommittedRange:
+        startSeq !== null && endSeq !== null
+          ? { start: startSeq, end: endSeq }
+          : s.lastCommittedRange,
+      lastGenerationSeen: generation ?? s.lastGenerationSeen,
+      lastCommittedAt: now,
+      lastLedgerFailed: !ledgerOk,
+      // Recorded for the retain loop to drain; cleared by the completion writer.
+      pendingRetain:
+        heartbeat || startSeq === null || endSeq === null
+          ? s.pendingRetain
+          : appendPendingRange(
+              s.pendingRetain,
+              {
+                start: startSeq,
+                end: endSeq,
+                messages: conversational,
+                key: advancementKey,
+                // Owner tag: a detached predecessor close may deliver only its own work.
+                ...(typeof params.sessionId === "string" ? { sessionId: params.sessionId } : {}),
+              },
+              (m) => log.warn(m)
+            ),
+    };
+  });
+  return { status: duplicate ? "duplicate" : "committed" };
+}
+
+async function loadLedgerWriter(): Promise<LedgerWriter> {
+  const ledger = await import("./session-ledger.js");
+  return {
+    configureSessionLedger: ledger.configureSessionLedger,
+    insertCommittedTurn: ledger.insertCommittedTurn,
+  };
+}
+
 /** Registers the engine when the host exposes registerContextEngine; otherwise a no-op. */
 export function registerHindsightContextEngine(
   api: { registerContextEngine?: RegisterContextEngine },
   log: Logger,
   hostStateRoot?: string,
-  getPolicy?: () => Partial<MarksAdmissionPolicy> | undefined
+  getPolicy?: () => Partial<MarksAdmissionPolicy> | undefined,
+  durableTurns = false
 ): boolean {
   const register = api.registerContextEngine;
   if (typeof register !== "function") {
@@ -392,7 +545,9 @@ export function registerHindsightContextEngine(
     return false;
   }
   try {
-    register.call(api, ENGINE_ID, () => createContextEngine(log, { hostStateRoot, getPolicy }));
+    register.call(api, ENGINE_ID, () =>
+      createContextEngine(log, { hostStateRoot, getPolicy, durableTurns })
+    );
     return true;
   } catch (e) {
     log.warn(`[hindsight-engine] registerContextEngine failed: ${(e as Error)?.message ?? e}`);

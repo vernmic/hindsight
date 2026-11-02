@@ -57,14 +57,14 @@ it("R19.1 positive control: retires a completed ordinary row without a completio
   expect(queue.size()).toBe(0);
 });
 
-it("R19.1: the real flush wrapper keeps a completion-bearing receipt (no writer ported)", async () => {
+it("R19.1: the real flush wrapper keeps a completion-bearing receipt it cannot apply (no state root)", async () => {
   const { queue, transport } = await flushFixture(true);
   expect(transport.submit).toHaveBeenCalledTimes(1);
   expect(queue.size()).toBe(1);
   const row = queue.peek()[0];
   expect(row.completion).toBeDefined();
   expect(row.deliveryState).toBe("completed");
-  expect(String(row.lastError)).toContain("completion action held");
+  expect(String(row.lastError)).toContain("completion action held: no host state root");
 });
 
 it("R19.2: default-cadence session_end finishes a pending operation without a second submit", async () => {

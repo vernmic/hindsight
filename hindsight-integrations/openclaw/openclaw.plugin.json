@@ -229,6 +229,11 @@
         "minimum": 1,
         "default": 1
       },
+      "durableTurns": {
+        "type": "boolean",
+        "description": "Durable engine-owned turns: the context engine commits each accepted turn and retain delivers the committed work, marking it done only when the server confirms. Requires a host with the agent-end-context-engine-turn-v1 capability (the engine is refused otherwise). Only read when plugins.slots.contextEngine selects hindsight-openclaw.",
+        "default": false
+      },
       "retainOverlapTurns": {
         "type": "integer",
         "description": "Extra prior turns to include when chunked retention fires. Window = retainEveryNTurns + retainOverlapTurns. Only applies when retainEveryNTurns > 1.",
@@ -555,6 +560,10 @@
     "retainEveryNTurns": {
       "label": "Retain Every N Turns",
       "placeholder": "1 (every turn, default)"
+    },
+    "durableTurns": {
+      "label": "Durable Engine Turns",
+      "advanced": true
     },
     "retainOverlapTurns": {
       "label": "Retain Overlap Turns",
