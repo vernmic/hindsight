@@ -6,7 +6,7 @@
 // result and never throws; a failure logs at warn and the caller continues.
 import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
-import { mkdirSync } from "fs";
+import { existsSync, mkdirSync } from "fs";
 import { join } from "path";
 import {
   CHECKPOINT_SCHEMA_V2_DDL,
@@ -15,6 +15,7 @@ import {
   readContextState,
   type ContextStateRow,
 } from "./checkpoint-store.js";
+import { legacySessionFileName, sessionFileName } from "./session-state.js";
 
 // v2 adds the durable checkpoint records (context_state / context_checkpoints /
 // checkpoint_entries / ledger_bindings). Fresh ledgers are created at v2; an
@@ -42,11 +43,20 @@ export function ledgerEligible(sessionKey: string | undefined | null): boolean {
   return true;
 }
 
+/** R27.2 naming (package 32): readable prefix plus a SHA-256 of the full key. */
 export function ledgerPath(sessionKey: string): string {
-  const safe = String(sessionKey)
-    .replace(/[^a-zA-Z0-9_.-]/g, "_")
-    .slice(0, 120);
-  return join(ledgerRoot, "workspace", "state", "astinus", `${safe}.sqlite`);
+  return join(ledgerRoot, "workspace", "state", "astinus", sessionFileName(sessionKey, ".sqlite"));
+}
+
+/** The maintained plugin's lossy name; several keys can share it, so it is never adopted. */
+export function legacyLedgerPath(sessionKey: string): string {
+  return join(
+    ledgerRoot,
+    "workspace",
+    "state",
+    "astinus",
+    legacySessionFileName(sessionKey, ".sqlite")
+  );
 }
 
 /**
@@ -173,6 +183,13 @@ export function openSessionLedger(
   const path = ledgerPath(sessionKey);
   let db: DatabaseSync;
   try {
+    // A lossy-named ledger may belong to another key: fail closed until reconciled (as R27.2).
+    if (!existsSync(path) && existsSync(legacyLedgerPath(sessionKey))) {
+      const reason = "legacy-ledger-unreconciled";
+      disabled.set(sessionKey, { reason, until: Number.POSITIVE_INFINITY });
+      warn(`[astinus-ledger] ${sessionKey}: ${reason}; ledger disabled for this session`);
+      return { ok: false, reason };
+    }
     mkdirSync(join(ledgerRoot, "workspace", "state", "astinus"), { recursive: true });
     db = new DatabaseSync(path);
     db.exec(`PRAGMA journal_mode = WAL;`);

@@ -58,19 +58,28 @@ export function sessionStateDir(hostStateRoot: string): string {
  * R27.2: the readable prefix is lossy, so the name also carries a SHA-256 of the complete key
  * (injective in practice), and the document records the key it belongs to.
  */
-export function sessionStatePath(hostStateRoot: string, sessionKey: string): string {
+export function sessionFileName(sessionKey: string, ext: string): string {
   const key = String(sessionKey);
   const safe = key.replace(/[^a-zA-Z0-9_.-]/g, "_").slice(0, 80);
   const digest = createHash("sha256").update(key, "utf8").digest("hex").slice(0, 32);
-  return join(sessionStateDir(hostStateRoot), `${safe}.${digest}.json`);
+  return `${safe}.${digest}${ext}`;
 }
 
 /** The maintained plugin's lossy name; several keys can share it, so it is never adopted. */
+export function legacySessionFileName(sessionKey: string, ext: string): string {
+  return (
+    String(sessionKey)
+      .replace(/[^a-zA-Z0-9_.-]/g, "_")
+      .slice(0, 120) + ext
+  );
+}
+
+export function sessionStatePath(hostStateRoot: string, sessionKey: string): string {
+  return join(sessionStateDir(hostStateRoot), sessionFileName(sessionKey, ".json"));
+}
+
 export function legacySessionStatePath(hostStateRoot: string, sessionKey: string): string {
-  const safe = String(sessionKey)
-    .replace(/[^a-zA-Z0-9_.-]/g, "_")
-    .slice(0, 120);
-  return join(sessionStateDir(hostStateRoot), `${safe}.json`);
+  return join(sessionStateDir(hostStateRoot), legacySessionFileName(sessionKey, ".json"));
 }
 
 function defaultSessionState(): SessionState {
