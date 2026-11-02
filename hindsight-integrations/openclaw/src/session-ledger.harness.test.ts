@@ -3,7 +3,15 @@
 // session key, because the module caches open ledgers and disabled entries per key for the life
 // of the process.
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { copyFileSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import {
+  copyFileSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+  existsSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -192,5 +200,80 @@ describe("package 32 - injective ledger names (R27.2 naming)", () => {
     expect(r.ok).toBe(false);
     expect(r.reason).toBe("legacy-ledger-unreconciled");
     expect(existsSync(ledgerPath(k))).toBe(false);
+  });
+});
+
+describe("package 33 - legacy ledger adoption", () => {
+  const lossyPath = (k: string) =>
+    join(
+      root,
+      "workspace",
+      "state",
+      "astinus",
+      k.replace(/[^a-zA-Z0-9_.-]/g, "_").slice(0, 120) + ".sqlite"
+    );
+  /** Make a real ledger for `owner`, then move it to `k`'s legacy name. */
+  function legacyFor(k: string, owner: string, rows: number, keepWal = false): void {
+    for (let i = 0; i < rows; i++) {
+      expect(
+        insertCommittedTurn(row(owner, `adv-${owner}-${i}`, 3 * i + 1, 3 * i + 3), warn).ok
+      ).toBe(true);
+    }
+    let hold: DatabaseSync | null = null;
+    if (keepWal) {
+      // a second connection with a read snapshot keeps the WAL from being checkpointed away
+      hold = new DatabaseSync(ledgerPath(owner));
+      hold.exec("PRAGMA wal_autocheckpoint = 0");
+      hold
+        .prepare(
+          "INSERT INTO turns(session_id,seq_start,seq_end,gen,advancement_key,committed_at) VALUES('w',90,92,'g','adv-wal',1)"
+        )
+        .run();
+    }
+    for (const ext of ["", "-wal", "-shm"]) {
+      if (existsSync(ledgerPath(owner) + ext))
+        copyFileSync(ledgerPath(owner) + ext, lossyPath(k) + ext);
+    }
+    hold?.close();
+    closeAllLedgers();
+    for (const ext of ["", "-wal", "-shm"]) rmSync(ledgerPath(owner) + ext, { force: true });
+  }
+  const count = (k: string) => {
+    const db = new DatabaseSync(ledgerPath(k), { readOnly: true });
+    const n = (db.prepare("SELECT COUNT(*) AS n FROM turns").get() as { n: number }).n;
+    db.close();
+    return n;
+  };
+
+  it("adopts a matching-key legacy ledger on first open: same rows, old name gone", () => {
+    const k = `${key()}:adopt`;
+    legacyFor(k, k, 3);
+    const msgs: string[] = [];
+    expect(insertCommittedTurn(row(k, "adv-new", 40, 42), (m) => msgs.push(m)).ok).toBe(true);
+    closeAllLedgers();
+    expect(existsSync(lossyPath(k))).toBe(false);
+    expect(existsSync(ledgerPath(k))).toBe(true);
+    expect(count(k)).toBe(4);
+    expect(msgs.filter((m) => m.includes("adopted legacy ledger"))).toHaveLength(1);
+  });
+
+  it("refuses a foreign-key legacy ledger and leaves it byte-unchanged", () => {
+    const k = `${key()}:foreign`;
+    legacyFor(k, `${k}:someone-else`, 2);
+    const before = readFileSync(lossyPath(k));
+    const r = insertCommittedTurn(row(k, "adv-f"), warn);
+    expect(r).toMatchObject({ ok: false, reason: "legacy-ledger-unreconciled" });
+    expect(readFileSync(lossyPath(k)).equals(before)).toBe(true);
+    expect(existsSync(ledgerPath(k))).toBe(false);
+  });
+
+  it("adopts a legacy ledger with WAL sidecars and loses no rows", () => {
+    const k = `${key()}:wal`;
+    legacyFor(k, k, 2, true);
+    expect(existsSync(lossyPath(k) + "-wal")).toBe(true);
+    expect(insertCommittedTurn(row(k, "adv-w2", 50, 52), warn).ok).toBe(true);
+    closeAllLedgers();
+    expect(count(k)).toBe(4); // 2 + the WAL-only row + the new one
+    for (const ext of ["", "-wal", "-shm"]) expect(existsSync(lossyPath(k) + ext)).toBe(false);
   });
 });
