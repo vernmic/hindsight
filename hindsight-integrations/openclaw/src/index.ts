@@ -12,7 +12,14 @@ import {
   type HindsightClientOptions,
   type MinScores,
 } from "@vectorize-io/hindsight-client";
-import { RetainQueue } from "./retain-queue.js";
+import { RetainQueue, sameCommittedWork } from "./retain-queue.js";
+import { isTurnOwnedByEngine } from "./engine-compat.js";
+import {
+  appendPendingLegacy,
+  applyCompletedRetain,
+  loadSessionState,
+  updateSessionState,
+} from "./session-state.js";
 import {
   createRetainTransport,
   reconcileRetainQueue,
@@ -337,6 +344,15 @@ function toStringMetadata(
   return out;
 }
 const turnCountBySession = new Map<string, number>();
+// Durable owned work older than this drains below cadence (9c76 ASTINUS_STUCK_RANGE_MS).
+const DURABLE_STUCK_MS = 2 * 60 * 60 * 1000;
+/** The per-message hash the completion marker records (9c76 retainMessageHash). */
+function retainMessageHash(message: unknown): string {
+  const content = (message as { content?: unknown } | null | undefined)?.content;
+  return createHash("sha256")
+    .update(typeof content === "string" ? content : JSON.stringify(content ?? ""))
+    .digest("hex");
+}
 // Where the running agent run started in each session's transcript, recorded by
 // before_prompt_build and consumed by agent_end. See runStartMarker.
 const runStartBySession = new Map<string, string | null>();
@@ -473,14 +489,14 @@ export async function flushRetainQueue(
       capability,
       signal,
       isCurrent,
-      // R19.1: the completion-action writer (session-state markers) is not ported yet (P4 slice 3,
-      // unreviewed). A row carrying an action must NOT be acknowledged: failing its local
-      // application keeps the terminal receipt queued until a reviewed writer exists.
+      // A row carrying a completion action is acknowledged only after its session-state write
+      // succeeds; a failed write (or no state root to write to) keeps the receipt queued.
       applyCompletion: (item) => {
         if (item.completion) {
-          throw new Error(
-            "completion action held: no reviewed completion writer in this build; receipt kept queued"
-          );
+          if (!lifecycle.stateRoot) {
+            throw new Error("completion action held: no host state root; receipt kept queued");
+          }
+          applyCompletedRetain(lifecycle.stateRoot, item);
         }
         const messages = Number(item.metadata.message_count ?? 0);
         log.trackRetain(item.bankId, Number.isFinite(messages) ? messages : 0);
@@ -2265,6 +2281,7 @@ export function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
       typeof config.retainEveryNTurns === "number" && config.retainEveryNTurns >= 1
         ? config.retainEveryNTurns
         : 1,
+    durableTurns: config.durableTurns === true,
     retainOverlapTurns:
       typeof config.retainOverlapTurns === "number" && config.retainOverlapTurns >= 0
         ? config.retainOverlapTurns
@@ -2384,8 +2401,12 @@ export default function (api: MoltbotPluginAPI) {
     const engineStateRoot = hostStateRoot;
     // Admission knobs ride the apply context from the live plugin config (re-read per assemble,
     // so a config reinit is honoured).
-    registerHindsightContextEngine(api, log, engineStateRoot, () =>
-      marksPolicyFromConfig(lifecycle.config)
+    registerHindsightContextEngine(
+      api,
+      log,
+      engineStateRoot,
+      () => marksPolicyFromConfig(lifecycle.config),
+      pluginConfig.durableTurns === true
     );
 
     debug("[Hindsight] Plugin loaded successfully (deferred heavy init to gateway start)");
@@ -3291,7 +3312,11 @@ ${memoriesFormatted}
           }
         }
 
-        if (!Array.isArray(eventMessages) || eventMessages.length === 0) {
+        // Durable turns (default OFF): every un-retained turn is a durable work item in the
+        // session state, so a session_end with no transcript can still deliver it.
+        const durableStateRoot = pluginConfig.durableTurns === true ? lifecycle.stateRoot : null;
+        const markerSessionKey = durableStateRoot ? effectiveCtx?.sessionKey : undefined;
+        if (!markerSessionKey && (!Array.isArray(eventMessages) || eventMessages.length === 0)) {
           debug("[Hindsight Hook] No messages in event, skipping retention");
           return;
         }
@@ -3303,11 +3328,131 @@ ${memoriesFormatted}
 
         // Chunked retention: skip non-Nth turns and use a sliding window when firing
         const retainEveryN = pluginConfig.retainEveryNTurns ?? 1;
-        const allMessages = eventMessages;
+        const allMessages: any[] = Array.isArray(eventMessages) ? eventMessages : [];
         let messagesToRetain = allMessages;
         let retainFullWindow = false;
+        // Owned-work delivery (9c76cbda9): what this retain drains, cleared from the session
+        // state by the completion writer once the server confirms the retain.
+        let markerAdvance: { seq: number; hashes: string[]; generation: string | null } | null =
+          null;
+        let drainedRanges: Array<{ start: number; end: number; key?: string }> = [];
+        let drainedLegacyIds: string[] = [];
 
-        if (retainEveryN > 1) {
+        if (markerSessionKey && durableStateRoot) {
+          // Every un-retained turn is a durable work item tagged with its owner - committed
+          // ranges by commitTurn, captures by their own agent_end. A cadence boundary, the age
+          // backstop or the owner's session_end delivers them; a detached predecessor close
+          // delivers only its own work.
+          const ownedByEngine = isTurnOwnedByEngine(ctx);
+          const endedSessionId =
+            force && typeof event?.sessionId === "string" ? event.sessionId : undefined;
+          // R27.3: strict - a corrupt or unreconciled document throws here (caught below), so
+          // nothing is captured, submitted or overwritten until it is reconciled.
+          let state = loadSessionState(durableStateRoot, markerSessionKey, true);
+          // Work already carried by a queued retain is not submitted again.
+          const held = lifecycle.queue?.pendingForSession(markerSessionKey) ?? [];
+          const heldRanges = held.flatMap((item) => item.completion?.marker?.ranges ?? []);
+          const heldLegacy = new Set(
+            held.flatMap((item) => item.completion?.marker?.legacyIds ?? [])
+          );
+          if (!force && !ownedByEngine) {
+            // Keyed by the host runId, so a repeated delivery finds it (pending, queued or
+            // delivered); nothing counts as captured until the durable append succeeds.
+            const runId = typeof ctx?.runId === "string" ? ctx.runId : undefined;
+            const itemId = runId ?? randomUUID();
+            const turnMessages = sliceLastTurnsByUserBoundary(allMessages, 1)
+              .filter((m: any) => m?.role === "user" || m?.role === "assistant")
+              .map((m: any) => ({ role: m.role, content: messageText(m) }));
+            const alreadyCaptured =
+              state.deliveredCaptureIds.includes(itemId) ||
+              heldLegacy.has(itemId) ||
+              state.pendingLegacy.some((item) => item.id === itemId);
+            if (!alreadyCaptured && turnMessages.length > 0) {
+              state = updateSessionState(durableStateRoot, markerSessionKey, (s) => ({
+                ...s,
+                pendingLegacy: appendPendingLegacy(
+                  s.pendingLegacy,
+                  {
+                    id: itemId,
+                    ...(typeof ctx?.sessionId === "string" ? { sessionId: ctx.sessionId } : {}),
+                    messages: turnMessages,
+                    at: Date.now(),
+                  },
+                  (m) => log.warn(m)
+                ),
+              }));
+            }
+          }
+          const ownedByCaller = (owner: string | undefined) =>
+            !force ||
+            owner === undefined ||
+            endedSessionId === undefined ||
+            owner === endedSessionId;
+          let pendingRanges = state.pendingRetain.filter(
+            (range) =>
+              ownedByCaller(range.sessionId) && !heldRanges.some((h) => sameCommittedWork(h, range))
+          );
+          const emptyRanges = pendingRanges.filter((range) => range.messages.length === 0);
+          if (emptyRanges.length > 0) {
+            // Nothing conversational in these ranges: clear them without touching the marker.
+            try {
+              updateSessionState(durableStateRoot, markerSessionKey, (s) => ({
+                ...s,
+                pendingRetain: s.pendingRetain.filter(
+                  (r) => !emptyRanges.some((empty) => sameCommittedWork(empty, r))
+                ),
+              }));
+            } catch (e) {
+              debug(`[Hindsight Hook] session state write failed: ${e}`);
+            }
+            pendingRanges = pendingRanges.filter((range) => range.messages.length > 0);
+          }
+          // Work older than DURABLE_STUCK_MS drains below cadence; unstamped ranges count as
+          // stuck. Age only speeds delivery of work that exists - it never settles a turn.
+          const isStuck = (at: number | undefined) =>
+            typeof at !== "number" || Date.now() - at > DURABLE_STUCK_MS;
+          const pendingLegacy = state.pendingLegacy.filter(
+            (item) => ownedByCaller(item.sessionId) && !heldLegacy.has(item.id)
+          );
+          if (pendingRanges.length === 0 && pendingLegacy.length === 0) {
+            debug(`[Hindsight Hook] owned work: nothing deliverable for ${markerSessionKey}`);
+            return;
+          }
+          const stuckPending = [...pendingRanges, ...pendingLegacy].some((w) => isStuck(w.at));
+          const pendingTurns =
+            pendingLegacy.length +
+            pendingRanges.flatMap((r) => r.messages).filter((m: any) => m?.role === "user").length;
+          if (!force && !stuckPending && pendingTurns < retainEveryN) {
+            debug(
+              `[Hindsight Hook] owned work: ${pendingTurns}/${retainEveryN} un-retained turns - holding`
+            );
+            return;
+          }
+          // Deliver in capture order; ranges written before the stamp sort first.
+          const deliverMsgs = [
+            ...pendingRanges.map((r) => ({ at: r.at ?? 0, messages: r.messages })),
+            ...pendingLegacy.map((l) => ({ at: l.at, messages: l.messages })),
+          ]
+            .sort((a, b) => a.at - b.at)
+            .flatMap((w) => w.messages);
+          messagesToRetain = deliverMsgs;
+          retainFullWindow = true;
+          drainedRanges = pendingRanges.map((r) => ({
+            start: r.start,
+            end: r.end,
+            ...(r.key !== undefined ? { key: r.key } : {}),
+          }));
+          drainedLegacyIds = pendingLegacy.map((item) => item.id);
+          markerAdvance = {
+            // Legacy turns carry no transcript seq; only committed ranges advance the position.
+            seq: pendingRanges.length > 0 ? Math.max(...pendingRanges.map((r) => r.end)) : 0,
+            hashes: deliverMsgs.map(retainMessageHash),
+            generation: state.lastGenerationSeen,
+          };
+          debug(
+            `[Hindsight Hook] owned work: retaining ${deliverMsgs.length} msgs / ${pendingTurns} turns (${pendingRanges.length} ranges, ${pendingLegacy.length} legacy)`
+          );
+        } else if (retainEveryN > 1) {
           const sessionTrackingKey = `${bankId}:${effectiveCtx?.sessionKey || "session"}`;
           // session_end is a flush, not a turn — don't increment the counter.
           const turnCount = force
@@ -3476,7 +3621,24 @@ ${memoriesFormatted}
         // synchronously before the hook can return.
         lifecycle.queue.enqueue(
           bankId,
-          { ...retainRequest, targetFingerprint: transport.targetFingerprint },
+          {
+            ...retainRequest,
+            targetFingerprint: transport.targetFingerprint,
+            ...(markerSessionKey && markerAdvance
+              ? {
+                  completion: {
+                    sessionKey: markerSessionKey,
+                    generation: markerAdvance.generation,
+                    marker: {
+                      seq: markerAdvance.seq,
+                      hashes: markerAdvance.hashes,
+                      ranges: drainedRanges,
+                      ...(drainedLegacyIds.length > 0 ? { legacyIds: drainedLegacyIds } : {}),
+                    },
+                  },
+                }
+              : {}),
+          },
           retainRequest.metadata
         );
         if (pluginConfig.debugPerfTiming) {

@@ -88,6 +88,9 @@ export interface PluginHookAgentContext {
   messageProvider?: string;
   channelId?: string;
   senderId?: string;
+  /** Host run id; keys a durable legacy capture so a replayed agent_end is a no-op. */
+  runId?: string;
+  sessionId?: string;
   /** session_end only, OpenClaw >= 2026.10.1. Absent on older hosts. */
   endedTranscript?: PluginHookEndedTranscript;
 }
@@ -176,6 +179,8 @@ export interface PluginConfig {
   recallMinScores?: MinScores; // Optional per-stage score floors. Missing fields impose no floor; missing/null result scores pass.
   recallRoles?: Array<"user" | "assistant" | "system" | "tool">; // Roles to include when composing contextual recall query. Default: ['user', 'assistant']
   retainEveryNTurns?: number; // Retain every Nth turn (1 = every turn, default: 1). Values > 1 enable chunked retention.
+  /** Durable engine-owned turns (commitTurn + owned-work retain). Default false. */
+  durableTurns?: boolean;
   retainOverlapTurns?: number; // Extra prior turns included when chunked retention fires (default: 0). Window = retainEveryNTurns + retainOverlapTurns.
   recallTopK?: number; // Max number of memories to inject. Default: unlimited
   recallContextTurns?: number; // Number of user turns to include in recall query context. Default: 1 (latest only)

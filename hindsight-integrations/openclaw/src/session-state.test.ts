@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  legacySessionStatePath,
   loadSessionState,
   loadSessionStateCached,
   sessionStatePath,
@@ -17,36 +18,39 @@ function write(r: string, key: string, body: unknown, mtime?: number) {
   if (mtime !== undefined) utimesSync(p, mtime, mtime);
 }
 
-describe("session state document (read side)", () => {
+describe("session state document", () => {
   afterEach(() => {
     setSessionStateDir(null);
     if (root) rmSync(root, { recursive: true, force: true });
     root = "";
   });
 
-  it("resolves under the host root with a sanitized, capped file name", () => {
-    expect(sessionStatePath("/r", "agent:main:s/1")).toBe(
+  it("resolves under the host root with a readable prefix and a digest of the full key", () => {
+    const p = sessionStatePath("/r", "agent:main:s/1");
+    expect(dirname(p)).toBe(join("/r", "workspace", "state", "astinus"));
+    expect(p).toMatch(/agent_main_s_1\.[0-9a-f]{32}\.json$/);
+    expect(sessionStatePath("/r", "k".repeat(300))).toMatch(/[\\/]k{80}\.[0-9a-f]{32}\.json$/);
+    expect(legacySessionStatePath("/r", "agent:main:s/1")).toBe(
       join("/r", "workspace", "state", "astinus", "agent_main_s_1.json")
     );
-    expect(sessionStatePath("/r", "k".repeat(300)).endsWith("k".repeat(120) + ".json")).toBe(true);
   });
 
   it("returns defaults for a missing, corrupt or mistyped file", () => {
     root = mkdtempSync(join(tmpdir(), "hs-state-"));
-    expect(loadSessionState(root, "agent:main:none")).toEqual({
+    expect(loadSessionState(root, "agent:main:none")).toMatchObject({
       lastGenerationSeen: null,
       lastCommittedSeq: 0,
     });
     write(root, "agent:main:bad", "{not json");
     expect(loadSessionState(root, "agent:main:bad").lastCommittedSeq).toBe(0);
     write(root, "agent:main:typed", { lastGenerationSeen: 5, lastCommittedSeq: "9" });
-    expect(loadSessionState(root, "agent:main:typed")).toEqual({
+    expect(loadSessionState(root, "agent:main:typed")).toMatchObject({
       lastGenerationSeen: null,
       lastCommittedSeq: 0,
     });
   });
 
-  it("reads the two fields and ignores the rest of the fork document", () => {
+  it("reads the generation stamp and seq counter alongside the rest of the fork document", () => {
     root = mkdtempSync(join(tmpdir(), "hs-state-"));
     write(root, "agent:main:s", {
       lastGenerationSeen: "gen-7",
@@ -54,7 +58,7 @@ describe("session state document (read side)", () => {
       topics: { a: {} },
       pendingRetain: [],
     });
-    expect(loadSessionState(root, "agent:main:s")).toEqual({
+    expect(loadSessionState(root, "agent:main:s")).toMatchObject({
       lastGenerationSeen: "gen-7",
       lastCommittedSeq: 412,
     });
@@ -79,10 +83,10 @@ describe("session state document (read side)", () => {
     expect(loadSessionStateCached(a, "agent:main:x").lastCommittedSeq).toBe(10);
     expect(loadSessionStateCached(b, "agent:main:x").lastCommittedSeq).toBe(20);
     setSessionStateDir(join(root, "scratch"));
-    expect(sessionStatePath(a, "agent:main:x")).toBe(join(root, "scratch", "agent_main_x.json"));
+    expect(dirname(sessionStatePath(a, "agent:main:x"))).toBe(join(root, "scratch"));
     setSessionStateDir("  ");
-    expect(sessionStatePath(a, "agent:main:x")).toBe(
-      join(a, "workspace", "state", "astinus", "agent_main_x.json")
+    expect(dirname(sessionStatePath(a, "agent:main:x"))).toBe(
+      join(a, "workspace", "state", "astinus")
     );
   });
 });

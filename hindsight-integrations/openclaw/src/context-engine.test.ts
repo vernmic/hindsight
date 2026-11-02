@@ -1,4 +1,5 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { sessionStatePath } from "./session-state.js";
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { zstdCompressSync } from "node:zlib";
@@ -346,7 +347,7 @@ describe("last-assemble bookkeeping and cached marks index (wave 11)", () => {
     const r = mkdtempSync(join(tmpdir(), "hs-w13-"));
     try {
       const key = "agent:main:w13";
-      const p = join(r, "workspace", "state", "astinus", "agent_main_w13.json");
+      const p = sessionStatePath(r, key);
       mkdirSync(dirname(p), { recursive: true });
       writeFileSync(p, JSON.stringify({ lastGenerationSeen: "gen-3", lastCommittedSeq: 77 }));
       const apply = vi.fn(() => ({
