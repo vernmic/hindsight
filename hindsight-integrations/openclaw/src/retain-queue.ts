@@ -25,12 +25,26 @@ export type RetainCompletionAction = {
   marker?: {
     seq: number;
     hashes: string[];
-    ranges: Array<{ start: number; end: number }>;
+    /** Committed ranges this retain delivers; `key` (the host advancementKey) is their identity (9c76cbda9). */
+    ranges: CommittedRange[];
     /** Owned legacy turns this retain delivers (fork, 2026-10-25); cleared on completion. */
     legacyIds?: string[];
   };
   segment?: { segment: number; unitsDelta: number };
 };
+
+/** A committed transcript range; `key` is absent on records written before 2026-11-01. */
+export type CommittedRange = { start: number; end: number; key?: string };
+
+/**
+ * Whether two committed-range records name the same work (9c76cbda9). The host advancementKey is
+ * the identity: a destructive transcript rewrite can reuse sequence numbers, so coordinates
+ * identify only two keyless legacy records, and a keyless record never matches a keyed one.
+ */
+export function sameCommittedWork(a: CommittedRange, b: CommittedRange): boolean {
+  if (a.key !== undefined || b.key !== undefined) return a.key === b.key;
+  return a.start === b.start && a.end === b.end;
+}
 
 export type RetainDeliveryState = "submitting" | "submitted" | "completed" | "failed" | "uncertain";
 
@@ -163,11 +177,11 @@ export class RetainQueue {
   }
 
   /** Raw ranges already held by this owner must not be submitted again. */
-  pendingForSession(sessionKey: string, generation: string | null): QueuedRetain[] {
-    return this.readAll().filter(
-      (item) =>
-        item.completion?.sessionKey === sessionKey && item.completion.generation === generation
-    );
+  pendingForSession(sessionKey: string): QueuedRetain[] {
+    // Held-work identity is the owner session (99ed79c61): on 10.3 the transcript generation
+    // rotates every turn (openclaw/openclaw#172031), so keying on it hid work queued under the
+    // previous generation and every drain re-submitted it.
+    return this.readAll().filter((item) => item.completion?.sessionKey === sessionKey);
   }
 
   /** Number of items waiting (cached, O(1)). */
