@@ -3,7 +3,7 @@
 // session key, because the module caches open ledgers and disabled entries per key for the life
 // of the process.
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { copyFileSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -148,5 +148,49 @@ describe("Gate L0 harness — session-ledger contract", () => {
     const other = key();
     rmSync(join(root, "workspace"), { force: true });
     expect(insertCommittedTurn(row(other, "adv-g3"), warn).ok).toBe(true);
+  });
+});
+
+describe("package 32 - injective ledger names (R27.2 naming)", () => {
+  const dir = () => join(root, "workspace", "state", "astinus");
+  const lossy = (k: string) => k.replace(/[^a-zA-Z0-9_.-]/g, "_").slice(0, 120) + ".sqlite";
+
+  it("keys that share a lossy name get separate ledgers, each recording its own key", () => {
+    const k = key();
+    const a = `${k}:a/b`;
+    const b = `${k}:a_b`; // same sanitized name as a
+    expect(insertCommittedTurn(row(a, "adv-p1"), warn).ok).toBe(true);
+    expect(insertCommittedTurn(row(b, "adv-p2"), warn).ok).toBe(true);
+    closeAllLedgers();
+    expect(ledgerPath(a)).not.toBe(ledgerPath(b));
+    for (const s of [a, b]) {
+      const db = new DatabaseSync(ledgerPath(s), { readOnly: true });
+      expect(db.prepare("SELECT session_key FROM meta").get()).toEqual({ session_key: s });
+      db.close();
+    }
+  });
+
+  it("a ledger whose stored key differs from the opening key refuses", () => {
+    const k = key();
+    const a = `${k}:owner`;
+    const b = `${k}:other`;
+    expect(insertCommittedTurn(row(a, "adv-p3"), warn).ok).toBe(true);
+    closeAllLedgers();
+    copyFileSync(ledgerPath(a), ledgerPath(b));
+    const r = insertCommittedTurn(row(b, "adv-p4"), warn);
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe(`ledger-key-mismatch:${a}`);
+  });
+
+  it("an old lossy-named ledger fails closed and is never adopted", () => {
+    const k = `${key()}:legacy`;
+    mkdirSync(dir(), { recursive: true });
+    const legacy = new DatabaseSync(join(dir(), lossy(k)));
+    legacy.exec("CREATE TABLE meta (session_key TEXT)");
+    legacy.close();
+    const r = insertCommittedTurn(row(k, "adv-p5"), warn);
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe("legacy-ledger-unreconciled");
+    expect(existsSync(ledgerPath(k))).toBe(false);
   });
 });
