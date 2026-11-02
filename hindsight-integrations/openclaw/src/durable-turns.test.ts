@@ -14,6 +14,17 @@ import {
 // P4 slice 3 (package 27): the durable turn writer, the completion writer and the owned-work
 // retain drain, ported from 9c76cbda9. Faked host and synthetic HTTP only; no server contacted.
 
+// Package 28: the pass spawn is captured, never run.
+const spawned = vi.hoisted(() => [] as Array<{ cmd: string; args: string[]; stdin: string }>);
+vi.mock("node:child_process", async (orig) => ({
+  ...(await orig<typeof import("node:child_process")>()),
+  spawn: vi.fn((cmd: string, args: string[]) => {
+    const rec = { cmd, args, stdin: "" };
+    spawned.push(rec);
+    return { on() {}, unref() {}, stdin: { on() {}, end: (d: string) => (rec.stdin = d) } };
+  }),
+}));
+
 let root = "";
 const AUTHORITIES = Symbol.for("@vectorize-io/hindsight-openclaw/lifecycle-authorities");
 const KEY = "agent:main:durable";
@@ -40,6 +51,7 @@ const commit = (n: number, extra: Record<string, unknown> = {}) => ({
 
 beforeEach(() => {
   vi.resetModules();
+  spawned.length = 0;
   root = mkdtempSync(join(tmpdir(), "durable-turns-"));
 });
 afterEach(() => {
@@ -536,4 +548,44 @@ describe("faked host: owned-work retain", () => {
       await h.service.stop();
     }
   }, 15000);
+});
+
+describe("classification pass spawn (package 28)", () => {
+  it("spawns once per newly committed turn; not for a duplicate, a heartbeat or a failed ledger row", async () => {
+    const engine = createContextEngine(quiet, {
+      hostStateRoot: root,
+      durableTurns: true,
+      loadLedger: okLedger(),
+      turnMiddleAgeTurns: 6,
+      passProviders: [{ url: "https://p.invalid/c", model: "m", apiKey: "k" }],
+    }) as any;
+    const admission = { rawSeq: 11, agentId: "main", storePath: "/host.sqlite" };
+    expect(await engine.commitTurn(commit(1, { admission }))).toEqual({ status: "committed" });
+    expect(await engine.commitTurn(commit(1, { admission }))).toEqual({ status: "duplicate" });
+    await engine.commitTurn(commit(2, { isHeartbeat: true }));
+    expect(spawned).toHaveLength(1);
+    expect(spawned[0].cmd).toBe(process.execPath);
+    expect(spawned[0].args).toHaveLength(1); // the script only: the key never rides argv
+    expect(spawned[0].args[0]).toMatch(/astinus-pass\.js$/);
+    expect(JSON.parse(spawned[0].stdin)).toMatchObject({
+      root,
+      session_key: KEY,
+      session_id: "sid-1",
+      agent_id: "main",
+      host_db_path: "/host.sqlite",
+      range: [11, 12],
+      turn_middle_age_turns: 6,
+      providers: [{ apiKey: "k" }],
+    });
+    const failing = createContextEngine(quiet, {
+      hostStateRoot: root,
+      durableTurns: true,
+      loadLedger: async () => ({
+        configureSessionLedger() {},
+        insertCommittedTurn: () => ({ ok: false, reason: "x" }),
+      }),
+    }) as any;
+    expect(await failing.commitTurn(commit(3))).toEqual({ status: "committed" });
+    expect(spawned).toHaveLength(1);
+  });
 });

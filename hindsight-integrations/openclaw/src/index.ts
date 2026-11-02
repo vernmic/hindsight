@@ -163,6 +163,7 @@ function captureHookLifecycle(): { signal: AbortSignal | undefined; isCurrent: (
 // In-flight recall deduplication: concurrent recalls for the same bank reuse one promise
 import type { RecallResponse } from "./types.js";
 import { marksPolicyFromConfig, registerHindsightContextEngine } from "./context-engine.js";
+import type { PassProvider } from "./pass-provider.js";
 import { resolveHostStateRoot, resolveRetainQueuePath } from "./host-paths.js";
 import {
   lifecycleAuthorityFor,
@@ -2282,6 +2283,20 @@ export function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
         ? config.retainEveryNTurns
         : 1,
     durableTurns: config.durableTurns === true,
+    turnMiddleAgeTurns:
+      Number.isInteger(config.turnMiddleAgeTurns) && config.turnMiddleAgeTurns! >= 1
+        ? config.turnMiddleAgeTurns
+        : undefined,
+    // Each entry owns its endpoint, model and (SecretRef-resolved) key; incomplete entries drop.
+    passProviders: Array.isArray(config.passProviders)
+      ? config.passProviders.filter(
+          (p: unknown): p is PassProvider =>
+            !!p &&
+            typeof (p as PassProvider).url === "string" &&
+            typeof (p as PassProvider).model === "string" &&
+            typeof (p as PassProvider).apiKey === "string"
+        )
+      : undefined,
     retainOverlapTurns:
       typeof config.retainOverlapTurns === "number" && config.retainOverlapTurns >= 0
         ? config.retainOverlapTurns
@@ -2406,7 +2421,11 @@ export default function (api: MoltbotPluginAPI) {
       log,
       engineStateRoot,
       () => marksPolicyFromConfig(lifecycle.config),
-      pluginConfig.durableTurns === true
+      pluginConfig.durableTurns === true,
+      {
+        turnMiddleAgeTurns: pluginConfig.turnMiddleAgeTurns,
+        passProviders: pluginConfig.passProviders,
+      }
     );
 
     debug("[Hindsight] Plugin loaded successfully (deferred heavy init to gateway start)");

@@ -1,3 +1,4 @@
+import type { PassProvider } from "./pass-provider.js";
 import type { MemoryProviderRuntime } from "./memory-provider.js";
 // Moltbot plugin API types (minimal subset needed for this plugin)
 
@@ -181,6 +182,10 @@ export interface PluginConfig {
   retainEveryNTurns?: number; // Retain every Nth turn (1 = every turn, default: 1). Values > 1 enable chunked retention.
   /** Durable engine-owned turns (commitTurn + owned-work retain). Default false. */
   durableTurns?: boolean;
+  /** turn_middle age in newer turns: pass cutoff and apply tail floor (default 6). */
+  turnMiddleAgeTurns?: number;
+  /** Ordered classification-pass providers; each apiKey via SecretRef (passProviders.*.apiKey). */
+  passProviders?: PassProvider[];
   retainOverlapTurns?: number; // Extra prior turns included when chunked retention fires (default: 0). Window = retainEveryNTurns + retainOverlapTurns.
   recallTopK?: number; // Max number of memories to inject. Default: unlimited
   recallContextTurns?: number; // Number of user turns to include in recall query context. Default: 1 (latest only)

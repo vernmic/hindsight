@@ -12,6 +12,10 @@
         {
           "path": "hindsightApiToken",
           "expected": "string"
+        },
+        {
+          "path": "passProviders.*.apiKey",
+          "expected": "string"
         }
       ]
     }
@@ -233,6 +237,27 @@
         "type": "boolean",
         "description": "Durable engine-owned turns: the context engine commits each accepted turn and retain delivers the committed work, marking it done only when the server confirms. Requires a host with the agent-end-context-engine-turn-v1 capability (the engine is refused otherwise). Only read when plugins.slots.contextEngine selects hindsight-openclaw.",
         "default": false
+      },
+      "turnMiddleAgeTurns": {
+        "type": "integer",
+        "description": "Durable mode: a committed turn becomes a turn_middle redaction candidate once this many newer turns exist; also the tail floor turn_middle marks apply under. Other mark kinds keep the 8-turn tail.",
+        "minimum": 1,
+        "default": 6
+      },
+      "passProviders": {
+        "type": "array",
+        "description": "Durable mode: ordered chat-completions providers for the classification pass. Each entry owns its endpoint, model and API key (configure apiKey via SecretRef). Empty = no model call (labelled outcome, turn_middle proposals only).",
+        "items": {
+          "type": "object",
+          "properties": {
+            "name": { "type": "string" },
+            "url": { "type": "string" },
+            "model": { "type": "string" },
+            "apiKey": { "type": "string" },
+            "extra": { "type": "object" }
+          },
+          "required": ["url", "model", "apiKey"]
+        }
       },
       "retainOverlapTurns": {
         "type": "integer",
@@ -563,6 +588,14 @@
     },
     "durableTurns": {
       "label": "Durable Engine Turns",
+      "advanced": true
+    },
+    "turnMiddleAgeTurns": {
+      "label": "Turn-Middle Age (turns)",
+      "advanced": true
+    },
+    "passProviders": {
+      "label": "Classification Pass Providers",
       "advanced": true
     },
     "retainOverlapTurns": {

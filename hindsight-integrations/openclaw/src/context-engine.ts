@@ -20,7 +20,10 @@
 //
 // ENGINE ID = PLUGIN ID ("hindsight-openclaw"): the host reads
 // plugins.slots.contextEngine both as the owning plugin id and as the engine id.
+import { spawn } from "node:child_process";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import type { PassPayload, PassProvider } from "./astinus-pass.js";
 import type { MarksAdmissionPolicy } from "./assemble-marks.js";
 import { ENGINE_ID } from "./engine-compat.js";
 import {
@@ -170,6 +173,13 @@ export type ContextEngineOptions = {
    * agent_end refuses the engine.
    */
   durableTurns?: boolean;
+  /** F2 (config `turnMiddleAgeTurns`, default 6, read once): the pass's turn_middle proposal
+   *  cutoff and the tail floor turn_middle marks apply under. */
+  turnMiddleAgeTurns?: number;
+  /** Resolved config `passProviders`, in order; reaches the pass over stdin only. */
+  passProviders?: PassProvider[];
+  /** Pass spawner override (tests); default spawns dist/astinus-pass.js detached. */
+  spawnPass?: (payload: PassPayload) => void;
   /** Ledger writer override (tests); default the lazily loaded session-ledger module. */
   loadLedger?: () => Promise<LedgerWriter>;
 };
@@ -314,6 +324,7 @@ export function createContextEngine(log: Logger, options: ContextEngineOptions =
               tokenBudget: params.tokenBudget ?? 0,
               // Review answer 1 (e8cb): the admission knobs ride the apply context from plugin config.
               policy: options.getPolicy?.(),
+              turnMiddleAgeTurns: options.turnMiddleAgeTurns,
               // e8cb M1: the debounce counts TURNS off the ledger; the durable seq counter
               // (state.lastCommittedSeq) is only the cold-handle fallback.
               turnCounter: side.readMaxTurnId(key) ?? state.lastCommittedSeq,
@@ -425,8 +436,8 @@ export type CommitTurnParams = {
  * Ported from 9c76cbda9 commitTurn: records the accepted turn (rawSeq + generation and the
  * admission..terminal range) for the retain loop to drain. THROWS on a state failure so the host
  * retries the same key; it never reports "committed" for a turn it did not persist. Not ported
- * here: the topic mapping (no classifier in this plugin), the sidecar pass spawn (package 28)
- * and the in-process F13 lag check.
+ * here: the in-process F13 lag check. The classification pass (package 28) is spawned once per
+ * newly committed non-heartbeat turn whose ledger row landed.
  */
 async function commitTurn(
   log: Logger,
@@ -520,7 +531,42 @@ async function commitTurn(
             ),
     };
   });
+  if (!duplicate && ledgerOk && !heartbeat && startSeq !== null && endSeq !== null) {
+    const facts = authorityFor(root).lastAssemble.get(key);
+    try {
+      (options.spawnPass ?? spawnPassProcess)({
+        root,
+        session_key: key,
+        session_id: typeof params.sessionId === "string" ? params.sessionId : key,
+        agent_id: params.admission?.agentId ?? "",
+        host_db_path: params.admission?.storePath ?? "",
+        range: [startSeq, endSeq],
+        view_tokens: facts?.viewTokens ?? null,
+        token_budget: facts?.tokenBudget ?? null,
+        estimator: facts?.estimator ?? "plugin",
+        window_first_seq: facts?.windowFirstSeq ?? null,
+        turn_middle_age_turns: options.turnMiddleAgeTurns,
+        providers: options.passProviders ?? [],
+      });
+    } catch (e) {
+      log.warn(`[hindsight-engine] commitTurn: pass spawn failed: ${(e as Error)?.message ?? e}`);
+    }
+  }
   return { status: duplicate ? "duplicate" : "committed" };
+}
+
+/** Detached pass process; the payload (provider keys included) goes over stdin only. */
+function spawnPassProcess(payload: PassPayload): void {
+  const script = fileURLToPath(new URL("./astinus-pass.js", import.meta.url));
+  const child = spawn(process.execPath, [script], {
+    detached: true,
+    stdio: ["pipe", "ignore", "ignore"],
+    windowsHide: true,
+  });
+  child.on("error", () => {});
+  child.stdin?.on("error", () => {});
+  child.stdin?.end(JSON.stringify(payload));
+  child.unref();
 }
 
 async function loadLedgerWriter(): Promise<LedgerWriter> {
@@ -537,7 +583,8 @@ export function registerHindsightContextEngine(
   log: Logger,
   hostStateRoot?: string,
   getPolicy?: () => Partial<MarksAdmissionPolicy> | undefined,
-  durableTurns = false
+  durableTurns = false,
+  pass: Pick<ContextEngineOptions, "turnMiddleAgeTurns" | "passProviders"> = {}
 ): boolean {
   const register = api.registerContextEngine;
   if (typeof register !== "function") {
@@ -546,7 +593,7 @@ export function registerHindsightContextEngine(
   }
   try {
     register.call(api, ENGINE_ID, () =>
-      createContextEngine(log, { hostStateRoot, getPolicy, durableTurns })
+      createContextEngine(log, { hostStateRoot, getPolicy, durableTurns, ...pass })
     );
     return true;
   } catch (e) {
