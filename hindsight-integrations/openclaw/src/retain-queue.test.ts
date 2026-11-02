@@ -4,7 +4,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 import type { HindsightClient } from "@vectorize-io/hindsight-client";
 import { buildRetainRequest, createAsyncRetainOperationId, flushRetainQueue } from "./index.js";
-import { RetainQueue } from "./retain-queue.js";
+import { RetainQueue, sameCommittedWork } from "./retain-queue.js";
 import type { RetainTransport } from "./retain-delivery.js";
 async function flushTestQueue(
   queue: RetainQueue,
@@ -180,5 +180,83 @@ describe("RetainQueue operation id persistence", () => {
 
     expect(() => new RetainQueue({ filePath: queuePath })).toThrow("malformed JSON");
     expect(readFileSync(queuePath, "utf8")).toContain("not-json");
+  });
+});
+
+// Ported from 99ed79c61 + 9c76cbda9 (10.3 rotates the transcript generation every turn).
+describe("committed-work identity", () => {
+  it("holds a session's queued work across generation rotation", () => {
+    const queue = new RetainQueue({ filePath: makeQueuePath() });
+    const completion = (generation: string) => ({
+      sessionKey: "agent:main:main",
+      generation,
+      marker: { seq: 9, hashes: [], ranges: [{ start: 1, end: 9, key: "adv-1" }] },
+    });
+    queue.enqueue("bank-1", {
+      targetFingerprint: "unit",
+      content: "a",
+      completion: completion("g1"),
+    });
+    queue.enqueue("bank-1", {
+      targetFingerprint: "unit",
+      content: "b",
+      completion: completion("g2"),
+    });
+    queue.enqueue("bank-1", { targetFingerprint: "unit", content: "c" });
+    expect(queue.pendingForSession("agent:main:main").map((i) => i.content)).toEqual(["a", "b"]);
+    expect(queue.pendingForSession("agent:other")).toEqual([]);
+  });
+
+  it("matches keyed records by key only, even when coordinates are reused", () => {
+    expect(
+      sameCommittedWork({ start: 1, end: 9, key: "k1" }, { start: 1, end: 9, key: "k1" })
+    ).toBe(true);
+    expect(
+      sameCommittedWork({ start: 1, end: 9, key: "k1" }, { start: 1, end: 9, key: "k2" })
+    ).toBe(false);
+    expect(
+      sameCommittedWork({ start: 1, end: 9, key: "k1" }, { start: 40, end: 50, key: "k1" })
+    ).toBe(true);
+  });
+
+  it("never matches a keyless record to a keyed one", () => {
+    expect(sameCommittedWork({ start: 1, end: 9 }, { start: 1, end: 9, key: "k1" })).toBe(false);
+    expect(sameCommittedWork({ start: 1, end: 9, key: "k1" }, { start: 1, end: 9 })).toBe(false);
+  });
+
+  it("keeps draining keyless legacy records by coordinates", () => {
+    expect(sameCommittedWork({ start: 1, end: 9 }, { start: 1, end: 9 })).toBe(true);
+    expect(sameCommittedWork({ start: 1, end: 9 }, { start: 1, end: 10 })).toBe(false);
+  });
+
+  it("reads keyless legacy and keyed queue rows from one file", () => {
+    const path = makeQueuePath();
+    const row = (id: string, range: object) =>
+      JSON.stringify({
+        id,
+        bankId: "bank-1",
+        content: id,
+        documentId: id,
+        createdAt: new Date(0).toISOString(),
+        metadata: {},
+        completion: {
+          sessionKey: "s",
+          generation: "old",
+          marker: { seq: 9, hashes: [], ranges: [range] },
+        },
+      });
+    writeFileSync(
+      path,
+      row("legacy", { start: 1, end: 9 }) +
+        "\n" +
+        row("keyed", { start: 1, end: 9, key: "k" }) +
+        "\n"
+    );
+    const held = new RetainQueue({ filePath: path }).pendingForSession("s");
+    expect(held.map((i) => i.id)).toEqual(["legacy", "keyed"]);
+    const [legacy, keyed] = held.map((i) => i.completion!.marker!.ranges[0]);
+    expect(sameCommittedWork(legacy, { start: 1, end: 9 })).toBe(true);
+    expect(sameCommittedWork(keyed, { start: 1, end: 9, key: "k" })).toBe(true);
+    expect(sameCommittedWork(legacy, keyed)).toBe(false);
   });
 });
