@@ -193,12 +193,82 @@ export function estimateTokensHost(list: unknown[]): number {
   return Math.ceil(total * 1.2);
 }
 
+type TranscriptRow = {
+  seq: number;
+  event_json: string | null;
+  event_zstd?: unknown;
+  event_utf8_bytes?: unknown;
+};
+type RowRange = { after?: number; lo?: number; hi?: number; descending?: boolean; limit?: number };
+
+/** THE host-transcript reader (assemble and the classification pass): read-only, scoped to one
+ *  session, identity or Zstd rows. Nothing else in the plugin queries host tables. */
+export class HostTranscript {
+  private compressed: boolean | null = null;
+  constructor(
+    private readonly db: DatabaseSync,
+    readonly sessionId: string
+  ) {}
+  static open(dbPath: string, sessionId: string): HostTranscript {
+    return new HostTranscript(new DatabaseSync(dbPath, { readOnly: true }), sessionId);
+  }
+  /** Undecoded rows, so a caller can stop before the first row it cannot decode. */
+  rows(range: RowRange = {}): TranscriptRow[] {
+    if (this.compressed === null) {
+      const cols = this.db.prepare("PRAGMA table_info(transcript_events)").all() as Array<{
+        name?: unknown;
+      }>;
+      const names = new Set(cols.map((col) => String(col.name)));
+      this.compressed = names.has("event_zstd") && names.has("event_utf8_bytes");
+    }
+    const where = ["session_id = ?"];
+    const args: Array<string | number> = [this.sessionId];
+    for (const [op, v] of [
+      ["seq > ?", range.after],
+      ["seq >= ?", range.lo],
+      ["seq <= ?", range.hi],
+    ] as const) {
+      if (v !== undefined) (where.push(op), args.push(v));
+    }
+    const cols = this.compressed
+      ? "seq, event_json, event_zstd, event_utf8_bytes"
+      : "seq, event_json";
+    const limit = range.limit !== undefined ? (args.push(range.limit), " LIMIT ?") : "";
+    return this.db
+      .prepare(
+        `SELECT ${cols} FROM transcript_events WHERE ${where.join(" AND ")} ORDER BY seq ${range.descending ? "DESC" : "ASC"}${limit}`
+      )
+      .all(...args) as TranscriptRow[];
+  }
+  /** Decoded events; throws on a row it cannot decode. */
+  events(range: RowRange = {}): Array<{ seq: number; eventJson: string }> {
+    return this.rows(range).map((r) => ({
+      seq: Number(r.seq),
+      eventJson: decodeTranscriptEventJson(r),
+    }));
+  }
+  seqBounds(): { min: number | null; max: number | null } {
+    const r = this.db
+      .prepare("SELECT MIN(seq) AS lo, MAX(seq) AS hi FROM transcript_events WHERE session_id = ?")
+      .get(this.sessionId) as { lo?: number | null; hi?: number | null } | undefined;
+    return { min: r?.lo ?? null, max: r?.hi ?? null };
+  }
+  createdAt(seq: number): number | null {
+    const r = this.db
+      .prepare("SELECT created_at FROM transcript_events WHERE session_id = ? AND seq = ?")
+      .get(this.sessionId, seq) as { created_at?: unknown } | undefined;
+    return typeof r?.created_at === "number" ? r.created_at : null;
+  }
+  close(): void {
+    this.db.close();
+  }
+}
+
 class SeqIndex {
-  private db: DatabaseSync | null = null;
+  private db: HostTranscript | null = null;
   private lastSeq = 0;
   private readonly map = new Map<string, number>();
   private loadedOnce = false;
-  private hasCompressedColumns: boolean | null = null;
   failed = false;
   /** Set when the last refresh stopped at a row it could not read; lastSeq stays before it. */
   readError: string | null = null;
@@ -215,7 +285,7 @@ class SeqIndex {
       return false;
     }
     try {
-      this.db = new DatabaseSync(this.dbPath, { readOnly: true });
+      this.db = HostTranscript.open(this.dbPath, this.sessionId);
       return true;
     } catch {
       this.failed = true;
@@ -230,28 +300,9 @@ class SeqIndex {
     if (!this.open()) return;
     this.readError = null;
     try {
-      if (this.hasCompressedColumns === null) {
-        const cols = this.db!.prepare("PRAGMA table_info(transcript_events)").all() as Array<{
-          name?: unknown;
-        }>;
-        const names = new Set(cols.map((col) => String(col.name)));
-        this.hasCompressedColumns = names.has("event_zstd") && names.has("event_utf8_bytes");
-      }
-      const select = this.hasCompressedColumns
-        ? "SELECT seq, event_json, event_zstd, event_utf8_bytes FROM transcript_events WHERE session_id = ? AND seq > ? ORDER BY seq LIMIT ?"
-        : "SELECT seq, event_json FROM transcript_events WHERE session_id = ? AND seq > ? ORDER BY seq LIMIT ?";
-      let rows: Array<{
-        seq: number;
-        event_json: string | null;
-        event_zstd?: unknown;
-        event_utf8_bytes?: unknown;
-      }> = [];
+      let rows: TranscriptRow[] = [];
       do {
-        rows = this.db!.prepare(select).all(
-          this.sessionId,
-          this.lastSeq,
-          LOAD_CHUNK
-        ) as typeof rows;
+        rows = this.db!.rows({ after: this.lastSeq, limit: LOAD_CHUNK });
         for (const r of rows) {
           let eventJson: string;
           try {
