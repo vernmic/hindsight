@@ -172,12 +172,18 @@ carried `pre_skill_write` gate is not retired by W02.
 
 ## W04 install, disable and uninstall (native `hermes plugins`)
 
+- **Prerequisite for required mode:** a host with the `pre_skill_batch` hook and `skill_policy.required`
+  (qualified only on proposed host `a60c9f83`; not a released host or latest main). On a host without them,
+  required mode is unsupported, not fail-closed: do not configure it there.
 - There is no separate package format: the host installer pins a Git subdirectory at one commit.
   Install both plugins from the same reviewed commit `<sha>`:
   `hermes plugins install https://github.com/vernmic/hindsight.git#hindsight-integrations/hermes/extras/skill_policy_consumer --ref <sha> --enable`
   and the same with `/recommendations` appended to the subdirectory. The installer records source and
   pinned revision in `plugins/.install-metadata.json`. Then set `skill_policy.required: pre_skill_batch`
   (for required mode) and the `plugins.entries` settings above.
+- With `skills.write_approval` on, an allowed batch is staged (not written) carrying the approved
+  `payload_digest`; `/skills approve <id>` replays it through the host's write, ledger and usage
+  bookkeeping without a second judge call, and refuses a staged payload edited after approval.
 - Disable: `hermes plugins disable jev-skill-policy` while `skill_policy.required` is set makes the host
   refuse every skill batch as policy unavailable (still captured if recommendations stays enabled). To return
   to native skill writes, disable both plugins **and** remove `skill_policy.required`.
@@ -185,11 +191,12 @@ carried `pre_skill_write` gate is not retired by W02.
   directories and metadata entries. The recommendation store (`<HERMES_HOME>/jev-skill-recommendations`)
   is left in place on purpose; delete it yourself once its records are no longer needed. The host's
   required switch is not changed by `remove`; clear it as above.
-- Stock host (no `pre_skill_batch`): optional mode loads and registers nothing, so skill writes are native.
-  `required: true` fails plugin startup with `required skill policy selected but this host has no
-  pre_skill_batch hook`. A stock host has no required-policy switch, so it cannot refuse the write itself;
-  enforcement needs the proposed host.
+- Stock host (no `pre_skill_batch`): optional mode registers no batch hook (the recommendations observer
+  still registers), so skill writes are native. With `required: true` the policy plugin fails startup
+  (`required skill policy selected but this host has no pre_skill_batch hook`) and the host still writes.
 - Tested scope: Windows 10 (19045), CPython 3.14, proposed host `a60c9f83` and stock base `085f562a`,
-  disposable profiles under a short path. WSL/Linux/macOS were not run. On Windows the host's isolated
-  runtime copy at enable time can exceed the 260-character path limit when `HERMES_HOME` is deep (for
-  example under `%TEMP%`); use a short `HERMES_HOME` or enable Windows long paths.
+  disposable short-path profiles, synthetic judge and board, the host's write-approval, staging, replay
+  and bookkeeping unmodified. Not established: WSL/Linux/macOS, session-bound context (the judge saw no
+  session), real boards, retention, production installs. On Windows the host's isolated runtime copy at
+  enable time can exceed the 260-character path limit when `HERMES_HOME` is deep (for example under
+  `%TEMP%`); a short `HERMES_HOME` avoids it (long-path settings untested).
