@@ -6,7 +6,7 @@
 // result and never throws; a failure logs at warn and the caller continues.
 import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
-import { existsSync, mkdirSync } from "fs";
+import { existsSync, mkdirSync, renameSync } from "fs";
 import { join } from "path";
 import {
   CHECKPOINT_SCHEMA_V2_DDL,
@@ -161,6 +161,35 @@ const OPEN_FAILED_COOLDOWN_MS = 5 * 60 * 1000;
 
 export type LedgerOpen = { ok: true; db: DatabaseSync } | { ok: false; reason: string };
 
+/** Rename a legacy ledger to its digest name when its meta.session_key is this key. */
+function adoptLegacyLedger(from: string, to: string, sessionKey: string): boolean {
+  let stored: string | undefined;
+  try {
+    const ro = new DatabaseSync(from, { readOnly: true });
+    try {
+      stored = (
+        ro.prepare("SELECT session_key FROM meta LIMIT 1").get() as
+          | { session_key?: string }
+          | undefined
+      )?.session_key;
+    } finally {
+      ro.close();
+    }
+  } catch {
+    return false;
+  }
+  if (stored !== sessionKey) return false;
+  const rw = new DatabaseSync(from);
+  try {
+    rw.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+  } finally {
+    rw.close();
+  }
+  renameSync(from, to);
+  for (const ext of ["-wal", "-shm"]) if (existsSync(from + ext)) renameSync(from + ext, to + ext);
+  return true;
+}
+
 /** Open (or create) a session's ledger. Cached; never throws. */
 export function openSessionLedger(
   sessionKey: string,
@@ -183,8 +212,15 @@ export function openSessionLedger(
   const path = ledgerPath(sessionKey);
   let db: DatabaseSync;
   try {
-    // A lossy-named ledger may belong to another key: fail closed until reconciled (as R27.2).
-    if (!existsSync(path) && existsSync(legacyLedgerPath(sessionKey))) {
+    // A lossy-named ledger is adopted only when its stored key is this key; otherwise it may
+    // belong to another key, so it fails closed (as R27.2).
+    const legacy = legacyLedgerPath(sessionKey);
+    if (!existsSync(path) && existsSync(legacy)) {
+      if (adoptLegacyLedger(legacy, path, sessionKey)) {
+        warn(`[astinus-ledger] ${sessionKey}: adopted legacy ledger ${legacy} -> ${path}`);
+      }
+    }
+    if (!existsSync(path) && existsSync(legacy)) {
       const reason = "legacy-ledger-unreconciled";
       disabled.set(sessionKey, { reason, until: Number.POSITIVE_INFINITY });
       warn(`[astinus-ledger] ${sessionKey}: ${reason}; ledger disabled for this session`);
