@@ -15,6 +15,7 @@ import {
   readContextState,
   type ContextStateRow,
 } from "./checkpoint-store.js";
+import { ensureMarkAnchorColumns, HostTranscript } from "./assemble-marks.js";
 import { legacySessionFileName, sessionFileName } from "./session-state.js";
 
 // v2 adds the durable checkpoint records (context_state / context_checkpoints /
@@ -123,7 +124,8 @@ CREATE TABLE IF NOT EXISTS marks (
   reason      TEXT NOT NULL,
   stmt_age_s  INTEGER, topic_dormancy_s INTEGER, pressure REAL,
   proposed_at INTEGER NOT NULL, applied_gen TEXT, applied_at INTEGER,
-  view_tokens_before INTEGER, view_tokens_after INTEGER
+  view_tokens_before INTEGER, view_tokens_after INTEGER,
+  anchor_first_event TEXT, anchor_last_event TEXT, retired_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS ix_marks_seq ON marks(session_id, seq_start);
 CREATE TABLE IF NOT EXISTS supersessions (
@@ -274,6 +276,7 @@ export function openSessionLedger(
         lastUsedAt.delete(oldest);
       }
     }
+    ensureMarkAnchorColumns(db);
     cache.set(sessionKey, db);
     lastUsedAt.set(sessionKey, Date.now());
     // Item 6: hourly idle-close sweep, piggybacked on the per-turn open path.
@@ -788,7 +791,7 @@ export function readMarks(
     const marks = opened.db
       .prepare(
         `SELECT mark_id, session_id, seq_start, seq_end, kind, action, digest, reason,
-                applied_gen, applied_at
+                applied_gen, applied_at, anchor_first_event, anchor_last_event, retired_at
            FROM marks ORDER BY seq_start`
       )
       .all();
@@ -822,7 +825,7 @@ export function readMarksCached(
     const marks = db
       .prepare(
         `SELECT mark_id, session_id, seq_start, seq_end, kind, action, digest, reason,
-                applied_gen, applied_at
+                applied_gen, applied_at, anchor_first_event, anchor_last_event, retired_at
            FROM marks ORDER BY seq_start`
       )
       .all();
@@ -888,4 +891,96 @@ export function readActiveCheckpointEntryIdsCached(sessionKey: string): string[]
   return readCheckpointEntries(db, st.active_checkpoint_id)
     .map((r) => String((r as { source_entry_id?: unknown }).source_entry_id ?? ""))
     .filter((s) => s.length > 0);
+}
+
+/**
+ * One-time mark rebase plan. Marks admitted before anchors existed carry only seq numbers:
+ * - applied under the current generation: numbers still exact, so backfill anchors;
+ * - applied under an older generation: a rewrite and a reindex cannot be told apart, retire;
+ * - pending and unanchored: proposed before the columns existed, remove (the pass re-proposes).
+ */
+export function planMarkRebase(
+  marks: ReadonlyArray<{
+    mark_id: number;
+    applied_gen?: string | null;
+    applied_at?: number | null;
+    anchor_first_event?: string | null;
+    anchor_last_event?: string | null;
+  }>,
+  currentGen: string
+): { backfill: number[]; retire: number[]; remove: number[] } {
+  const plan = { backfill: [] as number[], retire: [] as number[], remove: [] as number[] };
+  for (const m of marks) {
+    if (m.anchor_first_event && m.anchor_last_event) continue;
+    if (m.applied_at == null) plan.remove.push(m.mark_id);
+    else if (currentGen && m.applied_gen === currentGen) plan.backfill.push(m.mark_id);
+    else plan.retire.push(m.mark_id);
+  }
+  return plan;
+}
+
+/**
+ * Run the one-time rebase on an ALREADY-OPEN ledger (assemble's hot path never creates a
+ * file). A backfill whose rows carry no event id is retired instead: it is never left to
+ * apply by number. Returns the counts, or null when not open, already done, or failed.
+ */
+export function runMarkRebaseCached(
+  sessionKey: string,
+  hostDbPath: string,
+  sessionId: string,
+  currentGen: string,
+  warn: (msg: string) => void
+): { backfill: number; retire: number; remove: number } | null {
+  const db = cache.get(sessionKey);
+  if (!db) return null;
+  try {
+    const done = db.prepare("SELECT mark_rebase_done FROM meta LIMIT 1").get() as
+      | { mark_rebase_done?: number | null }
+      | undefined;
+    if (!done || done.mark_rebase_done != null) return null;
+    const marks = db
+      .prepare(
+        "SELECT mark_id, seq_start, seq_end, applied_gen, applied_at, anchor_first_event, anchor_last_event FROM marks"
+      )
+      .all() as Array<{ mark_id: number; seq_start: number; seq_end: number }>;
+    const plan = planMarkRebase(marks, currentGen);
+    const fills: Array<[number, string, string]> = [];
+    if (plan.backfill.length > 0) {
+      const ht = HostTranscript.open(hostDbPath, sessionId);
+      try {
+        for (const id of plan.backfill) {
+          const m = marks.find((x) => x.mark_id === id)!;
+          const a = ht.anchorsFor(Number(m.seq_start), Number(m.seq_end));
+          if (a) fills.push([id, a.first, a.last]);
+          else plan.retire.push(id);
+        }
+      } finally {
+        ht.close();
+      }
+    }
+    const now = Date.now();
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const fill = db.prepare("UPDATE marks SET anchor_first_event = ?, anchor_last_event = ? WHERE mark_id = ?");
+      for (const [id, a, b] of fills) fill.run(a, b, id);
+      const retire = db.prepare("UPDATE marks SET retired_at = ? WHERE mark_id = ?");
+      for (const id of plan.retire) retire.run(now, id);
+      const remove = db.prepare("DELETE FROM marks WHERE mark_id = ?");
+      for (const id of plan.remove) remove.run(id);
+      db.prepare("UPDATE meta SET mark_rebase_done = ?").run(now);
+      db.exec("COMMIT");
+    } catch (e) {
+      db.exec("ROLLBACK");
+      throw e;
+    }
+    const counts = { backfill: fills.length, retire: plan.retire.length, remove: plan.remove.length };
+    if (marks.length > 0)
+      warn(
+        `[astinus-ledger] ${sessionKey}: mark rebase backfill=${counts.backfill} retire=${counts.retire} remove=${counts.remove}`
+      );
+    return counts;
+  } catch (e) {
+    warn(`[astinus-ledger] ${sessionKey}: mark rebase failed: ${(e as Error)?.message ?? e}`);
+    return null;
+  }
 }
