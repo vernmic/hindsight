@@ -309,6 +309,17 @@ export class HostTranscript {
     }
     return first && last ? { first, last } : null;
   }
+  /** The host's current rewrite generation for this session (A2); null when it cannot be read. */
+  generation(): string | null {
+    try {
+      const row = this.db
+        .prepare("SELECT generation FROM transcript_rewrite_watermarks WHERE session_id = ?")
+        .get(this.sessionId) as { generation?: unknown } | undefined;
+      return typeof row?.generation === "string" && row.generation ? row.generation : null;
+    } catch {
+      return null;
+    }
+  }
   close(): void {
     this.db.close();
   }
