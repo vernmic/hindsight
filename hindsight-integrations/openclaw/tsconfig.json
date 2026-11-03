@@ -4,6 +4,9 @@
     "module": "ES2022",
     "lib": ["ES2022"],
     "moduleResolution": "node",
+    "paths": {
+      "gpt-tokenizer/encoding/cl100k_base": ["./node_modules/gpt-tokenizer/esm/encoding/cl100k_base.d.ts"]
+    },
     "declaration": true,
     "outDir": "./dist",
     "rootDir": "./src",
