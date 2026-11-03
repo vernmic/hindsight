@@ -928,7 +928,6 @@ export function runMarkRebaseCached(
   sessionKey: string,
   hostDbPath: string,
   sessionId: string,
-  currentGen: string,
   warn: (msg: string) => void
 ): { backfill: number; retire: number; remove: number } | null {
   const db = cache.get(sessionKey);
@@ -943,20 +942,21 @@ export function runMarkRebaseCached(
         "SELECT mark_id, seq_start, seq_end, applied_gen, applied_at, anchor_first_event, anchor_last_event FROM marks"
       )
       .all() as Array<{ mark_id: number; seq_start: number; seq_end: number }>;
-    const plan = planMarkRebase(marks, currentGen);
     const fills: Array<[number, string, string]> = [];
-    if (plan.backfill.length > 0) {
-      const ht = HostTranscript.open(hostDbPath, sessionId);
-      try {
-        for (const id of plan.backfill) {
-          const m = marks.find((x) => x.mark_id === id)!;
-          const a = ht.anchorsFor(Number(m.seq_start), Number(m.seq_end));
-          if (a) fills.push([id, a.first, a.last]);
-          else plan.retire.push(id);
-        }
-      } finally {
-        ht.close();
+    const ht = HostTranscript.open(hostDbPath, sessionId);
+    // A2 (Codex 11-03, prod 8b94fbefe): the current generation is the host's rewrite watermark,
+    // never a saved observation; when it cannot be proven nothing is backfilled (all retire).
+    let plan: ReturnType<typeof planMarkRebase>;
+    try {
+      plan = planMarkRebase(marks, ht.generation() ?? "");
+      for (const id of plan.backfill) {
+        const m = marks.find((x) => x.mark_id === id)!;
+        const a = ht.anchorsFor(Number(m.seq_start), Number(m.seq_end));
+        if (a) fills.push([id, a.first, a.last]);
+        else plan.retire.push(id);
       }
+    } finally {
+      ht.close();
     }
     const now = Date.now();
     db.exec("BEGIN IMMEDIATE");
