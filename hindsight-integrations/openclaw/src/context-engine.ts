@@ -305,7 +305,6 @@ export function createContextEngine(log: Logger, options: ContextEngineOptions =
             key,
             hostDbPath,
             params.sessionId,
-            loadSessionStateCached(options.hostStateRoot ?? "", key).lastGenerationSeen ?? "",
             (m) => log.warn(m)
           );
           const read = side.readMarksCached(key, (m) => log.warn(m));

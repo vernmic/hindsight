@@ -2,8 +2,16 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { zstdCompressSync } from "node:zlib";
 import { afterEach, describe, expect, it } from "vitest";
-import { applyMarks, ensureMarkAnchorColumns, SeqIndex, type LedgerMark } from "./assemble-marks.js";
+import {
+  applyMarks,
+  ensureMarkAnchorColumns,
+  HostTranscript,
+  SeqIndex,
+  type LedgerMark,
+} from "./assemble-marks.js";
+import { createContextEngine, estimateTokens } from "./context-engine.js";
 import {
   closeAllLedgers,
   configureSessionLedger,
@@ -36,13 +44,15 @@ const msg = (role: string, turn: number) => ({
 });
 
 /** Host store with event ids; turns [from..to] at seq 1.. (2 rows per turn). */
-function host(from = 1, to = 12) {
+function host(from = 1, to = 12, gen: string | null = "gen-now") {
   const dir = mkdtempSync(join(tmpdir(), "p36-"));
   dirs.push(dir);
   const dbPath = join(dir, "host.sqlite");
   const db = new DatabaseSync(dbPath);
   db.exec("CREATE TABLE transcript_events (session_id TEXT, seq INTEGER, event_json TEXT)");
   write(db, from, to);
+  db.exec("CREATE TABLE transcript_rewrite_watermarks (session_id TEXT PRIMARY KEY, generation TEXT, updated_at INTEGER)");
+  if (gen) db.prepare("INSERT INTO transcript_rewrite_watermarks VALUES ('sid-1', ?, 1)").run(gen);
   db.close();
   return { dir, dbPath };
 }
@@ -128,12 +138,12 @@ describe("B9 anchors", () => {
     ins.run(40, 41, "gen-now", 1); // backfill impossible (no rows) -> retire
     ensureMarkAnchorColumns(db); // idempotent on a migrated ledger
     const warns: string[] = [];
-    expect(runMarkRebaseCached(key, dbPath, "sid-1", "gen-now", (m) => warns.push(m))).toEqual({
+    expect(runMarkRebaseCached(key, dbPath, "sid-1", (m) => warns.push(m))).toEqual({
       backfill: 1,
       retire: 2,
       remove: 1,
     });
-    expect(runMarkRebaseCached(key, dbPath, "sid-1", "gen-now", () => {})).toBeNull(); // once
+    expect(runMarkRebaseCached(key, dbPath, "sid-1", () => {})).toBeNull(); // once
     const marks = readMarksCached(key, () => {}).marks as LedgerMark[];
     expect(marks.map((m) => [m.seq_start, m.anchor_first_event ?? null, m.retired_at != null])).toEqual([
       [3, "ev-user-2", false],
@@ -151,6 +161,52 @@ describe("B9 anchors", () => {
       ""
     );
     expect(plan).toEqual({ backfill: [], retire: [2], remove: [] });
+  });
+});
+
+describe("Codex A2/A3/A4 parity", () => {
+  // A2: the saved state says g-old (the mark's generation) but the host rewrote to g-new.
+  for (const gen of ["g-new", null])
+    it(`rebase never pins old numbers to new content (host generation ${gen ?? "unreadable"})`, () => {
+      const { dir, dbPath } = host(1, 12, gen);
+      trimFirstTurn(dbPath); // the rewrite: seq 3-4 now holds turn 3, not the marked turn 2
+      configureSessionLedger(dir);
+      const key = `agent:main:p36-a2-${gen}`;
+      const db = (openSessionLedger(key, "main", dbPath, () => {}) as { db: DatabaseSync }).db;
+      db.prepare(
+        "INSERT INTO marks(session_id,seq_start,seq_end,kind,action,digest,reason,proposed_at,applied_gen,applied_at) VALUES('sid-1',3,4,'turn','digest','d','r',1,'g-old',1)"
+      ).run();
+      expect(runMarkRebaseCached(key, dbPath, "sid-1", () => {})).toEqual({ backfill: 0, retire: 1, remove: 0 });
+      const [m] = readMarksCached(key, () => {}).marks as LedgerMark[];
+      expect([m.anchor_first_event ?? null, m.retired_at != null]).toEqual([null, true]);
+    });
+
+  it("A3: anchors come from compressed (event_zstd) rows", () => {
+    const dir = mkdtempSync(join(tmpdir(), "p36-z-"));
+    dirs.push(dir);
+    const dbPath = join(dir, "host.sqlite");
+    const db = new DatabaseSync(dbPath);
+    db.exec("CREATE TABLE transcript_events (session_id TEXT, seq INTEGER, event_json TEXT, event_zstd BLOB, event_utf8_bytes INTEGER)");
+    const ins = db.prepare("INSERT INTO transcript_events VALUES ('sid-1',?,NULL,?,?)");
+    for (let s = 1; s <= 6; s++) {
+      const bytes = Buffer.from(JSON.stringify({ id: `e${s}`, message: msg("user", s) }), "utf8");
+      ins.run(s, zstdCompressSync(bytes), bytes.length);
+    }
+    db.close();
+    const ht = HostTranscript.open(dbPath, "sid-1");
+    expect(ht.anchorsFor(4, 6)).toEqual({ first: "e4", last: "e6" });
+    ht.close();
+  });
+
+  it("A4: with no marks the view count is the final view's count", async () => {
+    const messages = view(1, 6);
+    const out = await createContextEngine(
+      { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } as never,
+      {}
+    ).assemble({ messages, sessionKey: "agent:main:p36-a4", sessionId: "sid-1", tokenBudget: 100_000 } as never);
+    expect(out.messages).toEqual(messages);
+    expect(out.estimatedTokens).toBe(estimateTokens(messages));
+    expect(out.estimatedTokens).toBeGreaterThan(0);
   });
 });
 
