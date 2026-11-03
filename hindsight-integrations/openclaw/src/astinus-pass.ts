@@ -11,7 +11,11 @@ import { DatabaseSync } from "node:sqlite";
 import { appendFileSync, existsSync, mkdirSync, realpathSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { DEFAULT_TURN_MIDDLE_AGE_TURNS, HostTranscript } from "./assemble-marks.js";
+import {
+  DEFAULT_TURN_MIDDLE_AGE_TURNS,
+  ensureMarkAnchorColumns,
+  HostTranscript,
+} from "./assemble-marks.js";
 import { configureSessionLedger, ledgerPath } from "./session-ledger.js";
 import { callLlm, type PassProvider, type ProviderDeps } from "./pass-provider.js";
 
@@ -286,6 +290,7 @@ function samePath(a: string, b: string): boolean {
  *  `ageTurns` NEWER turns exist. Additive to the model's marks; skips overlaps. */
 function proposeTurnMiddleMarks(
   db: DatabaseSync,
+  ht: HostTranscript,
   sessionId: string,
   ageTurns: number,
   nowS: number
@@ -297,13 +302,15 @@ function proposeTurnMiddleMarks(
     .prepare("SELECT seq_start, seq_end FROM marks WHERE session_id = ?")
     .all(sessionId) as Json[];
   const insert = db.prepare(
-    "INSERT INTO marks(session_id,seq_start,seq_end,kind,action,digest,reason,proposed_at) VALUES(?,?,?,'turn','digest',NULL,?,?)"
+    "INSERT INTO marks(session_id,seq_start,seq_end,kind,action,digest,reason,proposed_at,anchor_first_event,anchor_last_event) VALUES(?,?,?,'turn','digest',NULL,?,?,?,?)"
   );
   let n = 0;
   rows.forEach((r, idx) => {
     if (rows.length - 1 - idx < ageTurns) return;
     if (existing.some((m) => m.seq_start <= r.seq_end && m.seq_end >= r.seq_start)) return;
-    insert.run(sessionId, r.seq_start, r.seq_end, TURN_MIDDLE_REASON, nowS);
+    const a = ht.anchorsFor(r.seq_start, r.seq_end);
+    if (!a) return; // an unanchorable range cannot survive a reindex
+    insert.run(sessionId, r.seq_start, r.seq_end, TURN_MIDDLE_REASON, nowS, a.first, a.last);
     n++;
   });
   return n;
@@ -335,6 +342,7 @@ export async function runPass(payload: PassPayload, deps: PassDeps = {}): Promis
   let passId: number | null = null;
   try {
     db.exec(`PRAGMA busy_timeout = ${PASS_BUSY_TIMEOUT_MS}; PRAGMA journal_mode = WAL;`);
+    ensureMarkAnchorColumns(db);
     const meta = db
       .prepare("SELECT host_db_path, agent_id, session_key FROM meta LIMIT 1")
       .get() as Json | undefined;
@@ -559,7 +567,7 @@ export async function runPass(payload: PassPayload, deps: PassDeps = {}): Promis
           ? Math.max(0, nowS - Math.floor(top.last_seen_at / 1000))
           : null;
         const insertMark = db.prepare(
-          "INSERT INTO marks(session_id,seq_start,seq_end,kind,action,digest,reason,stmt_age_s,topic_dormancy_s,pressure,proposed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)"
+          "INSERT INTO marks(session_id,seq_start,seq_end,kind,action,digest,reason,stmt_age_s,topic_dormancy_s,pressure,proposed_at,anchor_first_event,anchor_last_event) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         for (const m of (answer.marks ?? []) as Json[]) {
           const ms = Math.trunc(Number(m.range[0]));
@@ -571,6 +579,8 @@ export async function runPass(payload: PassPayload, deps: PassDeps = {}): Promis
           if (ms < minTurnSeq) continue; // outside this session's transcript
           if (existing.some((e) => ms <= e.seq_end && me >= e.seq_start)) continue;
           const action = String(m.action);
+          const anchor = ht!.anchorsFor(ms, me);
+          if (!anchor) continue; // unanchorable: would redact the wrong turn after a reindex
           let ageS: number | null = null;
           try {
             const created = ht!.createdAt(ms);
@@ -589,7 +599,9 @@ export async function runPass(payload: PassPayload, deps: PassDeps = {}): Promis
             ageS,
             dormancy,
             pressure,
-            nowMs
+            nowMs,
+            anchor.first,
+            anchor.last
           );
           existing.push({ seq_start: ms, seq_end: me });
         }
@@ -610,7 +622,7 @@ export async function runPass(payload: PassPayload, deps: PassDeps = {}): Promis
             .get(startedAt) as Json
         ).n
       );
-      proposeTurnMiddleMarks(db, sessionId, ageTurns, nowS);
+      proposeTurnMiddleMarks(db, ht!, sessionId, ageTurns, nowS);
       db.prepare(
         "UPDATE passes SET outcome=?, model=?, effort=?, elapsed_ms=?, reasoning_tokens=?, marks_proposed=?," +
           " fallback_from=?, fallback_reason=?, finished_at=?, lag_turns=? WHERE pass_id=?"
