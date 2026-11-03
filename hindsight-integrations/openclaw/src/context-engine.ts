@@ -25,7 +25,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { PassPayload, PassProvider } from "./astinus-pass.js";
 import type { MarksAdmissionPolicy } from "./assemble-marks.js";
-import { shouldQueueRetain } from "./retain-scope.js";
+import { shouldQueueRetain, type RetainScopeConfig } from "./retain-scope.js";
 import { ENGINE_ID } from "./engine-compat.js";
 import {
   appendPendingRange,
@@ -181,6 +181,8 @@ export type ContextEngineOptions = {
   turnMiddleAgeTurns?: number;
   /** Resolved config `passProviders`, in order; reaches the pass over stdin only. */
   passProviders?: PassProvider[];
+  /** B4: config `retainScope` (skip / allow session-key patterns). */
+  retainScope?: RetainScopeConfig;
   /** Pass spawner override (tests); default spawns dist/astinus-pass.js detached. */
   spawnPass?: (payload: PassPayload) => void;
   /** Ledger writer override (tests); default the lazily loaded session-ledger module. */
@@ -525,7 +527,7 @@ async function commitTurn(
       lastLedgerFailed: !ledgerOk,
       // Recorded for the retain loop to drain; cleared by the completion writer.
       pendingRetain:
-        heartbeat || startSeq === null || endSeq === null || !shouldQueueRetain(key)
+        heartbeat || startSeq === null || endSeq === null || !shouldQueueRetain(key, options.retainScope)
           ? s.pendingRetain
           : appendPendingRange(
               s.pendingRetain,
@@ -594,7 +596,7 @@ export function registerHindsightContextEngine(
   hostStateRoot?: string,
   getPolicy?: () => Partial<MarksAdmissionPolicy> | undefined,
   durableTurns = false,
-  pass: Pick<ContextEngineOptions, "turnMiddleAgeTurns" | "passProviders"> = {}
+  pass: Pick<ContextEngineOptions, "turnMiddleAgeTurns" | "passProviders" | "retainScope"> = {}
 ): boolean {
   const register = api.registerContextEngine;
   if (typeof register !== "function") {
