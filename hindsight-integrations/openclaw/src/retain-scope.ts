@@ -39,7 +39,9 @@ export function shouldQueueRetain(
   if (typeof sessionKey !== "string" || !sessionKey.trim()) return false;
   const key = sessionKey.trim();
   const allow = compile(scope.allowSessionPatterns);
-  if (allow.length) return allow.some((r) => r.test(key));
+  // R36.2: a supplied nonempty list stays in allowlist mode even when every entry is invalid.
+  if (Array.isArray(scope.allowSessionPatterns) && scope.allowSessionPatterns.length)
+    return allow.some((r) => r.test(key));
   const skip = compile(scope.skipSessionPatterns ?? DEFAULT_SKIP_SESSION_PATTERNS);
   return !skip.some((r) => r.test(key));
 }
