@@ -19,6 +19,7 @@ import {
   planMarkRebase,
   readMarksCached,
   runMarkRebaseCached,
+  ledgerPath,
 } from "./session-ledger.js";
 import { shouldQueueRetain } from "./retain-scope.js";
 
@@ -181,6 +182,31 @@ describe("Codex A2/A3/A4 parity", () => {
       expect([m.anchor_first_event ?? null, m.retired_at != null]).toEqual([null, true]);
     });
 
+  it("R36.1: a rebase that cannot take the write lock leaves legacy numeric marks unapplied, then retries", () => {
+    const { dir, dbPath } = host(1, 12, "g-new");
+    trimFirstTurn(dbPath);
+    configureSessionLedger(dir);
+    const key = "agent:main:p36-r361";
+    const db = (openSessionLedger(key, "main", dbPath, () => {}) as { db: DatabaseSync }).db;
+    db.exec("PRAGMA busy_timeout=1");
+    db.prepare(
+      "INSERT INTO marks(session_id,seq_start,seq_end,kind,action,digest,reason,proposed_at,applied_gen,applied_at) VALUES('sid-1',3,4,'turn','digest','d','r',1,'g-old',1)"
+    ).run();
+    const writer = new DatabaseSync(ledgerPath(key));
+    writer.exec("BEGIN IMMEDIATE");
+    try {
+      expect(runMarkRebaseCached(key, dbPath, "sid-1", () => {})).toBeNull();
+      const read = readMarksCached(key, () => {});
+      expect(read.ok).toBe(true);
+      expect(read.marks).toEqual([]);
+      const res = applyMarks(view(2, 12), read.marks as never, ctx(dbPath, key));
+      expect(texts(res.messages)).toContain("user 3");
+    } finally {
+      writer.exec("ROLLBACK");
+      writer.close();
+    }
+    expect(runMarkRebaseCached(key, dbPath, "sid-1", () => {})).toEqual({ backfill: 0, retire: 1, remove: 0 });
+  });
   it("A3: anchors come from compressed (event_zstd) rows", () => {
     const dir = mkdtempSync(join(tmpdir(), "p36-z-"));
     dirs.push(dir);
@@ -241,5 +267,7 @@ describe("B4 retain scope", () => {
     expect(shouldQueueRetain("agent:main:telegram:group:-100:topic:22", allow)).toBe(true);
     expect(shouldQueueRetain("agent:main:telegram:group:-100:topic:7", allow)).toBe(false);
     expect(shouldQueueRetain("agent:db:subagent:1", { allowSessionPatterns: [] })).toBe(true);
+    // R36.2: all-invalid nonempty allowlist stays in allowlist mode and matches nothing.
+    expect(shouldQueueRetain("agent:main:telegram:group:-100:topic:7", { allowSessionPatterns: ["("] })).toBe(false);
   });
 });
