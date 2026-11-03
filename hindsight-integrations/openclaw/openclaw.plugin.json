@@ -414,7 +414,7 @@
       },
       "skipOperationalSessions": {
         "type": "boolean",
-        "description": "When true (default), cron, heartbeat and subagent sessions skip recall and retain. When false, they recall and retain like any other session, and ignoreSessionPatterns / statelessSessionPatterns apply to them.",
+        "description": "When true (default), cron and heartbeat sessions skip recall and retain (subagent sessions are ordinary sessions; exclude them with ignoreSessionPatterns or statelessSessionPatterns). When false, they recall and retain like any other session, and ignoreSessionPatterns / statelessSessionPatterns apply to them.",
         "default": true
       },
       "enableKnowledgeTools": {

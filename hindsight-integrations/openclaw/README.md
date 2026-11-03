@@ -132,7 +132,7 @@ Optional settings in `~/.openclaw/openclaw.json` under `plugins.entries.hindsigh
 | `ignoreSessionPatterns`    | `[]`                           | Session key glob patterns to skip entirely — no recall, no retain (e.g. `["agent:*:cron:**"]`)                                                                                                                                                                                                                   |
 | `statelessSessionPatterns` | `[]`                           | Session key glob patterns for read-only sessions — retain is always skipped; recall is skipped when `skipStatelessSessions` is `true` (e.g. `["agent:*:subagent:**", "agent:*:heartbeat:**"]`)                                                                                                                   |
 | `skipStatelessSessions`    | `true`                         | When `true`, sessions matching `statelessSessionPatterns` also skip recall. Set to `false` to allow recall but still skip retain.                                                                                                                                                                                |
-| `skipOperationalSessions`  | `true`                         | When `true`, cron, heartbeat and subagent sessions skip recall and retain. Set to `false` to treat them like any other session; `ignoreSessionPatterns` and `statelessSessionPatterns` then decide what each kind does.                                                                                          |
+| `skipOperationalSessions`  | `true`                         | When `true`, cron and heartbeat sessions skip recall and retain. Subagent sessions are ordinary sessions (they carry findings); exclude them with `ignoreSessionPatterns` or `statelessSessionPatterns`. Set to `false` to treat them like any other session; `ignoreSessionPatterns` and `statelessSessionPatterns` then decide what each kind does.                                                                                          |
 | `debugPerfTiming`          | `false`                        | Emit one info-level perf line per `before_prompt_build` (recall path) and `agent_end` (retain path) so you can spot whether latency is in the plugin or upstream. Off by default. Format: `perf: <hook> hook_total=Xms <hook-specific fields>`. Safe in production — uses the existing logger.                   |
 
 ### Per-agent bank mapping
@@ -159,7 +159,7 @@ Details worth knowing:
 - **Retain and recall both follow the map** — they resolve the bank through the same path.
 - **Bank defaults still apply.** A mapped bank is stamped with the configured missions, extraction mode, entity labels and so on when it is first used, exactly like a derived bank.
 - **Agent ids match exactly** — the lookup is case-sensitive and not fuzzy, so `Inbound` is not `inbound`. Keys are trimmed, values too.
-- **Mapped agents are exempt from the sender/surface skips.** A session whose sender cannot be resolved, or whose dispatch surface differs from the session's provider, is normally skipped rather than routed into a bank keyed by the wrong thing. A mapped agent's bank depends on neither, so those sessions are retained as intended. Operational sessions (`cron`, `heartbeat`, `subagent`, `temp:`) are still skipped for mapped agents, exactly as before.
+- **Mapped agents are exempt from the sender/surface skips.** A session whose sender cannot be resolved, or whose dispatch surface differs from the session's provider, is normally skipped rather than routed into a bank keyed by the wrong thing. A mapped agent's bank depends on neither, so those sessions are retained as intended. Operational sessions (`cron`, `heartbeat`, `temp:`) are still skipped for mapped agents, exactly as before.
 - **Entries with a blank or non-string bank are ignored** (and logged), rather than routing an agent to a bank named `""`.
 
 ### Per-user dynamic bank defaults
@@ -210,7 +210,7 @@ Glob syntax:
 | Retain | Skipped                 | Always skipped                                  |
 | Recall | Skipped                 | Skipped only when `skipStatelessSessions: true` |
 
-Cron, heartbeat and subagent sessions are skipped entirely by default, whatever these patterns say. Set `skipOperationalSessions: false` to let the patterns decide for them too.
+Cron and heartbeat sessions are skipped entirely by default, whatever these patterns say. Set `skipOperationalSessions: false` to let the patterns decide for them too. Subagent sessions recall and retain by default; add `agent:*:subagent:**` to `ignoreSessionPatterns` (or `statelessSessionPatterns` for read-only) to exclude them.
 
 **Example config** — give cron jobs full memory, and let heartbeats and subagents read but not write memories:
 
@@ -229,7 +229,7 @@ JavaScript regular expression sources, matched case-insensitively against the se
 `agent:main:...` and sanitized `agent_main_...` forms).
 
 - Default (no `retainScope`): skip keys with a `heartbeat`, `cron`, `keepalive`, `ping`, `poll`,
-  `dashboard` or `status` segment; retain everything else, including subagent sessions.
+  `dashboard` or `status` segment; retain everything else, including subagent sessions. This is the same default as the session filters above: subagents are retained unless excluded with `ignoreSessionPatterns`.
 - `skipSessionPatterns`: replaces the default skip list.
 - `allowSessionPatterns` (nonempty): takes precedence over the skip list; only matching keys queue.
   Invalid entries are ignored, and a list with no valid entry matches nothing (it never falls back

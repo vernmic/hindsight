@@ -1597,12 +1597,13 @@ export function getIdentitySkipReason(
   const mappedBanking =
     pluginConfig !== undefined && mappedBankIdForAgent(resolvedCtx, pluginConfig) !== undefined;
   const allowCliSessions = agentBanking || staticBanking || mappedBanking;
-  // Cron, heartbeat and subagent sessions are skipped unless the operator opts
-  // them in; then ignoreSessionPatterns / statelessSessionPatterns decide (#5915).
+  // Cron and heartbeat sessions are skipped unless the operator opts
+  // them in; then ignoreSessionPatterns / statelessSessionPatterns decide (#5915). Subagent
+  // sessions carry findings and are ordinary sessions (B4); exclude them with those patterns.
   const allowOperationalSessions = pluginConfig?.skipOperationalSessions === false;
 
   if (typeof sessionKey === "string") {
-    if (!allowOperationalSessions && /^agent:[^:]+:(cron|heartbeat|subagent):/.test(sessionKey)) {
+    if (!allowOperationalSessions && /^agent:[^:]+:(cron|heartbeat):/.test(sessionKey)) {
       return { resolvedCtx, reason: finalSkipReason(`operational session ${sessionKey}`) };
     }
     if (!allowCliSessions && /^agent:[^:]+:main$/.test(sessionKey)) {
@@ -1614,7 +1615,7 @@ export function getIdentitySkipReason(
   }
 
   const operationalProviders = [
-    ...(allowOperationalSessions ? [] : ["cron", "heartbeat", "subagent"]),
+    ...(allowOperationalSessions ? [] : ["cron", "heartbeat"]),
     ...(allowCliSessions ? [] : ["main"]),
   ];
   if (resolvedCtx?.messageProvider && operationalProviders.includes(resolvedCtx.messageProvider)) {
