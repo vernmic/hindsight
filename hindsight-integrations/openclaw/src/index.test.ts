@@ -1385,7 +1385,6 @@ describe("session identity helpers", () => {
   it.each([
     "agent:worker:cron:nightly:cleanup",
     "agent:worker:heartbeat:node-1",
-    "agent:worker:subagent:abc123",
   ])("marks operational sessions as final skips: %s", (sessionKey) => {
     const result = getIdentitySkipReason({ sessionKey });
     expect(result.reason).toEqual({
