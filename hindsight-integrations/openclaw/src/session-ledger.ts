@@ -792,7 +792,12 @@ export function readMarks(
       .prepare(
         `SELECT mark_id, session_id, seq_start, seq_end, kind, action, digest, reason,
                 applied_gen, applied_at, anchor_first_event, anchor_last_event, retired_at
-           FROM marks ORDER BY seq_start`
+           FROM marks
+          -- R36.1: an unanchored (legacy numeric) mark applies only once the one-time rebase
+          -- has committed; a failed/deferred rebase leaves the prompt unchanged by it until a retry.
+          WHERE anchor_first_event IS NOT NULL
+             OR (SELECT mark_rebase_done FROM meta LIMIT 1) IS NOT NULL
+          ORDER BY seq_start`
       )
       .all();
     return { ok: true, marks };
@@ -826,7 +831,12 @@ export function readMarksCached(
       .prepare(
         `SELECT mark_id, session_id, seq_start, seq_end, kind, action, digest, reason,
                 applied_gen, applied_at, anchor_first_event, anchor_last_event, retired_at
-           FROM marks ORDER BY seq_start`
+           FROM marks
+          -- R36.1: an unanchored (legacy numeric) mark applies only once the one-time rebase
+          -- has committed; a failed/deferred rebase leaves the prompt unchanged by it until a retry.
+          WHERE anchor_first_event IS NOT NULL
+             OR (SELECT mark_rebase_done FROM meta LIMIT 1) IS NOT NULL
+          ORDER BY seq_start`
       )
       .all();
     return { ok: true, marks };

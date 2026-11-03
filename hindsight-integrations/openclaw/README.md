@@ -222,6 +222,21 @@ Cron, heartbeat and subagent sessions are skipped entirely by default, whatever 
 }
 ```
 
+### Durable retain scope (`retainScope`)
+
+In durable mode, `retainScope` decides which sessions queue turns for retention. Patterns are
+JavaScript regular expression sources, matched case-insensitively against the session key (both
+`agent:main:...` and sanitized `agent_main_...` forms).
+
+- Default (no `retainScope`): skip keys with a `heartbeat`, `cron`, `keepalive`, `ping`, `poll`,
+  `dashboard` or `status` segment; retain everything else, including subagent sessions.
+- `skipSessionPatterns`: replaces the default skip list.
+- `allowSessionPatterns` (nonempty): takes precedence over the skip list; only matching keys queue.
+  Invalid entries are ignored, and a list with no valid entry matches nothing (it never falls back
+  to the default). An empty list behaves as if absent.
+
+A deployment that retains only its desk sessions supplies them as an allowlist, e.g.
+`"retainScope": { "allowSessionPatterns": ["^agent:main:telegram:group:-100\\d+:topic:(22|1201)$"] }`.
 ## Retention details
 
 Retained documents use stable session-scoped IDs derived from the OpenClaw `sessionKey`. Every retain in a session shares one document id like `openclaw:agent:agentname:discord:channel:123`, so all turns of the conversation accumulate under a single Hindsight document (on legacy APIs without `update_mode: 'append'` support, the integration falls back to per-retain ids — `...:turn:<boot>:000001`, `...:window:<boot>:000002` for chunked retention — so prior turns aren't overwritten; `<boot>` is a token minted per host process, which keeps a restart from replaying ids the previous run already used). Retained documents include richer metadata such as `session_key`, `agent_id`, `provider`, `channel_id`, `thread_id`, `sender_id`, `turn_index`, and `retention_scope`. Each message in the retained JSON also carries a structured `timestamp` field (ISO 8601) lifted from OpenClaw's per-message time, so facts are not polluted by inline weekday/date prefixes.
