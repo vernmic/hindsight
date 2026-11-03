@@ -211,18 +211,35 @@ describe("Codex A2/A3/A4 parity", () => {
 });
 
 describe("B4 retain scope", () => {
-  it("queues conversational sessions only, in both key forms", () => {
-    expect(shouldQueueRetain("agent:main:telegram:group:-100:topic:22")).toBe(true);
-    expect(shouldQueueRetain("agent:main:telegram:group:-100:topic:1201")).toBe(true);
+  it("default skips only heartbeat/cron/poll/status sessions, in both key forms", () => {
+    for (const k of [
+      "agent:main:telegram:group:-100:topic:22",
+      "agent:main:telegram:group:-100:topic:1201",
+      "agent:db:subagent:8cdb0690",
+      "agent_main_subagent_8cdb0690",
+      "agent:main:main",
+    ])
+      expect(shouldQueueRetain(k)).toBe(true);
     for (const k of [
       "agent:astinus:cron:cd29bb61:run:0d8e5b5c",
       "agent_astinus_cron_cd29bb61_run_0d8e5b5c",
-      "agent:db:subagent:8cdb0690",
       "agent_gardener_main_heartbeat",
       "agent_main_dashboard_x",
+      "agent:main:keepalive",
+      "agent:ops:status:poll",
       "  ",
       undefined,
     ])
       expect(shouldQueueRetain(k)).toBe(false);
+  });
+
+  it("config skip patterns replace the default; a non-empty allowlist overrides", () => {
+    const skip = { skipSessionPatterns: ["subagent"] };
+    expect(shouldQueueRetain("agent:db:subagent:1", skip)).toBe(false);
+    expect(shouldQueueRetain("agent:main:heartbeat", skip)).toBe(true);
+    const allow = { allowSessionPatterns: ["topic:(22|1201)$", "(bad"] };
+    expect(shouldQueueRetain("agent:main:telegram:group:-100:topic:22", allow)).toBe(true);
+    expect(shouldQueueRetain("agent:main:telegram:group:-100:topic:7", allow)).toBe(false);
+    expect(shouldQueueRetain("agent:db:subagent:1", { allowSessionPatterns: [] })).toBe(true);
   });
 });

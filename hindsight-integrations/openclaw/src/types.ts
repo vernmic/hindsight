@@ -186,6 +186,8 @@ export interface PluginConfig {
   turnMiddleAgeTurns?: number;
   /** Ordered classification-pass providers; each apiKey via SecretRef (passProviders.*.apiKey). */
   passProviders?: PassProvider[];
+  /** B4 retain queue scope; default skips heartbeat/cron/poll/status sessions. */
+  retainScope?: { skipSessionPatterns?: string[]; allowSessionPatterns?: string[] };
   retainOverlapTurns?: number; // Extra prior turns included when chunked retention fires (default: 0). Window = retainEveryNTurns + retainOverlapTurns.
   recallTopK?: number; // Max number of memories to inject. Default: unlimited
   recallContextTurns?: number; // Number of user turns to include in recall query context. Default: 1 (latest only)
