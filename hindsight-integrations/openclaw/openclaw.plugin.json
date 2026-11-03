@@ -244,6 +244,15 @@
         "minimum": 1,
         "default": 6
       },
+      "retainScope": {
+        "type": "object",
+        "description": "Durable mode retain queue scope. skipSessionPatterns (regex, case-insensitive) replaces the default skip of heartbeat/cron/keepalive/ping/poll/dashboard/status session keys; a non-empty allowSessionPatterns queues only matching keys.",
+        "properties": {
+          "skipSessionPatterns": { "type": "array", "items": { "type": "string" } },
+          "allowSessionPatterns": { "type": "array", "items": { "type": "string" } }
+        },
+        "additionalProperties": false
+      },
       "passProviders": {
         "type": "array",
         "description": "Durable mode: ordered chat-completions providers for the classification pass. Each entry owns its endpoint, model and API key (configure apiKey via SecretRef). Empty = no model call (labelled outcome, turn_middle proposals only).",
@@ -592,6 +601,10 @@
     },
     "turnMiddleAgeTurns": {
       "label": "Turn-Middle Age (turns)",
+      "advanced": true
+    },
+    "retainScope": {
+      "label": "Retain Session Scope",
       "advanced": true
     },
     "passProviders": {

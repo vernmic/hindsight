@@ -2287,6 +2287,8 @@ export function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
       Number.isInteger(config.turnMiddleAgeTurns) && config.turnMiddleAgeTurns! >= 1
         ? config.turnMiddleAgeTurns
         : undefined,
+    retainScope:
+      config.retainScope && typeof config.retainScope === "object" ? config.retainScope : undefined,
     // Each entry owns its endpoint, model and (SecretRef-resolved) key; incomplete entries drop.
     passProviders: Array.isArray(config.passProviders)
       ? config.passProviders.filter(
@@ -2425,6 +2427,7 @@ export default function (api: MoltbotPluginAPI) {
       {
         turnMiddleAgeTurns: pluginConfig.turnMiddleAgeTurns,
         passProviders: pluginConfig.passProviders,
+        retainScope: pluginConfig.retainScope,
       }
     );
 
