@@ -22,7 +22,39 @@ export type LedgerMark = {
   pressure?: number | null;
   topic_dormancy_s?: number | null;
   stmt_age_s?: number | null;
+  // Anchors: host event ids at the mark's first/last row. Seq numbers move on a trim or a
+  // header repair; ids do not. A mark whose anchor is gone is skipped, never re-aimed.
+  anchor_first_event?: string | null;
+  anchor_last_event?: string | null;
+  retired_at?: number | null; // one-time rebase: numbers no longer trustworthy
 };
+
+/** Adds the anchor columns in place; an old ledger keeps its rows. Idempotent; never throws. */
+export function ensureMarkAnchorColumns(db: DatabaseSync): void {
+  for (const [table, col, type] of [
+    ["marks", "anchor_first_event", "TEXT"],
+    ["marks", "anchor_last_event", "TEXT"],
+    ["marks", "retired_at", "INTEGER"],
+    ["meta", "mark_rebase_done", "INTEGER"],
+  ]) {
+    try {
+      const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name?: unknown }>;
+      if (cols.length > 0 && !cols.some((c) => c.name === col))
+        db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${type}`);
+    } catch {
+      /* a locked or read-only ledger keeps working without anchors */
+    }
+  }
+}
+
+function eventIdOf(eventJson: string): string | null {
+  try {
+    const ev = JSON.parse(eventJson) as Record<string, unknown>;
+    return typeof ev.id === "string" && ev.id ? ev.id : null;
+  } catch {
+    return null;
+  }
+}
 
 const PRESERVE_USER_TURNS = 8;
 /** F2 (design A.14): one setting, `turnMiddleAgeTurns`, is both the pass's proposal cutoff and
@@ -262,15 +294,33 @@ export class HostTranscript {
       .get(this.sessionId, seq) as { created_at?: unknown } | undefined;
     return typeof r?.created_at === "number" ? r.created_at : null;
   }
+  /** Host event ids of the first and last identified rows in [lo, hi]; null when none. */
+  anchorsFor(lo: number, hi: number): { first: string; last: string } | null {
+    let first: string | null = null;
+    let last: string | null = null;
+    for (const r of this.rows({ lo, hi })) {
+      let id: string | null = null;
+      try {
+        id = eventIdOf(decodeTranscriptEventJson(r));
+      } catch {
+        return null; // an undecodable row inside the range: do not guess
+      }
+      if (id) (first ??= id), (last = id);
+    }
+    return first && last ? { first, last } : null;
+  }
   close(): void {
     this.db.close();
   }
 }
 
-class SeqIndex {
+export class SeqIndex {
   private db: HostTranscript | null = null;
   private lastSeq = 0;
+  /** Event id at lastSeq; when that row changes, the transcript was reindexed. */
+  private lastSeqId: string | null = null;
   private readonly map = new Map<string, number>();
+  private readonly byEventId = new Map<string, number>();
   private loadedOnce = false;
   failed = false;
   /** Set when the last refresh stopped at a row it could not read; lastSeq stays before it. */
@@ -303,6 +353,15 @@ class SeqIndex {
     if (!this.open()) return;
     this.readError = null;
     try {
+      // A trim or header repair keeps event ids but renumbers rows, and the incremental read
+      // below only walks seq > lastSeq, so survivors would keep stale coordinates. Reload
+      // from scratch when the row at lastSeq no longer carries the id recorded for it.
+      if (this.loadedOnce && !this.tailUnchanged()) {
+        this.map.clear();
+        this.byEventId.clear();
+        this.lastSeq = -1;
+        this.lastSeqId = null;
+      }
       let rows: TranscriptRow[] = [];
       do {
         rows = this.db!.rows({ after: this.lastSeq, limit: LOAD_CHUNK });
@@ -315,7 +374,9 @@ class SeqIndex {
             return;
           }
           const key = eventIdentity(eventJson);
-          if (Number(r.seq) > this.lastSeq) this.lastSeq = Number(r.seq);
+          const eid = eventIdOf(eventJson);
+          if (eid) this.byEventId.set(eid, Number(r.seq));
+          if (Number(r.seq) > this.lastSeq) (this.lastSeq = Number(r.seq)), (this.lastSeqId = eid);
           if (!key) continue;
           this.map.set(key, Number(r.seq));
           try {
@@ -341,6 +402,30 @@ class SeqIndex {
     return this.loadedOnce;
   }
 
+  private tailUnchanged(): boolean {
+    if (this.lastSeqId === null) return true;
+    try {
+      const row = this.db!.rows({ lo: this.lastSeq, hi: this.lastSeq })[0];
+      return !!row && eventIdOf(decodeTranscriptEventJson(row)) === this.lastSeqId;
+    } catch {
+      return false;
+    }
+  }
+
+  seqOfEventId(id: string): number | null {
+    return this.byEventId.get(id) ?? null;
+  }
+
+  /** Release the read handle (Windows refuses to delete a directory with an open DB). */
+  close(): void {
+    try {
+      this.db?.close();
+    } catch {
+      /* already closed */
+    }
+    this.db = null;
+  }
+
   seqOf(message: unknown): number | null {
     const direct = this.map.get(identityKeyOf(message));
     if (direct !== undefined && direct !== -1) return direct;
@@ -358,7 +443,10 @@ function seqIndexFor(dbPath: string, sessionId: string): SeqIndex {
     ix = new SeqIndex(dbPath, sessionId);
     if (seqIndexes.size >= 200) {
       const oldest = seqIndexes.keys().next().value;
-      if (oldest !== undefined) seqIndexes.delete(oldest);
+      if (oldest !== undefined) {
+        seqIndexes.get(oldest)?.close();
+        seqIndexes.delete(oldest);
+      }
     }
     seqIndexes.set(cacheKey, ix);
   }
@@ -560,7 +648,7 @@ export function applyMarks(
       // stamp belongs after an actual admission - see `out.admitted.length > 0` below.
     }
   }
-  const toApply = [...admitted, ...pending];
+  const toApply = [...admitted, ...pending].filter((m) => m.retired_at == null);
   if (toApply.length === 0) return out;
 
   const ix = seqIndexFor(ctx.hostDbPath, ctx.sessionId);
@@ -584,8 +672,18 @@ export function applyMarks(
 
   const ordered = [...toApply].sort((a, b) => b.seq_start - a.seq_start);
   for (const mark of ordered) {
-    const lo = Number(mark.seq_start);
-    const hi = Number(mark.seq_end);
+    let lo = Number(mark.seq_start);
+    let hi = Number(mark.seq_end);
+    if (mark.anchor_first_event && mark.anchor_last_event) {
+      const a = ix.seqOfEventId(mark.anchor_first_event);
+      const b = ix.seqOfEventId(mark.anchor_last_event);
+      if (a === null || b === null) {
+        out.skipped.push(`seq ${lo}-${hi}: anchor gone from the transcript (not re-aimed)`);
+        continue;
+      }
+      lo = Math.min(a, b);
+      hi = Math.max(a, b);
+    }
     const isTurnMiddle =
       mark.action === "turn_middle" ||
       (typeof mark.reason === "string" && mark.reason.indexOf("turn_middle") === 0);

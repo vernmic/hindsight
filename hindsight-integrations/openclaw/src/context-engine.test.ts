@@ -441,7 +441,7 @@ describe("composed assembly over a real ledger and compressed host store", () =>
           content: [{ type: "text", text: `${role} ${turn}: ` + "synthetic content ".repeat(150) }],
         };
         messages.push(message);
-        const bytes = Buffer.from(JSON.stringify({ message }), "utf8");
+        const bytes = Buffer.from(JSON.stringify({ id: `ev-${messages.length}`, message }), "utf8");
         insert.run("host-uuid", messages.length, null, zstdCompressSync(bytes), bytes.length);
       }
     }
@@ -452,10 +452,10 @@ describe("composed assembly over a real ledger and compressed host store", () =>
     expect(opened.ok).toBe(true);
     if (!opened.ok) return;
     const addMark = opened.db.prepare(
-      "INSERT INTO marks (mark_id, session_id, seq_start, seq_end, kind, action, reason, proposed_at) VALUES (?,?,?,?,?,?,?,?)"
+      "INSERT INTO marks (mark_id, session_id, seq_start, seq_end, kind, action, reason, proposed_at, anchor_first_event, anchor_last_event) VALUES (?,?,?,?,?,?,?,?,?,?)"
     );
-    addMark.run(1, "host-uuid", 2, 2, "turn", "drop", "synthetic", 1);
-    addMark.run(2, "host-uuid", 900, 900, "turn", "drop", "out of window", 1);
+    addMark.run(1, "host-uuid", 2, 2, "turn", "drop", "synthetic", 1, "ev-2", "ev-2");
+    addMark.run(2, "host-uuid", 900, 900, "turn", "drop", "out of window", 1, "ev-900", "ev-900");
 
     const engine = createContextEngine(log(), { hostStateRoot: root });
     const out = await engine.assemble({
@@ -491,7 +491,7 @@ describe("composed assembly over a real ledger and compressed host store", () =>
           content: [{ type: "text", text: `${role} ${turn}: ` + "synthetic content ".repeat(150) }],
         };
         messages.push(message);
-        const bytes = Buffer.from(JSON.stringify({ message }), "utf8");
+        const bytes = Buffer.from(JSON.stringify({ id: `ev-${messages.length}`, message }), "utf8");
         insert.run("host-uuid", messages.length, null, zstdCompressSync(bytes), bytes.length);
       }
     }
@@ -502,10 +502,10 @@ describe("composed assembly over a real ledger and compressed host store", () =>
     expect(opened.ok).toBe(true);
     if (!opened.ok) return;
     const addMark = opened.db.prepare(
-      "INSERT INTO marks (mark_id, session_id, seq_start, seq_end, kind, action, reason, proposed_at) VALUES (?,?,?,?,?,?,?,?)"
+      "INSERT INTO marks (mark_id, session_id, seq_start, seq_end, kind, action, reason, proposed_at, anchor_first_event, anchor_last_event) VALUES (?,?,?,?,?,?,?,?,?,?)"
     );
-    addMark.run(1, "host-uuid", 2, 2, "turn", "drop", "synthetic", 1);
-    addMark.run(2, "host-uuid", 900, 900, "turn", "drop", "out of window", 1);
+    addMark.run(1, "host-uuid", 2, 2, "turn", "drop", "synthetic", 1, "ev-2", "ev-2");
+    addMark.run(2, "host-uuid", 900, 900, "turn", "drop", "out of window", 1, "ev-900", "ev-900");
 
     const engine = createContextEngine(log(), {
       hostStateRoot: root,

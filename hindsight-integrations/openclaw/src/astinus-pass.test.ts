@@ -48,7 +48,7 @@ function hostStore(dir: string, turns: number) {
     ]) {
       const m = { role, content: [{ type: "text", text }], idempotencyKey: `ik-${seq}` };
       messages.push(m);
-      ins.run(SID, seq, JSON.stringify({ message: m }), 1_000_000 + seq * 1000);
+      ins.run(SID, seq, JSON.stringify({ id: `ev-${seq}`, message: m }), 1_000_000 + seq * 1000);
       seq++;
     }
   }
