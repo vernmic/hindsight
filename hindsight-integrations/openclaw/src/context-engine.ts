@@ -25,6 +25,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { PassPayload, PassProvider } from "./astinus-pass.js";
 import type { MarksAdmissionPolicy } from "./assemble-marks.js";
+import { shouldQueueRetain } from "./retain-scope.js";
 import { ENGINE_ID } from "./engine-compat.js";
 import {
   appendPendingRange,
@@ -94,6 +95,7 @@ export type MarksReadSide = {
     tokensAfter: number
   ): void;
   applyMarks: typeof import("./assemble-marks.js").applyMarks;
+  runMarkRebaseCached?: typeof import("./session-ledger.js").runMarkRebaseCached;
   estimateTokensHost(list: unknown[]): number;
 };
 
@@ -150,6 +152,7 @@ async function loadMarksReadSide(): Promise<MarksReadSide> {
     readMarksCached: ledger.readMarksCached,
     readMaxTurnId: ledger.readMaxTurnId,
     markMarksApplied: ledger.markMarksApplied,
+    runMarkRebaseCached: ledger.runMarkRebaseCached,
     applyMarks: marks.applyMarks,
     estimateTokensHost: marks.estimateTokensHost,
   };
@@ -297,6 +300,14 @@ export function createContextEngine(log: Logger, options: ContextEngineOptions =
       ) {
         try {
           const side = await loadMarks();
+          // One-time rebase before any mark applies by number (guarded; never breaks assemble).
+          side.runMarkRebaseCached?.(
+            key,
+            hostDbPath,
+            params.sessionId,
+            loadSessionStateCached(options.hostStateRoot ?? "", key).lastGenerationSeen ?? "",
+            (m) => log.warn(m)
+          );
           const read = side.readMarksCached(key, (m) => log.warn(m));
           const marksIndex = authorityFor(options.hostStateRoot).marksIndex;
           let marks: unknown[] = marksIndex.get(key) ?? [];
@@ -515,7 +526,7 @@ async function commitTurn(
       lastLedgerFailed: !ledgerOk,
       // Recorded for the retain loop to drain; cleared by the completion writer.
       pendingRetain:
-        heartbeat || startSeq === null || endSeq === null
+        heartbeat || startSeq === null || endSeq === null || !shouldQueueRetain(key)
           ? s.pendingRetain
           : appendPendingRange(
               s.pendingRetain,
