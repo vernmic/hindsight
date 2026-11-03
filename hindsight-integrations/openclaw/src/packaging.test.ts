@@ -37,7 +37,7 @@ describe("published manifest", () => {
   });
 
   it("keeps the runtime dependencies the plugin needs at runtime", () => {
-    // The counterpart risk: stripping too much. These three are imported by
+    // The counterpart risk: stripping too much. These four are imported by
     // dist/ and must survive into the published manifest.
     const stripped = strippedFields();
     expect(stripped.has("dependencies")).toBe(false);
@@ -45,6 +45,7 @@ describe("published manifest", () => {
       "@clack/prompts",
       "@vectorize-io/hindsight-all",
       "@vectorize-io/hindsight-client",
+      "gpt-tokenizer",
     ]);
   });
 });
