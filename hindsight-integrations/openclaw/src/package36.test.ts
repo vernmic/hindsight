@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { zstdCompressSync } from "node:zlib";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   applyMarks,
   ensureMarkAnchorColumns,
@@ -22,6 +22,9 @@ import {
   ledgerPath,
 } from "./session-ledger.js";
 import { shouldQueueRetain } from "./retain-scope.js";
+import plugin from "./index.js";
+import { updateSessionState } from "./session-state.js";
+import { lifecycleAuthorityFor } from "./lifecycle-authority.js";
 
 // Package 36: mark anchors, the one-time rebase, the seq-index reload (prod 667d86349,
 // 7ace0c648, 40e6a16be, 7ee8730d8, 82a3d61d0) and retain scope (prod 484e299d6).
@@ -270,4 +273,39 @@ describe("B4 retain scope", () => {
     // R36.2: all-invalid nonempty allowlist stays in allowlist mode and matches nothing.
     expect(shouldQueueRetain("agent:main:telegram:group:-100:topic:7", { allowSessionPatterns: ["("] })).toBe(false);
   });
+});
+describe("R36.3 subagent retention through the real session_end hook", () => {
+  for (const exclude of [false, true])
+    it(`defaults retain subagent work; ignoreSessionPatterns excludes it (exclude=${exclude})`, async () => {
+      const root = mkdtempSync(join(tmpdir(), "p36-sub-"));
+      dirs.push(root);
+      const key = "agent:main:subagent:child-123";
+      const sid = "subagent-sid";
+      const ctx = { agentId: "main", sessionId: sid, sessionKey: key, messageProvider: "telegram", senderId: "u1",
+        contextEngineTurn: { enginePluginId: "hindsight-openclaw", logicalTurnId: "turn-1" } };
+      const config = { hindsightApiUrl: "http://synthetic.invalid:8888", autoRecall: false, autoRetain: true,
+        durableTurns: true, retainEveryNTurns: 1, retainQueuePath: join(root, "queue.jsonl"), dynamicBankId: false,
+        bankId: "synthetic-bank", logLevel: "error", ...(exclude ? { ignoreSessionPatterns: ["agent:*:subagent:**"] } : {}) };
+      vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ status: "ok", api_version: "0.10.0", features: {} }))));
+      let service: any;
+      const handlers = new Map<string, any>();
+      plugin({ config: { plugins: { entries: { "hindsight-openclaw": { config } } } }, runtime: { state: { resolveStateDir: () => root } },
+        registerService: (s: any) => (service = s), registerContextEngine() {}, on: (n: string, fn: any) => handlers.set(n, fn),
+        logger: { info() {}, warn() {}, error() {} } } as never);
+      let calls = 0;
+      try {
+        await service.start();
+        vi.spyOn(lifecycleAuthorityFor(root).client!, "retain").mockImplementation(async () => { calls++; return { success: true } as never; });
+        updateSessionState(root, key, (s) => ({ ...s, committedKeys: ["work-1"], lastGenerationSeen: "g",
+          pendingRetain: [{ start: 1, end: 2, key: "work-1", sessionId: sid, at: Date.now(), messages: [
+            { role: "user", content: "The subagent researched the deployment issue and verified dependency versions." },
+            { role: "assistant", content: "Finding: the deployment requires the host capability before durable turns." }] }] }) as never);
+        await handlers.get("session_end")({ sessionId: sid, sessionKey: key }, ctx);
+      } finally {
+        await service.stop();
+        vi.restoreAllMocks();
+        vi.unstubAllGlobals();
+      }
+      expect(calls).toBe(exclude ? 0 : 1);
+    }, 15000);
 });
