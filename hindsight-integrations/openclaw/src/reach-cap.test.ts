@@ -98,78 +98,23 @@ describe("placeholder reach (item 3)", () => {
   });
 });
 
-describe("hard cap (item 4)", () => {
-  const big = (t: number) => (t <= 4 ? 20000 : 500);
-
-  it("does nothing below the cap", () => {
-    const { dbPath, messages } = fixture("sid-rc", 12, big);
-    const res = applyMarks(messages, [], ctx(dbPath, "rc-below", budgetFor(messages, 0.85)));
-    expect(res.hardCap).toBeNull();
-    expect(res.messages).toBe(messages);
+describe("re-application is idempotent (a carried-forward view keeps its bytes)", () => {
+  it("a placeholder already in place is left as it is", () => {
+    const { dbPath, messages } = fixture("sid-rc", 12, () => 2000);
+    const c = ctx(dbPath, "rc-idem-ph", budgetFor(messages, 0.5));
+    const once = applyMarks(messages, [placeholderMark(7, 7)], c);
+    const twice = applyMarks(once.messages, [placeholderMark(7, 7)], c);
+    expect(JSON.stringify(twice.messages)).toBe(JSON.stringify(once.messages));
   });
 
-  it("reduces the oldest turns until the target, keeping every user message and the tail", () => {
-    const { dbPath, messages } = fixture("sid-rc", 12, big);
-    const res = applyMarks(messages, [], ctx(dbPath, "rc-over", budgetFor(messages, 1.2)));
-    expect(res.hardCap).not.toBeNull();
-    expect(res.hardCap!.turns).toBeGreaterThan(0);
-    expect(res.hardCap!.pressureAfter).toBeLessThanOrEqual(0.7);
-    const users = (res.messages as Msg[]).filter((m) => m.role === "user").map((m) => m.idempotencyKey);
-    expect(users).toEqual(Array.from({ length: 12 }, (_, i) => `ik-u-${i + 1}`));
-    // turn 1's interior is the first to go
-    expect(JSON.stringify((res.messages[1] as Msg).content)).toContain("Astinus hard cap");
-    expect(JSON.stringify((res.messages[1] as Msg).content)).toContain("seq 2-4");
-    // the last 8 user turns (5-12) are byte-for-byte the host objects
-    const tail = messages.slice(16);
-    expect(res.messages.slice(res.messages.length - tail.length)).toEqual(tail);
-    // no orphaned tool result anywhere
-    const callIds = new Set<string>();
-    for (const m of res.messages as Msg[]) {
-      if (m.role === "assistant" && Array.isArray(m.content)) {
-        for (const p of m.content as Msg[]) if (p.type === "toolCall") callIds.add(String(p.id));
-      }
-      if (m.role === "toolResult") expect(callIds.has(String(m.toolCallId))).toBe(true);
-    }
-  });
-
-  it("is off when hardCapPressure is 0", () => {
-    const { dbPath, messages } = fixture("sid-rc", 12, big);
-    const res = applyMarks(messages, [], ctx(dbPath, "rc-off", budgetFor(messages, 1.2), { hardCapPressure: 0 }));
-    expect(res.hardCap).toBeNull();
-    expect(res.messages).toBe(messages);
-  });
-
-  it("skips a turn holding unmapped host content and a turn whose pair crosses its edge", () => {
-    const { dbPath, messages } = fixture("sid-rc", 12, big, (t, push) => {
-      // turn 1: an unmapped host message (a compaction-summary stand-in)
-      if (t === 1) push({ role: "assistant", content: [{ type: "text", text: "summary of earlier work" }] }, false);
-      // turn 2: a call whose result lands after the next user message
-      if (t === 2) push({ role: "assistant", content: [{ type: "toolCall", id: "cross", name: "exec", arguments: {} }], idempotencyKey: "ik-cross-a" });
-      if (t === 3) push({ role: "toolResult", toolCallId: "cross", content: [{ type: "text", text: "late" }], idempotencyKey: "ik-cross-r" });
-    });
-    const res = applyMarks(messages, [], ctx(dbPath, "rc-skip", budgetFor(messages, 1.2)));
-    expect(res.hardCap).not.toBeNull();
-    const text = JSON.stringify(res.messages);
-    expect(text).toContain("summary of earlier work");
-    expect(text).toContain("\"id\":\"cross\"");
-    expect(text).toContain("\"toolCallId\":\"cross\"");
-    // turn 4 (no edge problems) was reduced instead
-    expect(text).toContain("Astinus hard cap");
-  });
-
-  it("writes a byte-stable stub, so a rebuilt view keeps the provider's prefix cache", () => {
-    const { dbPath, messages } = fixture("sid-rc", 12, big);
-    const a = applyMarks(messages, [], ctx(dbPath, "rc-stable-a", budgetFor(messages, 1.2)));
-    const b = applyMarks(messages, [], ctx(dbPath, "rc-stable-b", budgetFor(messages, 1.5)));
-    // turn 1's interior is reduced first at any pressure over the cap; its stub must not carry
-    // the pressure or the clock
-    expect(JSON.stringify(b.messages[1])).toBe(JSON.stringify(a.messages[1]));
-  });
-
-  it("scales pressure by the count anchor", () => {
-    const { dbPath, messages } = fixture("sid-rc", 12, big);
-    // estimate says 1.2, but the provider sees half of it: no cap
-    const res = applyMarks(messages, [], { ...ctx(dbPath, "rc-scale", budgetFor(messages, 1.2)), pressureScale: 0.5 });
-    expect(res.hardCap).toBeNull();
+  it("a turn_middle redaction already in place is left as it is", () => {
+    const { dbPath, messages } = fixture("sid-rc", 12, () => 2000);
+    const c = ctx(dbPath, "rc-idem-tm", budgetFor(messages, 0.5));
+    const tm = { mark_id: 9, session_id: "sid-rc", seq_start: 5, seq_end: 8, kind: "turn", action: "digest",
+                 digest: null, reason: "turn_middle: test", applied_at: 1 } as unknown as LedgerMark;
+    const once = applyMarks(messages, [tm], c);
+    expect(JSON.stringify(once.messages)).toContain("turn interior redacted");
+    const twice = applyMarks(once.messages, [tm], c);
+    expect(JSON.stringify(twice.messages)).toBe(JSON.stringify(once.messages));
   });
 });

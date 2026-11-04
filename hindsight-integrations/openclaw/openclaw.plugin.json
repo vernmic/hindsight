@@ -1,7 +1,7 @@
 {
   "id": "hindsight-openclaw",
   "name": "Hindsight Memory",
-  "kind": "memory",
+  "kind": ["memory", "context-engine"],
   "configContracts": {
     "secretInputs": {
       "paths": [
@@ -12,26 +12,21 @@
         {
           "path": "hindsightApiToken",
           "expected": "string"
-        },
-        {
-          "path": "passProviders.*.apiKey",
-          "expected": "string"
         }
       ]
     }
   },
   "contracts": {
     "tools": [
-      "hindsight_retain",
-      "hindsight_recall",
-      "hindsight_reflect",
-      "hindsight_get_knowledge_base_tree",
-      "hindsight_search_knowledge_base",
-      "hindsight_get_knowledge_page",
-      "hindsight_create_knowledge_folder",
-      "hindsight_create_knowledge_page",
-      "hindsight_update_knowledge_node",
-      "hindsight_delete_knowledge_node"
+      "agent_knowledge_list_pages",
+      "agent_knowledge_get_page",
+      "agent_knowledge_create_page",
+      "agent_knowledge_update_page",
+      "agent_knowledge_delete_page",
+      "agent_knowledge_recall",
+      "agent_knowledge_reflect",
+      "agent_knowledge_ingest",
+      "turn_note"
     ]
   },
   "configSchema": {
@@ -174,17 +169,6 @@
         "description": "Automatically recall memories on every prompt and inject them as context. Set to false when agent has its own recall tool.",
         "default": true
       },
-      "memoryMode": {
-        "type": "string",
-        "enum": ["hybrid", "context", "tools"],
-        "description": "Same as Hermes's memory_mode. 'hybrid': auto-recall plus the agent tools (hindsight_retain, hindsight_recall, hindsight_reflect and the knowledge-base tools); 'context': auto-recall only, no tools; 'tools': the tools only, no auto-recall. The tools always use the agent's own bank.",
-        "default": "hybrid"
-      },
-      "allowKnowledgeDelete": {
-        "type": "boolean",
-        "description": "Offer hindsight_delete_knowledge_node, which deletes a knowledge folder or page and everything under it. Cannot be undone. Off by default.",
-        "default": false
-      },
       "excludeProviders": {
         "type": "array",
         "items": {
@@ -233,46 +217,17 @@
         "minimum": 1,
         "default": 1
       },
-      "durableTurns": {
-        "type": "boolean",
-        "description": "Durable engine-owned turns: the context engine commits each accepted turn and retain delivers the committed work, marking it done only when the server confirms. Requires a host with the agent-end-context-engine-turn-v1 capability (the engine is refused otherwise). Only read when plugins.slots.contextEngine selects hindsight-openclaw.",
-        "default": false
-      },
-      "turnMiddleAgeTurns": {
-        "type": "integer",
-        "description": "Durable mode: a committed turn becomes a turn_middle redaction candidate once this many newer turns exist; also the tail floor turn_middle marks apply under. Other mark kinds keep the 8-turn tail.",
-        "minimum": 1,
-        "default": 6
-      },
-      "retainScope": {
-        "type": "object",
-        "description": "Durable mode retain queue scope. skipSessionPatterns (regex, case-insensitive) replaces the default skip of heartbeat/cron/keepalive/ping/poll/dashboard/status session keys; a non-empty allowSessionPatterns queues only matching keys.",
-        "properties": {
-          "skipSessionPatterns": { "type": "array", "items": { "type": "string" } },
-          "allowSessionPatterns": { "type": "array", "items": { "type": "string" } }
-        },
-        "additionalProperties": false
-      },
-      "passProviders": {
-        "type": "array",
-        "description": "Durable mode: ordered chat-completions providers for the classification pass. Each entry owns its endpoint, model and API key (configure apiKey via SecretRef). Empty = no model call (labelled outcome, turn_middle proposals only).",
-        "items": {
-          "type": "object",
-          "properties": {
-            "name": { "type": "string" },
-            "url": { "type": "string" },
-            "model": { "type": "string" },
-            "apiKey": { "type": "string" },
-            "extra": { "type": "object" }
-          },
-          "required": ["url", "model", "apiKey"]
-        }
-      },
       "retainOverlapTurns": {
         "type": "integer",
         "description": "Extra prior turns to include when chunked retention fires. Window = retainEveryNTurns + retainOverlapTurns. Only applies when retainEveryNTurns > 1.",
         "minimum": 0,
         "default": 0
+      },
+      "retainSegmentUnitThreshold": {
+        "type": "integer",
+        "description": "Session document roll (2026-09-25): units written to a session document before the next retain closes it and opens the next segment (`<session document id>:seg:<n>`). The new segment's tag list resets and is re-seeded from the ledger's current topics; the closed segment is left untouched. Roughly 300 bytes of transcript per unit, so the default of 50 is about 15 kB per segment. Lower it to bound the rows a single retain can rewrite.",
+        "minimum": 1,
+        "default": 50
       },
       "recallBudget": {
         "type": "string",
@@ -337,6 +292,11 @@
         "minimum": 1,
         "description": "Maximum number of memories to inject per turn. Applied after API response as a hard cap."
       },
+      "recallTopicFilter": {
+        "type": "boolean",
+        "description": "EXPERIMENTAL, default false. When true, recall also queries with a topic:<slug> tag filter and MERGES those hits ahead of the unfiltered results. Never a hard filter: Hindsight's tags_match 'any' includes untagged memories but excludes memories tagged with other vocabularies, so a hard filter would drop the protected retain:*/tier:* corpus. Leave off until the upstream namespace-aware match lands.",
+        "default": false
+      },
       "recallPromptPreamble": {
         "type": "string",
         "description": "Text shown above recalled memories in the injected context block.",
@@ -379,10 +339,6 @@
         "type": "string",
         "description": "Path to JSONL file for buffering failed retains. Default: ~/.openclaw/data/hindsight-retain-queue.jsonl"
       },
-      "retainNonBlocking": {
-        "type": "boolean",
-        "description": "Deprecated and ignored. agent_end always returns once the turn's retain is durably queued; delivery runs in the background. Accepted so existing configs keep validating."
-      },
       "retainQueueMaxAgeMs": {
         "type": "number",
         "description": "Max age in ms for queued retain items. -1 = keep forever.",
@@ -392,6 +348,11 @@
         "type": "number",
         "description": "How often to attempt flushing queued retains in ms. Default: 60000 (1 min).",
         "default": 60000
+      },
+      "retainNonBlocking": {
+        "type": "boolean",
+        "description": "When true, agent_end does not await the retain RPC (fire-and-forget with the same success/failure/queue handling, just off the hot path). session_end always awaits regardless, since it is the last chance to flush before the process may exit. Default: false.",
+        "default": false
       },
       "ignoreSessionPatterns": {
         "type": "array",
@@ -407,19 +368,25 @@
         },
         "description": "Session key glob patterns for read-only sessions: retain is always skipped, recall is skipped when skipStatelessSessions is true. E.g. [\"agent:*:subagent:**\", \"agent:*:heartbeat:**\"]."
       },
+      "skipRetainSessionPatterns": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Bare tokens (e.g. \"heartbeat\") auto-wrap as glob patterns \"**:token**\". Use glob syntax for custom patterns. Defaults: [] (disabled). Sessions matching these patterns skip retain but still allow recall.",
+        "default": []
+      },
       "skipStatelessSessions": {
         "type": "boolean",
         "description": "When true (default), sessions matching statelessSessionPatterns also skip recall. When false, they can recall but never retain.",
         "default": true
       },
-      "skipOperationalSessions": {
+      "retainQualityGate": {
         "type": "boolean",
-        "description": "When true (default), cron and heartbeat sessions skip recall and retain (subagent sessions are ordinary sessions; exclude them with ignoreSessionPatterns or statelessSessionPatterns). When false, they recall and retain like any other session, and ignoreSessionPatterns / statelessSessionPatterns apply to them.",
-        "default": true
+        "description": "When true, skip retain for low-signal turns (chitchat, memory-meta, procedural/narrative noise, pure tool calls) via a lightweight regex classifier. Default: false (disabled).",
+        "default": false
       },
       "enableKnowledgeTools": {
         "type": "boolean",
-        "description": "Deprecated and ignored: the agent_knowledge_* tools were removed",
+        "description": "Register the agent_knowledge_* tools (kept in this fork; upstream v1.1.0 removed them)",
         "default": false
       },
       "promptCapture": {
@@ -427,22 +394,13 @@
         "description": "Capture the engine view (pre-mark and post-mark lists) of each turn's first model call; keeps the last two turns per session under the plugin state directory",
         "default": false
       },
-      "deriveHeartbeatFromSessionKey": {
-        "type": "boolean",
-        "description": "Derive isHeartbeat from the session key (agent:<id>:(cron|heartbeat):...) when the host does not send it. For hosts that send isHeartbeat, leave off. On hosts that never send it, setting this true preserves prior heartbeat behaviour; false makes those turns ordinary.",
-        "default": false
-      },
       "astinusMarks": {
         "type": "object",
-        "description": "Context engine marks admission policy: the engine admits a SHARE of the pending marks, in priority order (pressure, then topic dormancy, then statement age), on a turn cadence. Defaults: mark from 0.30, admit ceil(pressure x pending), hold five turns after an admission, and 0.65 bypasses the debounce. Only read when plugins.slots.contextEngine selects hindsight-openclaw. Above hardCapPressure (default 0.90 of the host message budget) the oldest non-preserved turns are reduced to their user message plus a tombstone until pressure is at hardCapTarget (default 0.70); 0 disables the cap.",
+        "description": "Prune cycle (2026-11-03): when the view reaches pruneAtPressure of the host message budget (window minus reserve and system prompt), one prune runs and cuts it to pruneToPressure. What the previous prune left is removed outright, every pending mark is admitted at once, and the oldest whole turns are cut only if the marks are not enough. Between prunes the view does not change, so the provider prompt cache holds. Defaults: 0.60 and 0.25.",
         "additionalProperties": false,
         "properties": {
-          "minPressure": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.3 },
-          "admitShare": { "type": "boolean", "default": true },
-          "debounceTurns": { "type": "integer", "minimum": 1, "default": 5 },
-          "criticalPressure": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.65 },
-          "hardCapPressure": { "type": "number", "minimum": 0, "maximum": 2, "default": 0.9 },
-          "hardCapTarget": { "type": "number", "minimum": 0, "maximum": 2, "default": 0.7 }
+          "pruneAtPressure": { "type": "number", "exclusiveMinimum": 0, "maximum": 2, "default": 0.6 },
+          "pruneToPressure": { "type": "number", "minimum": 0, "maximum": 2, "default": 0.25 }
         }
       },
       "senderPrefixPattern": {
@@ -571,14 +529,6 @@
       "label": "Auto-Recall",
       "placeholder": "true (inject memories on every prompt)"
     },
-    "memoryMode": {
-      "label": "Memory Mode",
-      "placeholder": "hybrid (default), context (no tools), or tools (no auto-recall)"
-    },
-    "allowKnowledgeDelete": {
-      "label": "Allow Knowledge Delete",
-      "placeholder": "false (default)"
-    },
     "excludeProviders": {
       "label": "Excluded Providers",
       "placeholder": "e.g. heartbeat, telegram, discord"
@@ -607,25 +557,13 @@
       "label": "Retain Every N Turns",
       "placeholder": "1 (every turn, default)"
     },
-    "durableTurns": {
-      "label": "Durable Engine Turns",
-      "advanced": true
-    },
-    "turnMiddleAgeTurns": {
-      "label": "Turn-Middle Age (turns)",
-      "advanced": true
-    },
-    "retainScope": {
-      "label": "Retain Session Scope",
-      "advanced": true
-    },
-    "passProviders": {
-      "label": "Classification Pass Providers",
-      "advanced": true
-    },
     "retainOverlapTurns": {
       "label": "Retain Overlap Turns",
       "placeholder": "0 (no overlap, default)"
+    },
+    "retainSegmentUnitThreshold": {
+      "label": "Session Segment Unit Threshold",
+      "placeholder": "50 (units per segment before the session document rolls)"
     },
     "recallBudget": {
       "label": "Recall Budget",
@@ -663,6 +601,10 @@
       "label": "Recall Top K",
       "placeholder": "e.g. 5 (no limit by default)"
     },
+    "recallTopicFilter": {
+      "label": "Recall Topic Filter (experimental)",
+      "placeholder": "false (default) — merge topic-tagged recall ahead of unfiltered results"
+    },
     "recallPromptPreamble": {
       "label": "Recall Prompt Preamble",
       "placeholder": "Instruction shown above recalled memories in injected context"
@@ -691,14 +633,10 @@
     },
     "enableKnowledgeTools": {
       "label": "Enable Knowledge Tools",
-      "placeholder": "deprecated, ignored"
+      "placeholder": "false"
     },
     "promptCapture": {
       "label": "Prompt Capture",
-      "placeholder": "false"
-    },
-    "deriveHeartbeatFromSessionKey": {
-      "label": "Derive Heartbeat From Session Key",
       "placeholder": "false"
     },
     "retainQueuePath": {
@@ -714,7 +652,8 @@
       "placeholder": "60000"
     },
     "retainNonBlocking": {
-      "label": "Retain Non-Blocking (deprecated, ignored)"
+      "label": "Retain Non-Blocking",
+      "placeholder": "false (default)"
     },
     "ignoreSessionPatterns": {
       "label": "Ignore Session Patterns",
@@ -724,17 +663,21 @@
       "label": "Stateless Session Patterns",
       "placeholder": "e.g. [\"agent:*:subagent:**\", \"agent:*:heartbeat:**\"]"
     },
+    "skipRetainSessionPatterns": {
+      "label": "Skip Retain Session Patterns",
+      "placeholder": "e.g. [\"heartbeat\", \"cron\", \"subagent\"]"
+    },
     "skipStatelessSessions": {
       "label": "Skip Stateless Sessions",
       "placeholder": "true (default)"
     },
-    "skipOperationalSessions": {
-      "label": "Skip Operational Sessions",
-      "placeholder": "true (default)"
+    "retainQualityGate": {
+      "label": "Retain Quality Gate",
+      "placeholder": "false (default)"
     },
     "astinusMarks": {
-      "label": "Context Engine Marks Admission",
-      "placeholder": "minPressure 0.30, admitShare true, debounceTurns 5, criticalPressure 0.65, hardCapPressure 0.90, hardCapTarget 0.70"
+      "label": "Astinus Prune Cycle",
+      "placeholder": "pruneAtPressure 0.60, pruneToPressure 0.25"
     },
     "senderPrefixPattern": {
       "label": "Sender Prefix Pattern",
