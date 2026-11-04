@@ -654,21 +654,26 @@ export function applyMarks(
   // provider/estimate ratio, so pressure reflects what the model actually receives.
   const scale = typeof ctx.pressureScale === "number" && ctx.pressureScale > 0 ? ctx.pressureScale : 1;
   const pressureOf = (t: number) => (ctx.tokenBudget > 0 ? (t * scale) / ctx.tokenBudget : 0);
-  // Usable marks: well formed, not retired by the one-time rebase (2026-11-02), and able to change
-  // something - a digest mark with no digest text replaces nothing (item 1), except turn_middle,
-  // which redacts in place and carries no digest by design.
-  const usable = marks.filter(
+  // Valid marks: well formed and not retired by the one-time rebase (2026-11-02).
+  const valid = marks.filter(
     (m) =>
       m &&
       Number.isFinite(m.seq_start) &&
       Number.isFinite(m.seq_end) &&
-      (m as { retired_at?: number | null }).retired_at == null &&
-      (m.action !== "digest" ||
-        (typeof m.digest === "string" && m.digest.length > 0) ||
-        (typeof m.reason === "string" && m.reason.indexOf("turn_middle") === 0))
+      (m as { retired_at?: number | null }).retired_at == null
   );
-  const applied = usable.filter((m) => m.applied_at != null);
-  const pending = usable.filter((m) => m.applied_at == null);
+  // Actionable with its own action: a digest mark with no digest text replaces nothing (item 1),
+  // except turn_middle, which redacts in place and carries no digest by design. This gates only
+  // a mark's OWN action; a drop needs no text (Codex final review N3).
+  const actionable = (m: LedgerMark) =>
+    m.action !== "digest" ||
+    (typeof m.digest === "string" && m.digest.length > 0) ||
+    (typeof m.reason === "string" && m.reason.indexOf("turn_middle") === 0);
+  // Every applied mark joins the epoch cycle, text or not: the legacy applied empty digests (52 on
+  // topic 2549) must drop at the first prune like any other epoch-0 mark. Pending marks must be
+  // actionable to be admitted.
+  const applied = valid.filter((m) => m.applied_at != null);
+  const pending = valid.filter((m) => m.applied_at == null && actionable(m));
   out.pendingCount = pending.length;
   const epochOf = (m: LedgerMark) => {
     const e = Number(m.prune_epoch ?? 0);
@@ -678,9 +683,12 @@ export function applyMarks(
   // one (Vern: "whats the point of keeping tombstones forever ? memory is recall and enrich").
   const asDrop = (m: LedgerMark): LedgerMark => ({ ...m, action: "drop", reason: "prune_dropped" });
 
-  // Steady view: the current epoch's marks with their own action, earlier epochs dropped, pending
-  // marks waiting. A fixed function of the ledger, so request after request it is byte-identical.
-  const steadySet = applied.map((m) => (epochOf(m) < epoch ? asDrop(m) : m));
+  // Steady view: the current epoch's actionable marks with their own action, earlier epochs
+  // dropped, pending marks waiting. A fixed function of the ledger, so request after request it is
+  // byte-identical. A current-epoch mark that cannot act stays inert (item 1: not in effect).
+  const steadySet = applied.flatMap((m) =>
+    epochOf(m) < epoch ? [asDrop(m)] : actionable(m) ? [m] : []
+  );
   const steady = applySet(messages, steadySet, ctx);
   const steadyTokens = steady.changed ? estimateTokensHost(steady.list) : tokensBefore;
   const steadyPressure = pressureOf(steadyTokens);
