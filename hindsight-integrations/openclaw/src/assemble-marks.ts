@@ -350,8 +350,10 @@ function slimBlocks(msg: unknown): unknown {
     if (!b || typeof b !== "object") return b;
     const type = typeof b.type === "string" ? b.type : "";
     if (type === "thinking" || type === "reasoning") {
+      // A text part, not a rewritten thinking block: a thinking block keeps its signature, and
+      // a provider that verifies signatures rejects edited reasoning (Claude review 11-03).
       changed = true;
-      return { ...b, thinking: "[Astinus: reasoning trimmed]", reasoning: "[Astinus: reasoning trimmed]" };
+      return { type: "text", text: "[Astinus: reasoning trimmed]" };
     }
     if (
       type === "toolCall" ||
