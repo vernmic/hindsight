@@ -36,6 +36,13 @@ export interface CapturedTurn {
   categories?: CategoryCounts;
   /** Engine view totals, labelled as the engine view rather than the wire. */
   engineView?: { beforeTotal: number; afterTotal: number };
+  /**
+   * The engine-view lists themselves, inside the turn record so rotating the turn
+   * out removes them too (a separate blob store would grow without bound).
+   */
+  engineLists?: { before: unknown[]; after: unknown[] };
+  /** Tokens the marks removed from the engine view, total (P4). */
+  markRemovalTotal?: number;
 }
 
 /** Storage port. The production adapter owns paths, gzip and durability. */

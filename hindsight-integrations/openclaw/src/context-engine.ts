@@ -24,7 +24,10 @@ import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { PassPayload, PassProvider } from "./astinus-pass.js";
-import { providerUsageAfter, type MarksAdmissionPolicy } from "./assemble-marks.js";
+import { providerUsageAfter, type LedgerMark, type MarksAdmissionPolicy } from "./assemble-marks.js";
+import { buildEngineViewCapture } from "./prompt-capture-engine.js";
+import { rotateTurns } from "./prompt-capture.js";
+import { FsTurnStore } from "./prompt-capture-fs.js";
 import { anchoredFigure, calibrate, pressureScale, type AnchorState } from "./count-anchor.js";
 import { shouldQueueRetain, type RetainScopeConfig } from "./retain-scope.js";
 import { countPromptTokens, type PromptMessage } from "./token-count.js";
@@ -47,6 +50,70 @@ type Logger = { info(msg: string): void; warn(msg: string): void };
 /** Count anchor (2026-11-03): per session key, the last view's counts and provider calibration. */
 const countAnchors = new Map<string, AnchorState>();
 const MAX_COUNT_ANCHORS = 2000;
+
+/** Engine-view capture (token-accounting P2): the turn already captured per session key. */
+const lastCapturedTurn = new Map<string, string>();
+const MAX_LAST_CAPTURED = 2000;
+
+function captureEngineView(
+  log: Logger,
+  params: {
+    key: string;
+    stateDir: string;
+    turnLabel: string;
+    before: unknown[];
+    after: unknown[];
+    marks: LedgerMark[];
+    marksInEffect: number;
+    admittedIds: Array<number | string>;
+  }
+): void {
+  if (lastCapturedTurn.get(params.key) === params.turnLabel) return;
+  lastCapturedTurn.set(params.key, params.turnLabel);
+  if (lastCapturedTurn.size > MAX_LAST_CAPTURED) {
+    const oldest = lastCapturedTurn.keys().next().value;
+    if (oldest !== undefined) lastCapturedTurn.delete(oldest);
+  }
+  // Serialize synchronously: the host mutates the array after the engine returns. Once per
+  // turn, not per model call; the counting and writes leave the hot path.
+  const beforeJson = JSON.stringify(params.before);
+  const afterJson = JSON.stringify(params.after);
+  const ranges = params.marks
+    .filter(
+      (m) =>
+        m &&
+        m.applied_at != null &&
+        (m as { retired_at?: number | null }).retired_at == null &&
+        Number.isFinite(m.seq_start) &&
+        Number.isFinite(m.seq_end)
+    )
+    .map((m) => ({ markId: m.mark_id as number | string, seqStart: m.seq_start, seqEnd: m.seq_end }));
+  const startedAt = Date.now();
+  setImmediate(() => {
+    void (async () => {
+      const before = JSON.parse(beforeJson) as PromptMessage[];
+      const after = JSON.parse(afterJson) as PromptMessage[];
+      const capture = buildEngineViewCapture({
+        turnId: params.turnLabel,
+        startedAt,
+        completedAt: Date.now(),
+        before,
+        after,
+        marks: ranges,
+        marksInEffect: params.marksInEffect,
+        admittedMarkIds: params.admittedIds,
+      });
+      const store = new FsTurnStore(join(params.stateDir, "prompt-capture"));
+      await rotateTurns(store, params.key, {
+        ...capture.turn,
+        engineLists: { before, after },
+        markRemovalTotal: capture.removal.total,
+      });
+    })().catch((e: unknown) => {
+      log.warn(`[hindsight-engine] prompt capture failed: ${(e as Error).message}`);
+    });
+  });
+}
 
 export type RegisterContextEngine = (id: string, factory: () => unknown) => void;
 
@@ -189,6 +256,8 @@ export type ContextEngineOptions = {
   passProviders?: PassProvider[];
   /** B4: config `retainScope` (skip / allow session-key patterns). */
   retainScope?: RetainScopeConfig;
+  /** Config `promptCapture` (default false); re-read per assemble so a config reinit is honoured. */
+  getPromptCapture?: () => boolean;
   /** Pass spawner override (tests); default spawns dist/astinus-pass.js detached. */
   spawnPass?: (payload: PassPayload) => void;
   /** Ledger writer override (tests); default the lazily loaded session-ledger module. */
@@ -418,6 +487,23 @@ export function createContextEngine(log: Logger, options: ContextEngineOptions =
               (marksInEffect > 0 && outList !== list ? side.estimateTokensHost(outList) : estimatedTokens);
             estimatedTokens = finalEstimate;
             providerEstimator = anchored?.source === "derived";
+            // ENGINE-VIEW CAPTURE (P2): first model call of each turn, when promptCapture is on.
+            if (options.getPromptCapture?.() === true) {
+              try {
+                captureEngineView(log, {
+                  key,
+                  stateDir: join(options.hostStateRoot ?? "", "workspace", "state", "astinus"),
+                  turnLabel: `after-turn-${side.readMaxTurnId(key) ?? "none"}`,
+                  before: list,
+                  after: outList,
+                  marks: marks as LedgerMark[],
+                  marksInEffect,
+                  admittedIds: admittedIds as Array<number | string>,
+                });
+              } catch (e) {
+                log.warn(`[hindsight-engine] prompt capture skipped: ${(e as Error).message}`);
+              }
+            }
             if (key && params.sessionId && exactView !== null && hostAfter > 0) {
               countAnchors.set(key, {
                 ...(anchor ?? ({} as AnchorState)),
@@ -659,7 +745,10 @@ export function registerHindsightContextEngine(
   hostStateRoot?: string,
   getPolicy?: () => Partial<MarksAdmissionPolicy> | undefined,
   durableTurns = false,
-  pass: Pick<ContextEngineOptions, "turnMiddleAgeTurns" | "passProviders" | "retainScope"> = {}
+  pass: Pick<
+    ContextEngineOptions,
+    "turnMiddleAgeTurns" | "passProviders" | "retainScope" | "getPromptCapture"
+  > = {}
 ): boolean {
   const register = api.registerContextEngine;
   if (typeof register !== "function") {
