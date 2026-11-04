@@ -666,8 +666,17 @@ export function applyMarks(
   // host writes the assembled list back at attempt-history-prepare.ts:230-232, so the view is
   // CARRIED FORWARD, not rebuilt. Re-application still runs unconditionally; whether that is
   // redundant when the effect persists is unmeasured - the section-8 census will say.
-  const admitted = wellFormed.filter((m) => m.applied_at != null);
-  let pending = wellFormed.filter((m) => m.applied_at == null);
+  // A digest mark with no digest text cannot replace anything: it maps to a range, counts
+  // as in effect, and changes nothing. turn_middle marks are the exception - they redact
+  // in place and intentionally carry no digest.
+  const actionable = wellFormed.filter(
+    (m) =>
+      m.action !== "digest" ||
+      (typeof m.digest === "string" && m.digest.length > 0) ||
+      (typeof m.reason === "string" && m.reason.indexOf("turn_middle") === 0)
+  );
+  const admitted = actionable.filter((m) => m.applied_at != null);
+  let pending = actionable.filter((m) => m.applied_at == null);
   const policy = { ...DEFAULT_MARKS_POLICY, ...(ctx.policy ?? {}) };
   const pendingBefore = pending.length;
   out.pendingCount = pendingBefore;
