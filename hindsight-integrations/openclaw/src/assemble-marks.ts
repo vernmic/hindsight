@@ -338,6 +338,36 @@ export class HostTranscript {
   }
 }
 
+/**
+ * Replace reasoning and tool-call payloads in one message, keeping its text and identity.
+ * Tool-call arguments stay an empty object so the provider still receives valid JSON.
+ */
+function slimBlocks(msg: unknown): unknown {
+  const m = (msg ?? {}) as Record<string, unknown>;
+  if (!Array.isArray(m.content)) return msg;
+  let changed = false;
+  const content = (m.content as Array<Record<string, unknown>>).map((b) => {
+    if (!b || typeof b !== "object") return b;
+    const type = typeof b.type === "string" ? b.type : "";
+    if (type === "thinking" || type === "reasoning") {
+      changed = true;
+      return { ...b, thinking: "[Astinus: reasoning trimmed]", reasoning: "[Astinus: reasoning trimmed]" };
+    }
+    if (
+      type === "toolCall" ||
+      type === "tool_call" ||
+      type === "toolUse" ||
+      type === "tool_use" ||
+      type === "function_call"
+    ) {
+      changed = true;
+      return { ...b, arguments: {}, input: {} };
+    }
+    return b;
+  });
+  return changed ? { ...m, content } : msg;
+}
+
 export class SeqIndex {
   private db: HostTranscript | null = null;
   private lastSeq = 0;
@@ -836,7 +866,12 @@ function applyLedgerMarks(
   const pendingBefore = pending.length;
   out.pendingCount = pendingBefore;
   if (pending.length > 0) {
-    if (pressure < policy.minPressure) {
+    if (pressure > 1) {
+      // Over budget (2026-11-03): the host is already in overflow territory. Waiting on the
+      // debounce or the admission share is how a session reaches the provider ceiling with
+      // marks sitting idle. Admit everything pending.
+      out.skipped.push(`admission forced: pressure ${pressure.toFixed(2)} > 1 (over budget)`);
+    } else if (pressure < policy.minPressure) {
       // Below the floor nothing is admitted and the debounce clock restarts from zero for the
       // next time it crosses 0.30. Already-applied marks are NOT reverted (B2).
       lastAdmissionTurn.delete(ctx.sessionKey);
@@ -1042,7 +1077,11 @@ function applyLedgerMarks(
       for (let i = start; i <= end; i++) {
         if (keep.has(i)) {
           flushSeg(i - 1);
-          replacements.push(withoutUnpairedCalls(list[i], keptResults));
+          // Item 3 (2026-11-03): a preserved boundary message still carries its own reasoning
+          // and tool-call argument bodies. Marks must be able to reach those, or turn_middle
+          // only trims the messages it already deletes. Pair safety (stack c8caedefc) is
+          // applied to the slimmed result: an unpaired call becomes a text line.
+          replacements.push(withoutUnpairedCalls(slimBlocks(list[i]), keptResults));
           continue;
         }
         if (segStart < 0) segStart = i;
