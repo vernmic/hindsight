@@ -57,7 +57,7 @@ describe("commitPrune", () => {
     expect(before[0].prune_epoch).toBeNull();
     const fallback = { session_id: "sid", seq_start: 2, seq_end: 4, kind: "turn", action: "digest",
                        digest: "1 earlier turn(s) removed at prune 1", reason: "prune_fallback" };
-    expect(commitPrune(k, 1, [before[0].mark_id], fallback, "gen-1", 1000, 300)).toBe(true);
+    expect(commitPrune(k, 1, [before[0].mark_id], fallback, "gen-1", 1000, 300, 4)).toBe(true);
     expect(readPruneEpochCached(k)).toBe(1);
     const after = readMarksCached(k, warn).marks as Array<Record<string, unknown>>;
     expect(after).toHaveLength(2);
@@ -68,6 +68,12 @@ describe("commitPrune", () => {
     expect(fb.prune_epoch).toBe(1);
     expect(fb.applied_at).not.toBeNull();
     expect(fb.digest).toContain("removed at prune 1");
+    // the prune's own record: the report accounts for epoch drops from it (Astinus #6340)
+    const db = new DatabaseSync(ledgerPath(k), { readOnly: true });
+    const prunes = db.prepare("SELECT * FROM prunes").all() as Array<Record<string, unknown>>;
+    db.close();
+    expect(prunes).toHaveLength(1);
+    expect(prunes[0]).toMatchObject({ epoch: 1, tokens_before: 1000, tokens_after: 300, admitted: 1, dropped: 4, fallback_mark_id: fb.mark_id });
   });
 
   it("is all or nothing: a rejected fallback leaves the epoch and the marks as they were", () => {
@@ -82,5 +88,8 @@ describe("commitPrune", () => {
     expect(after).toHaveLength(1);
     expect(after[0].prune_epoch).toBeNull();
     expect(after[0].applied_at).toBeNull();
+    const db = new DatabaseSync(ledgerPath(k), { readOnly: true });
+    expect(db.prepare("SELECT COUNT(*) AS n FROM prunes").get()).toEqual({ n: 0 });
+    db.close();
   });
 });
