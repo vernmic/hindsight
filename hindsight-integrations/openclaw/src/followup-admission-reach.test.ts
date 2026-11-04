@@ -1,5 +1,5 @@
-// Follow-up increment: forced admission over budget (item 4 half) and boundary
-// slimming for turn_middle (item 3 reach). Same real-temp-host fixture as reach-cap.
+// Follow-up increment: boundary slimming for turn_middle (item 3 reach). Same real-temp-host
+// fixture as reach-cap. (Its forced-admission half was retired by the prune cycle, 2026-11-03.)
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -53,27 +53,6 @@ function ctx(dbPath: string, sessionKey: string, tokenBudget: number) {
 
 const budgetFor = (messages: unknown[], pressure: number) =>
   Math.max(1, Math.ceil(estimateTokensHost(messages) / pressure));
-
-function pendingMark(seqStart: number, seqEnd: number): LedgerMark {
-  return { mark_id: 21, session_id: "sid-fu", seq_start: seqStart, seq_end: seqEnd, kind: "tool_noise",
-           action: "placeholder", applied_at: null, pressure: 0.9, topic_dormancy_s: 10, stmt_age_s: 10 } as unknown as LedgerMark;
-}
-
-describe("forced admission over budget", () => {
-  it("admits a pending mark when pressure is above 1", () => {
-    const { dbPath, messages } = fixture("sid-fu", 12, 200);
-    const res = applyMarks(messages, [pendingMark(7, 7)], ctx(dbPath, "fu-over", budgetFor(messages, 2)));
-    expect(res.changed).toBe(true);
-    expect(res.skipped.join(" ")).toContain("admission forced");
-  });
-
-  it("still holds a pending mark when pressure is under the floor", () => {
-    const { dbPath, messages } = fixture("sid-fu", 12, 200);
-    const res = applyMarks(messages, [pendingMark(7, 7)], ctx(dbPath, "fu-idle", budgetFor(messages, 0.05)));
-    expect(res.changed).toBe(false);
-    expect(res.skipped.join(" ")).toContain("admission held");
-  });
-});
 
 describe("turn_middle boundary reach", () => {
   it("trims reasoning and call arguments on the boundaries it keeps", () => {
