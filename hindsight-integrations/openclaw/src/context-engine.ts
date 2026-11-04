@@ -24,7 +24,8 @@ import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { PassPayload, PassProvider } from "./astinus-pass.js";
-import type { MarksAdmissionPolicy } from "./assemble-marks.js";
+import { providerUsageAfter, type MarksAdmissionPolicy } from "./assemble-marks.js";
+import { anchoredFigure, calibrate, pressureScale, type AnchorState } from "./count-anchor.js";
 import { shouldQueueRetain, type RetainScopeConfig } from "./retain-scope.js";
 import { countPromptTokens, type PromptMessage } from "./token-count.js";
 import { ENGINE_ID } from "./engine-compat.js";
@@ -42,6 +43,10 @@ import {
 } from "./lifecycle-authority.js";
 
 type Logger = { info(msg: string): void; warn(msg: string): void };
+
+/** Count anchor (2026-11-03): per session key, the last view's counts and provider calibration. */
+const countAnchors = new Map<string, AnchorState>();
+const MAX_COUNT_ANCHORS = 2000;
 
 export type RegisterContextEngine = (id: string, factory: () => unknown) => void;
 
@@ -281,6 +286,9 @@ export function createContextEngine(log: Logger, options: ContextEngineOptions =
       const list = Array.isArray(params.messages) ? params.messages : [];
       let outList = list;
       let windowFirstSeq: number | null = null;
+      let viewLastSeq: number | null = null;
+      let hostAfter = 0;
+      let providerEstimator = false;
       let marksSeen = 0;
       let estimatedTokens = 0;
       let marksInEffect = 0;
@@ -288,6 +296,28 @@ export function createContextEngine(log: Logger, options: ContextEngineOptions =
       const hostDbPath = key ? hostDbPathFor(options.hostStateRoot ?? "", key) : "";
       const marksSelected =
         key && hostDbPath && typeof params.sessionId === "string" && params.sessionId;
+      // Count anchor: fold the provider figure for the previous view of this session into its
+      // calibration before this view's pressure is computed. Never breaks assemble.
+      let anchor = key ? countAnchors.get(key) : undefined;
+      if (anchor && anchor.sessionId !== params.sessionId) anchor = undefined;
+      if (anchor && anchor.viewLastSeq !== null && hostDbPath && params.sessionId) {
+        try {
+          const { state, check } = calibrate(
+            anchor,
+            providerUsageAfter(hostDbPath, params.sessionId, anchor.viewLastSeq)
+          );
+          anchor = state;
+          if (check) {
+            log.info(
+              `[hindsight-engine] count anchor: reported ${check.reported} vs provider ${check.provider} ` +
+                `(${(check.error * 100).toFixed(1)}%) session=${key}`
+            );
+          }
+        } catch {
+          /* no calibration this call */
+        }
+      }
+      const scale = pressureScale(anchor);
       // R16.1: only a selected path probes, so unselected/ordinary memory stays load-safe.
       if (marksSelected && !runtimeError) runtimeError = await probeSqlite();
       if (marksSelected && runtimeError && !runtimeErrorReported) {
@@ -338,6 +368,7 @@ export function createContextEngine(log: Logger, options: ContextEngineOptions =
               // Review answer 1 (e8cb): the admission knobs ride the apply context from plugin config.
               policy: options.getPolicy?.(),
               turnMiddleAgeTurns: options.turnMiddleAgeTurns,
+              pressureScale: scale,
               // e8cb M1: the debounce counts TURNS off the ledger; the durable seq counter
               // (state.lastCommittedSeq) is only the cold-handle fallback.
               turnCounter: side.readMaxTurnId(key) ?? state.lastCommittedSeq,
@@ -350,6 +381,8 @@ export function createContextEngine(log: Logger, options: ContextEngineOptions =
             outList = res.messages;
             // Captured unconditionally (e8cb Q1 2026-10-07): the held-marks case needs it most.
             windowFirstSeq = res.windowFirstSeq ?? null;
+            viewLastSeq = res.windowLastSeq ?? null;
+            hostAfter = res.tokensAfter;
             estimatedTokens = res.tokensBefore;
             marksInEffect = res.marksInEffect;
             const admittedIds = res.admitted.map((m) => m.mark_id);
@@ -377,9 +410,28 @@ export function createContextEngine(log: Logger, options: ContextEngineOptions =
             } catch {
               exactView = null;
             }
-            estimatedTokens =
-              exactView ??
+            // Count anchor: the tokenizer count is calibrated to the provider (within 15% of the
+            // model's own reported value). Without a pairing yet it stays the tokenizer count.
+            const anchored = exactView !== null ? anchoredFigure(exactView, anchor) : null;
+            const finalEstimate =
+              anchored?.tokens ??
               (marksInEffect > 0 && outList !== list ? side.estimateTokensHost(outList) : estimatedTokens);
+            estimatedTokens = finalEstimate;
+            providerEstimator = anchored?.source === "derived";
+            if (key && params.sessionId && exactView !== null && hostAfter > 0) {
+              countAnchors.set(key, {
+                ...(anchor ?? ({} as AnchorState)),
+                sessionId: params.sessionId,
+                viewLastSeq,
+                tokenizer: exactView,
+                host: hostAfter,
+                reported: finalEstimate,
+              });
+              if (countAnchors.size > MAX_COUNT_ANCHORS) {
+                const oldest = countAnchors.keys().next().value;
+                if (oldest !== undefined) countAnchors.delete(oldest);
+              }
+            }
           }
         } catch (e) {
           // Any failure degrades to "less pruned", never an error.
@@ -409,7 +461,7 @@ export function createContextEngine(log: Logger, options: ContextEngineOptions =
           at: Date.now(),
           viewTokens: estimatedTokens,
           tokenBudget: typeof params.tokenBudget === "number" ? params.tokenBudget : null,
-          estimator: marksInEffect > 0 ? "host" : "plugin",
+          estimator: providerEstimator ? "provider" : marksInEffect > 0 ? "host" : "plugin",
           windowFirstSeq,
         });
         if (facts.size > MAX_TRACKED_SESSIONS) {

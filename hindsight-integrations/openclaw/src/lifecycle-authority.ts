@@ -10,7 +10,8 @@ export type AssembleFact = {
   at: number;
   viewTokens: number;
   tokenBudget: number | null;
-  estimator: "host" | "plugin";
+  /** "provider": viewTokens is calibrated to the session's provider-reported prompt tokens. */
+  estimator: "host" | "plugin" | "provider";
   windowFirstSeq: number | null;
 };
 
