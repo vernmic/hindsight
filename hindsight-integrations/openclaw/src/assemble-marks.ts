@@ -693,16 +693,18 @@ function applyHardCap(out: ApplyResult, ctx: ApplyContext, policy: MarksAdmissio
     let paired = calls.size === results.size;
     for (const id of calls) if (!results.has(id)) paired = false;
     if (!paired) continue;
+    // Byte-stable: the stub depends only on the turn it replaces, never on the current pressure
+    // or clock, so a rebuilt view reproduces it exactly and the provider's prefix cache survives.
+    const firstTs = ((interior[0] ?? {}) as Record<string, unknown>).timestamp;
     const stub = {
       role: "assistant",
-      timestamp: Date.now(),
+      timestamp: typeof firstTs === "number" ? firstTs : 0,
       content: [
         {
           type: "text",
           text:
-            `[Astinus hard cap: turn interior removed at pressure ${pressureBefore.toFixed(2)} - ` +
-            `${interior.length} messages, ${calls.size} tool calls | seq ${lo}-${hi}; recover it ` +
-            `from the transcript by seq range]`,
+            `[Astinus hard cap: turn interior removed - ${interior.length} messages, ` +
+            `${calls.size} tool calls | seq ${lo}-${hi}; recover it from the transcript by seq range]`,
         },
       ],
     };
