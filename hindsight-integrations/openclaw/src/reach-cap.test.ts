@@ -157,6 +157,15 @@ describe("hard cap (item 4)", () => {
     expect(text).toContain("Astinus hard cap");
   });
 
+  it("writes a byte-stable stub, so a rebuilt view keeps the provider's prefix cache", () => {
+    const { dbPath, messages } = fixture("sid-rc", 12, big);
+    const a = applyMarks(messages, [], ctx(dbPath, "rc-stable-a", budgetFor(messages, 1.2)));
+    const b = applyMarks(messages, [], ctx(dbPath, "rc-stable-b", budgetFor(messages, 1.5)));
+    // turn 1's interior is reduced first at any pressure over the cap; its stub must not carry
+    // the pressure or the clock
+    expect(JSON.stringify(b.messages[1])).toBe(JSON.stringify(a.messages[1]));
+  });
+
   it("scales pressure by the count anchor", () => {
     const { dbPath, messages } = fixture("sid-rc", 12, big);
     // estimate says 1.2, but the provider sees half of it: no cap
