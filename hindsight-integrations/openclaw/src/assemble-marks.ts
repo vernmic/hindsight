@@ -122,6 +122,12 @@ export type MarksAdmissionPolicy = {
   admitShare: boolean;
   debounceTurns: number;
   criticalPressure: number;
+  /** Hard cap (2026-11-03): above this pressure, after marks, the oldest non-preserved turns
+   *  are reduced to their user message plus one tombstone until pressure is at hardCapTarget.
+   *  tokenBudget is the host's message budget (window - reserve - system prompt), so 1.0 is
+   *  the overflow line and the cap must act below it. 0 disables the cap. */
+  hardCapPressure: number;
+  hardCapTarget: number;
 };
 
 export const DEFAULT_MARKS_POLICY: MarksAdmissionPolicy = {
@@ -129,7 +135,13 @@ export const DEFAULT_MARKS_POLICY: MarksAdmissionPolicy = {
   admitShare: true,
   debounceTurns: 5,
   criticalPressure: 0.65,
+  hardCapPressure: 0.9,
+  hardCapTarget: 0.7,
 };
+
+/** Tool-call arguments up to this size stay verbatim under a placeholder mark: they are cheap
+ *  and say what was asked. */
+const ARGS_KEEP_CHARS = 200;
 
 /** Canonical tool-call-id form. The host strict sanitizer strips characters from RUNTIME ids
  *  (measured 203 of 203 lose the underscore for openai-completions - Claude root cause
@@ -529,6 +541,7 @@ export type ApplyResult = {
   readError?: string;
   windowFirstSeq: number | null; // min mapped seq of this view (2026-10-07): the pass bounds proposals to the assembled window
   windowLastSeq: number | null; // max mapped seq of this view: the next model call's usage follows it (count anchor)
+  hardCap: { turns: number; pressureBefore: number; pressureAfter: number } | null; // set when the cap reduced turns
 };
 
 const lastAdmissionTurn = new Map<string, number>();
@@ -556,6 +569,132 @@ function isToolResult(m: unknown): boolean {
   return ((m ?? {}) as Record<string, unknown>).role === "toolResult";
 }
 
+/** Placeholder reach (2026-11-03, item 3): the assistant side of a placeholdered range. Reasoning
+ *  is dropped and large tool-call arguments are stubbed; the call keeps its id and name so the
+ *  pair stays valid. Measured on topic 2549: thinking 43% and call bodies 18% of the view, and
+ *  the host replays reasoning_content for zai and deepseek (openai-completions-replay.ts), so
+ *  both reach the wire. Returns null when nothing changes. */
+function reduceAssistantBody(msg: Record<string, unknown>): Record<string, unknown> | null {
+  if (msg.role !== "assistant" || !Array.isArray(msg.content)) return null;
+  let changed = false;
+  let reasoningChars = 0;
+  const content: unknown[] = [];
+  for (const b of msg.content as Array<Record<string, unknown>>) {
+    if (b?.type === "thinking") {
+      const t = typeof b.thinking === "string" ? b.thinking : typeof b.text === "string" ? b.text : "";
+      if (t.length > 0) {
+        reasoningChars += t.length;
+        changed = true;
+        continue;
+      }
+    }
+    if ((b?.type === "toolCall" || b?.type === "tool_use") && b.arguments !== undefined) {
+      const raw = JSON.stringify(b.arguments ?? {});
+      if (raw.length > ARGS_KEEP_CHARS) {
+        content.push({ ...b, arguments: { astinus_pruned: `arguments pruned by Astinus (${raw.length} chars)` } });
+        changed = true;
+        continue;
+      }
+    }
+    content.push(b);
+  }
+  if (!changed) return null;
+  // An assistant message left with no parts is skipped by the host converter; keep one line so
+  // the turn shape is unchanged.
+  if (content.length === 0) {
+    content.push({ type: "text", text: `[reasoning pruned by Astinus (${reasoningChars} chars)]` });
+  }
+  return { ...msg, content };
+}
+
+function astinusAuthored(m: unknown): boolean {
+  const text = JSON.stringify(((m ?? {}) as Record<string, unknown>).content ?? "");
+  return text.indexOf("[Astinus") !== -1 || text.indexOf("[injected context") !== -1;
+}
+
+/** The hard cap (2026-11-03, item 4; Astinus's Q3 answer: "apply the strongest admissible set
+ *  and, if still over, reduce the oldest non-preserved turns to stubs deterministically instead
+ *  of waiting for the host's timeout-triggered compaction"). Runs after marks, on every view.
+ *  Oldest turn first: the user message stays, its interior becomes one tombstone. A turn is
+ *  skipped when a tool pair would cross its edge or it holds unmapped host content (a
+ *  compaction summary); the first user message and the preserved tail are never touched. */
+function applyHardCap(out: ApplyResult, ctx: ApplyContext, policy: MarksAdmissionPolicy): void {
+  if (!(ctx.tokenBudget > 0) || !(policy.hardCapPressure > 0)) return;
+  const scale = typeof ctx.pressureScale === "number" && ctx.pressureScale > 0 ? ctx.pressureScale : 1;
+  const pressureOf = (t: number) => (t * scale) / ctx.tokenBudget;
+  const startTotal = out.changed ? out.tokensAfter : out.tokensBefore;
+  const pressureBefore = pressureOf(startTotal);
+  if (pressureBefore <= policy.hardCapPressure) return;
+  const target = Math.min(policy.hardCapTarget, policy.hardCapPressure);
+  const list = out.messages.slice();
+  const ix = seqIndexFor(ctx.hostDbPath, ctx.sessionId);
+  ix.refresh();
+  const tailFloor = preservedFloorIdx(list);
+  const users: number[] = [];
+  for (let i = 0; i < tailFloor; i++) {
+    if (((list[i] ?? {}) as Record<string, unknown>).role === "user") users.push(i);
+  }
+  let total = startTotal;
+  const chosen: Array<{ a: number; b: number; stub: unknown }> = [];
+  for (let k = 0; k < users.length && pressureOf(total) > target; k++) {
+    const a = users[k] + 1;
+    const b = (k + 1 < users.length ? users[k + 1] : tailFloor) - 1;
+    if (a > b) continue;
+    const interior = list.slice(a, b + 1);
+    let lo: number | null = null;
+    let hi: number | null = null;
+    let foreign = false;
+    const calls = new Set<string>();
+    const results = new Set<string>();
+    for (const m of interior) {
+      const s = ix.seqOf(m);
+      if (s === null) {
+        if (!astinusAuthored(m)) foreign = true;
+      } else {
+        if (lo === null || s < lo) lo = s;
+        if (hi === null || s > hi) hi = s;
+      }
+      for (const id of toolCallIdsOf(m)) calls.add(canonicalId(id));
+      for (const id of toolResultCallIds(m)) results.add(canonicalId(id));
+    }
+    if (foreign || lo === null || hi === null) continue;
+    let paired = calls.size === results.size;
+    for (const id of calls) if (!results.has(id)) paired = false;
+    if (!paired) continue;
+    const stub = {
+      role: "assistant",
+      timestamp: Date.now(),
+      content: [
+        {
+          type: "text",
+          text:
+            `[Astinus hard cap: turn interior removed at pressure ${pressureBefore.toFixed(2)} - ` +
+            `${interior.length} messages, ${calls.size} tool calls | seq ${lo}-${hi}; recover it ` +
+            `from the transcript by seq range]`,
+        },
+      ],
+    };
+    const delta = estimateTokensHost(interior) - estimateTokensHost([stub]);
+    if (delta <= 0) continue;
+    chosen.push({ a, b, stub });
+    total -= delta;
+  }
+  if (chosen.length === 0) {
+    out.skipped.push(`hard cap: pressure ${pressureBefore.toFixed(2)} > ${policy.hardCapPressure} but no reducible turn outside the preserved tail`);
+    return;
+  }
+  for (let j = chosen.length - 1; j >= 0; j--) {
+    list.splice(chosen[j].a, chosen[j].b - chosen[j].a + 1, chosen[j].stub);
+  }
+  out.messages = list;
+  out.changed = true;
+  out.tokensAfter = estimateTokensHost(list);
+  out.hardCap = { turns: chosen.length, pressureBefore, pressureAfter: pressureOf(out.tokensAfter) };
+  out.skipped.push(
+    `hard cap: ${chosen.length} turn(s) reduced, pressure ${pressureBefore.toFixed(2)} -> ${out.hardCap.pressureAfter.toFixed(2)}`
+  );
+}
+
 /** The index of the first message inside the preserved tail: the last PRESERVE_USER_TURNS user
  *  turns (M3), not a fixed message count. */
 function preservedFloorIdx(messages: unknown[], keep = PRESERVE_USER_TURNS): number {
@@ -574,6 +713,21 @@ export function applyMarks(
   marks: LedgerMark[],
   ctx: ApplyContext
 ): ApplyResult {
+  const out = applyLedgerMarks(messages, marks, ctx);
+  // The cap runs on every view, marks or not: a desk with an empty ledger can still overflow.
+  try {
+    applyHardCap(out, ctx, { ...DEFAULT_MARKS_POLICY, ...(ctx.policy ?? {}) });
+  } catch {
+    /* degrade: no cap this call, the marked view stands */
+  }
+  return out;
+}
+
+function applyLedgerMarks(
+  messages: unknown[],
+  marks: LedgerMark[],
+  ctx: ApplyContext
+): ApplyResult {
   const tokensBefore = estimateTokensHost(messages);
   const out: ApplyResult = {
     messages,
@@ -586,6 +740,7 @@ export function applyMarks(
     pendingCount: 0,
     windowFirstSeq: null,
     windowLastSeq: null,
+    hardCap: null,
   };
   // 2026-10-07 (Vern: "so fix it"): the assembled window's first mapped seq. The pass bounds
   // its proposals to the window the host actually assembles - marks outside it can never
@@ -919,7 +1074,15 @@ export function applyMarks(
       let placeholdered = false;
       for (let i = start; i <= end; i++) {
         const msg = list[i] as Record<string, unknown> | null;
-        if (!msg || !isToolResult(msg)) continue;
+        if (!msg) continue;
+        if (!isToolResult(msg)) {
+          const reduced = reduceAssistantBody(msg);
+          if (reduced) {
+            list[i] = reduced;
+            placeholdered = true;
+          }
+          continue;
+        }
         const c = msg.content;
         const text = typeof c === "string" ? c : JSON.stringify(c ?? "");
         // M1: replace the ELEMENT — never mutate the host's message object in place. The
@@ -937,7 +1100,7 @@ export function applyMarks(
       }
       if (placeholdered) out.changed = true;
       else {
-        out.skipped.push(`seq ${lo}-${hi}: placeholder found no tool result`);
+        out.skipped.push(`seq ${lo}-${hi}: placeholder found nothing to prune`);
         continue;
       }
     } else {

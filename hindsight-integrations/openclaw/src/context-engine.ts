@@ -278,6 +278,8 @@ export function marksPolicyFromConfig(config: unknown): Partial<MarksAdmissionPo
   if (typeof raw.admitShare === "boolean") out.admitShare = raw.admitShare;
   if (typeof raw.debounceTurns === "number") out.debounceTurns = raw.debounceTurns;
   if (typeof raw.criticalPressure === "number") out.criticalPressure = raw.criticalPressure;
+  if (typeof raw.hardCapPressure === "number") out.hardCapPressure = raw.hardCapPressure;
+  if (typeof raw.hardCapTarget === "number") out.hardCapTarget = raw.hardCapTarget;
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -358,6 +360,7 @@ export function createContextEngine(log: Logger, options: ContextEngineOptions =
       let viewLastSeq: number | null = null;
       let hostAfter = 0;
       let providerEstimator = false;
+      let hardCapped = false;
       let marksSeen = 0;
       let estimatedTokens = 0;
       let marksInEffect = 0;
@@ -450,6 +453,12 @@ export function createContextEngine(log: Logger, options: ContextEngineOptions =
             outList = res.messages;
             // Captured unconditionally (e8cb Q1 2026-10-07): the held-marks case needs it most.
             windowFirstSeq = res.windowFirstSeq ?? null;
+            hardCapped = res.hardCap !== null;
+            if (res.hardCap) {
+              log.warn(
+                `[hindsight-engine] hard cap: ${res.hardCap.turns} turn(s) reduced, pressure ${res.hardCap.pressureBefore.toFixed(2)} -> ${res.hardCap.pressureAfter.toFixed(2)} session=${key}`
+              );
+            }
             viewLastSeq = res.windowLastSeq ?? null;
             hostAfter = res.tokensAfter;
             estimatedTokens = res.tokensBefore;
@@ -484,7 +493,9 @@ export function createContextEngine(log: Logger, options: ContextEngineOptions =
             const anchored = exactView !== null ? anchoredFigure(exactView, anchor) : null;
             const finalEstimate =
               anchored?.tokens ??
-              (marksInEffect > 0 && outList !== list ? side.estimateTokensHost(outList) : estimatedTokens);
+              ((marksInEffect > 0 || hardCapped) && outList !== list
+                ? side.estimateTokensHost(outList)
+                : estimatedTokens);
             estimatedTokens = finalEstimate;
             providerEstimator = anchored?.source === "derived";
             // ENGINE-VIEW CAPTURE (P2): first model call of each turn, when promptCapture is on.
@@ -558,7 +569,10 @@ export function createContextEngine(log: Logger, options: ContextEngineOptions =
       return {
         messages: outList,
         estimatedTokens,
-        promptAuthority: marksInEffect > 0 ? "assembled" : "preassembly_may_overflow",
+        // A hard-capped view is assembled too: the host must take the reduced view, not
+        // max(assembled, unwindowed), or its precheck compacts what the cap just saved.
+        promptAuthority:
+          marksInEffect > 0 || hardCapped ? "assembled" : "preassembly_may_overflow",
       };
     },
     async compact(params: unknown): Promise<unknown> {

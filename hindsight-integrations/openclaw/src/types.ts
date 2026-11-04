@@ -232,7 +232,7 @@ export interface PluginConfig {
    * extra top-level fields and fail the schema-parity assertion.
    */
   // prettier-ignore
-  astinusMarks?: { minPressure?: number; admitShare?: boolean; debounceTurns?: number; criticalPressure?: number };
+  astinusMarks?: { minPressure?: number; admitShare?: boolean; debounceTurns?: number; criticalPressure?: number; hardCapPressure?: number; hardCapTarget?: number };
 }
 
 export interface ServiceConfig {
