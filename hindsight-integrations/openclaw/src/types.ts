@@ -147,6 +147,9 @@ export interface PluginConfig {
   // Deprecated and ignored: the agent_knowledge_* tools were removed. Kept so
   // existing configs that set it still pass the strict manifest schema.
   enableKnowledgeTools?: boolean;
+  // Engine-view prompt capture (token-accounting P2): the pre-mark and post-mark view of
+  // each turn's first model call, last two turns per session. Default: false.
+  promptCapture?: boolean;
   daemonIdleTimeout?: number; // Seconds before daemon shuts down (0 = never)
   embedVersion?: string; // hindsight-embed version (default: "latest")
   embedPackagePath?: string; // Local path to hindsight package (e.g. '/path/to/hindsight')
