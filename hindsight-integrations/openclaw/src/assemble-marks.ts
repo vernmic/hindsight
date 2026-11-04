@@ -6,6 +6,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { existsSync } from "fs";
 import zlib from "node:zlib";
+import { usageFromEvent, type ProviderUsage } from "./prompt-accounting.js";
 
 export type LedgerMark = {
   mark_id?: number | unknown;
@@ -444,6 +445,30 @@ export class SeqIndex {
     const viaTc = tcKey ? this.map.get(tcKey) : undefined;
     return viaTc !== undefined && viaTc !== -1 ? viaTc : null;
   }
+
+  /**
+   * Provider usage of the first model call after `afterSeq`: the call that the view ending at
+   * afterSeq fed (count anchor, 2026-11-03). Reads at most `limit` rows; compressed rows are
+   * decoded when the runtime has zstd, else skipped.
+   */
+  firstUsageAfter(afterSeq: number, limit = 64): ProviderUsage | null {
+    if (!this.open()) return null;
+    try {
+      for (const r of this.db!.rows({ after: afterSeq, limit })) {
+        let json: string;
+        try {
+          json = decodeTranscriptEventJson(r);
+        } catch {
+          continue; // an undecodable row cannot carry usage; the next one may
+        }
+        const usage = usageFromEvent({ seq: Number(r.seq), eventJson: json });
+        if (usage) return usage;
+      }
+    } catch {
+      /* degrade: no anchor this call */
+    }
+    return null;
+  }
 }
 
 const seqIndexes = new Map<string, SeqIndex>();
@@ -464,6 +489,11 @@ function seqIndexFor(dbPath: string, sessionId: string): SeqIndex {
   return ix;
 }
 
+/** Provider usage of the first model call after `afterSeq` in this host session (count anchor). */
+export function providerUsageAfter(dbPath: string, sessionId: string, afterSeq: number): ProviderUsage | null {
+  return seqIndexFor(dbPath, sessionId).firstUsageAfter(afterSeq);
+}
+
 export type ApplyContext = {
   sessionKey: string;
   hostDbPath: string;
@@ -472,6 +502,8 @@ export type ApplyContext = {
   turnCounter: number; // monotonic (lastCommittedSeq), NOT the capped committedKeys length
   policy?: Partial<MarksAdmissionPolicy>; // `astinus.marks.*`; DEFAULT_MARKS_POLICY otherwise
   turnMiddleAgeTurns?: number; // F2: the turn_middle tail floor (default 6)
+  /** Provider/host-estimate ratio for this session (count anchor); pressure uses tokensBefore x scale. */
+  pressureScale?: number;
 };
 
 export type ApplyResult = {
@@ -486,6 +518,7 @@ export type ApplyResult = {
   /** Host transcript could not be read/decoded; messages are unchanged and nothing admitted. */
   readError?: string;
   windowFirstSeq: number | null; // min mapped seq of this view (2026-10-07): the pass bounds proposals to the assembled window
+  windowLastSeq: number | null; // max mapped seq of this view: the next model call's usage follows it (count anchor)
 };
 
 const lastAdmissionTurn = new Map<string, number>();
@@ -542,6 +575,7 @@ export function applyMarks(
     skipped: [],
     pendingCount: 0,
     windowFirstSeq: null,
+    windowLastSeq: null,
   };
   // 2026-10-07 (Vern: "so fix it"): the assembled window's first mapped seq. The pass bounds
   // its proposals to the window the host actually assembles - marks outside it can never
@@ -552,11 +586,14 @@ export function applyMarks(
     const wix = seqIndexFor(ctx.hostDbPath, ctx.sessionId);
     wix.refresh();
     let wfs: number | null = null;
+    let wls: number | null = null;
     for (const m of messages) {
       const s = wix.seqOf(m);
       if (s !== null && (wfs === null || s < wfs)) wfs = s;
+      if (s !== null && (wls === null || s > wls)) wls = s;
     }
     out.windowFirstSeq = wfs;
+    out.windowLastSeq = wls;
   } catch {
     /* degrade: windowFirstSeq stays null; the pass falls back to the compaction bound */
   }
@@ -609,7 +646,10 @@ export function applyMarks(
     (m) => m && Number.isFinite(m.seq_start) && Number.isFinite(m.seq_end)
   );
   if (wellFormed.length === 0) return out;
-  const pressure = ctx.tokenBudget > 0 ? tokensBefore / ctx.tokenBudget : 0;
+  // Count anchor (2026-11-03): the char estimate is scaled by the session's measured
+  // provider/estimate ratio, so pressure reflects what the model actually receives.
+  const scale = typeof ctx.pressureScale === "number" && ctx.pressureScale > 0 ? ctx.pressureScale : 1;
+  const pressure = ctx.tokenBudget > 0 ? (tokensBefore * scale) / ctx.tokenBudget : 0;
   // B2: admission (NEW marks) is gated; re-application (admitted marks) is unconditional.
   // The original justification ("the view is rebuilt from the transcript every turn, so
   // admitted marks ARE the view") was FALSIFIED 2026-10-11 by the view-ratchet finding: the
