@@ -408,6 +408,7 @@ export type ApplyContext = {
 
 export type PruneOutcome = {
   epoch: number; // the new epoch; the admitted marks and the fallback are stamped with it
+  tokensBefore: number; // the steady view the prune cut (host-shaped estimate)
   pressureBefore: number;
   pressureAfter: number;
   dropped: number; // earlier-epoch marks whose ranges were removed outright
@@ -741,6 +742,7 @@ export function applyMarks(
   out.skipped.push(...pruned.skipped);
   out.prune = {
     epoch: next,
+    tokensBefore: steadyTokens,
     pressureBefore: steadyPressure,
     pressureAfter: pressureOf(tokens),
     dropped: applied.length,
