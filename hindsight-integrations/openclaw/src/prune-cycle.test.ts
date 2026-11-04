@@ -118,6 +118,25 @@ describe("prune cycle", () => {
     expect(bytes(carried.messages)).toBe(bytes(pruned.messages));
   });
 
+  it("a legacy APPLIED empty digest is inert before the prune and dropped by it (Codex N3)", () => {
+    // turn 10 (seq 37-40) is outside the 8-turn tail of 20 and the only heavy turn, so dropping
+    // it alone reaches pruneTo and no fallback cut can hide a missed drop
+    const { dbPath, messages } = fixture(20, (t) => (t === 10 ? 20000 : 50));
+    const legacy = { mark_id: nextId++, session_id: SID, seq_start: 37, seq_end: 40, kind: "turn", action: "digest",
+                     digest: "", reason: "legacy", applied_at: 1 } as unknown as LedgerMark;
+    const idle = applyMarks(messages, [legacy], ctx(dbPath, "pc-n3", budgetAt(messages, 0.1)));
+    expect(idle.messages).toBe(messages); // item 1: an empty digest is not in effect
+    const budget = budgetAt(messages, 0.65);
+    const pruned = applyMarks(messages, [legacy], ctx(dbPath, "pc-n3", budget));
+    expect(pruned.prune).not.toBeNull();
+    expect(pruned.prune!.dropped).toBe(1);
+    expect(pruned.prune!.fallback).toBeNull();
+    expect(bytes(pruned.messages)).not.toContain("final 10");
+    const rebuilt = applyMarks(messages, committed([legacy], pruned), ctx(dbPath, "pc-n3", budget, 1));
+    expect(rebuilt.prune).toBeNull();
+    expect(bytes(rebuilt.messages)).toBe(bytes(pruned.messages));
+  });
+
   it("marks applied before the first prune (epoch 0) are dropped, and stay dropped on a rebuilt view", () => {
     // only turns 2 and 3 are heavy, so the marks reach pruneTo alone and no fallback cut can
     // hide what happens to the epoch-0 digest
