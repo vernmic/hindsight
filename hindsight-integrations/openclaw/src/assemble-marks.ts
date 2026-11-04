@@ -4,8 +4,8 @@
 // parts-array digest (M2); 8-user-turn preserved tail (M3); (dbPath,sessionId) index key (M4);
 // one refresh per pass (M5). Any failure degrades to "less pruned", never an error.
 import { DatabaseSync } from "node:sqlite";
+import * as zlib from "node:zlib";
 import { existsSync } from "fs";
-import zlib from "node:zlib";
 import { usageFromEvent, type ProviderUsage } from "./prompt-accounting.js";
 
 export type LedgerMark = {
@@ -19,125 +19,37 @@ export type LedgerMark = {
   reason?: string;
   applied_gen?: string | null;
   applied_at?: number | null;
-  // Admission priority inputs (Vern 2026-09-21); written by the pass, read here in that order.
+  // Written by the pass; kept for the ledger and the report, no longer an admission order.
   pressure?: number | null;
   topic_dormancy_s?: number | null;
   stmt_age_s?: number | null;
-  // Anchors: host event ids at the mark's first/last row. Seq numbers move on a trim or a
-  // header repair; ids do not. A mark whose anchor is gone is skipped, never re-aimed.
-  anchor_first_event?: string | null;
-  anchor_last_event?: string | null;
-  retired_at?: number | null; // one-time rebase: numbers no longer trustworthy
+  /** The prune epoch the mark was admitted in (NULL = 0, the marks applied before the cycle). */
+  prune_epoch?: number | null;
 };
-
-/** Adds the anchor columns in place; an old ledger keeps its rows. Idempotent; never throws. */
-export function ensureMarkAnchorColumns(db: DatabaseSync): void {
-  for (const [table, col, type] of [
-    ["marks", "anchor_first_event", "TEXT"],
-    ["marks", "anchor_last_event", "TEXT"],
-    ["marks", "retired_at", "INTEGER"],
-    ["meta", "mark_rebase_done", "INTEGER"],
-  ]) {
-    try {
-      const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name?: unknown }>;
-      if (cols.length > 0 && !cols.some((c) => c.name === col))
-        db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${type}`);
-    } catch {
-      /* a locked or read-only ledger keeps working without anchors */
-    }
-  }
-}
-
-function eventIdOf(eventJson: string): string | null {
-  try {
-    const ev = JSON.parse(eventJson) as Record<string, unknown>;
-    return typeof ev.id === "string" && ev.id ? ev.id : null;
-  } catch {
-    return null;
-  }
-}
 
 const PRESERVE_USER_TURNS = 8;
-/** F2 (design A.14): one setting, `turnMiddleAgeTurns`, is both the pass's proposal cutoff and
- *  the tail floor turn_middle marks apply under. Other mark kinds keep the 8-turn tail. */
-export const DEFAULT_TURN_MIDDLE_AGE_TURNS = 6;
 const LOAD_CHUNK = 5000;
 
-// Host transcript payload contract (OpenClaw v2026.10.3 / a20345f3
-// src/config/sessions/transcript-payload.ts prepareTranscriptPayload + registerDecoder,
-// src/infra/zstd-codec.ts): a row is either identity (event_json TEXT) or compressed
-// (event_json NULL, event_zstd = one Zstd frame, event_utf8_bytes = original UTF-8 length).
-// The decode below copies the host's bounds and checks; it reads, never rewrites, the store.
-const MAX_COMPRESSED_EVENT_BYTES = 4 * 1024 * 1024;
-const utf8Decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
-
-/** Decode one transcript row to its event JSON text, exactly as the host's reader does. Throws
- *  on any row it cannot decode; the caller must not treat such a row as identity-less. */
-export function decodeTranscriptEventJson(row: {
-  event_json?: unknown;
-  event_zstd?: unknown;
-  event_utf8_bytes?: unknown;
-}): string {
-  if (typeof row.event_json === "string") return row.event_json;
-  const bytes = row.event_zstd;
-  const rawBytes = row.event_utf8_bytes;
-  if (bytes === null || bytes === undefined) {
-    throw new Error("Transcript row has neither event_json nor event_zstd");
-  }
-  if (
-    !(bytes instanceof Uint8Array) ||
-    bytes.byteLength === 0 ||
-    bytes.byteLength > MAX_COMPRESSED_EVENT_BYTES ||
-    typeof rawBytes !== "number" ||
-    !Number.isSafeInteger(rawBytes) ||
-    rawBytes < 1 ||
-    rawBytes > MAX_COMPRESSED_EVENT_BYTES
-  ) {
-    throw new Error("Invalid compressed transcript payload bounds");
-  }
-  // Node >= 22.15 / 23.8 ship zlib Zstd; the installed @types/node predates it, hence the cast.
-  const zstdDecompressSync = (
-    zlib as unknown as {
-      zstdDecompressSync?: (data: Uint8Array, options: { maxOutputLength: number }) => Buffer;
-    }
-  ).zstdDecompressSync;
-  if (typeof zstdDecompressSync !== "function") {
-    throw new Error(
-      `Cannot decode compressed transcript payload: zlib Zstd requires Node >= 22.15.0 or >= 23.8.0 (running ${process.versions.node})`
-    );
-  }
-  const decoded = zstdDecompressSync.call(zlib, bytes, { maxOutputLength: rawBytes });
-  if (decoded.byteLength !== rawBytes) {
-    throw new Error("Compressed transcript payload length does not match its recorded UTF-8 size");
-  }
-  return utf8Decoder.decode(decoded);
-}
-
-/** Marks admission policy (Vern 2026-09-21). Defaults below; the plugin config `astinus.marks.*`
- *  supplies overrides through ApplyContext.policy. Mark from 0.30, admit the share of the pending
- *  pool in priority order, hold five turns between admissions, and let 0.65 bypass the debounce -
- *  a desk over its window must not wait. */
-export type MarksAdmissionPolicy = {
-  minPressure: number;
-  admitShare: boolean;
-  debounceTurns: number;
-  criticalPressure: number;
-  /** Hard cap (2026-11-03): above this pressure, after marks, the oldest non-preserved turns
-   *  are reduced to their user message plus one tombstone until pressure is at hardCapTarget.
-   *  tokenBudget is the host's message budget (window - reserve - system prompt), so 1.0 is
-   *  the overflow line and the cap must act below it. 0 disables the cap. */
-  hardCapPressure: number;
-  hardCapTarget: number;
+/** Prune cycle (Vern 2026-11-03; design suits/astinus/analysis/PRUNE-CYCLE-DESIGN-20261103.md).
+ *  Replaces the 2026-09-21 admission policy (floor, share, debounce, critical bypass) and the
+ *  0.90/0.70 hard cap. At pruneAtPressure one prune runs and cuts the view to pruneToPressure;
+ *  between prunes the view is a fixed function of the ledger, so the provider's prefix cache
+ *  holds - the reason the debounce existed. Pressure is the count-anchored estimate over the
+ *  host message budget (window - reserve - system prompt). Config: `astinusMarks.*`. */
+export type PrunePolicy = {
+  pruneAtPressure: number;
+  pruneToPressure: number;
 };
 
-export const DEFAULT_MARKS_POLICY: MarksAdmissionPolicy = {
-  minPressure: 0.3,
-  admitShare: true,
-  debounceTurns: 5,
-  criticalPressure: 0.65,
-  hardCapPressure: 0.9,
-  hardCapTarget: 0.7,
+export const DEFAULT_PRUNE_POLICY: PrunePolicy = {
+  pruneAtPressure: 0.6,
+  pruneToPressure: 0.25,
 };
+
+/** A prune that would remove less than this share of the view is not committed: a session whose
+ *  preserved tail alone sits over the threshold would otherwise re-prune, and miss the cache, on
+ *  every request. */
+const MIN_PRUNE_GAIN = 0.05;
 
 /** Tool-call arguments up to this size stay verbatim under a placeholder mark: they are cheap
  *  and say what was asked. */
@@ -154,8 +66,7 @@ export function canonicalId(raw: unknown): string {
 
 export function identityKeyOf(m: unknown): string {
   const msg = (m ?? {}) as Record<string, unknown>;
-  if (typeof msg.idempotencyKey === "string" && msg.idempotencyKey)
-    return "ik:" + msg.idempotencyKey;
+  if (typeof msg.idempotencyKey === "string" && msg.idempotencyKey) return "ik:" + msg.idempotencyKey;
   const inner = (msg.message ?? {}) as Record<string, unknown>;
   const ik = typeof inner.idempotencyKey === "string" ? inner.idempotencyKey : "";
   if (ik) return "ik:" + ik;
@@ -195,12 +106,20 @@ export function identityKeyOf(m: unknown): string {
 export function toolCallKeyOf(m: unknown): string | null {
   const msg = (m ?? {}) as Record<string, unknown>;
   const inner = (msg.message ?? {}) as Record<string, unknown>;
-  const role =
-    typeof msg.role === "string" ? msg.role : typeof inner.role === "string" ? inner.role : "";
+  const role = typeof msg.role === "string" ? msg.role : typeof inner.role === "string" ? inner.role : "";
   if (role !== "toolResult") return null;
   const raw = (msg.toolCallId ?? msg.tool_call_id ?? inner.toolCallId) as unknown;
   const cid = canonicalId(raw);
   return cid ? "tc:" + cid : null;
+}
+
+function eventIdOf(eventJson: string): string | null {
+  try {
+    const ev = JSON.parse(eventJson) as Record<string, unknown>;
+    return typeof ev.id === "string" && ev.id ? ev.id : null;
+  } catch {
+    return null;
+  }
 }
 
 function eventIdentity(eventJson: string): string | null {
@@ -241,101 +160,19 @@ export function estimateTokensHost(list: unknown[]): number {
   return Math.ceil(total * 1.2);
 }
 
-type TranscriptRow = {
-  seq: number;
-  event_json: string | null;
-  event_zstd?: unknown;
-  event_utf8_bytes?: unknown;
-};
-type RowRange = { after?: number; lo?: number; hi?: number; descending?: boolean; limit?: number };
-
-/** THE host-transcript reader (assemble and the classification pass): read-only, scoped to one
- *  session, identity or Zstd rows. Nothing else in the plugin queries host tables. */
-export class HostTranscript {
-  private compressed: boolean | null = null;
-  constructor(
-    private readonly db: DatabaseSync,
-    readonly sessionId: string
-  ) {}
-  static open(dbPath: string, sessionId: string): HostTranscript {
-    return new HostTranscript(new DatabaseSync(dbPath, { readOnly: true }), sessionId);
+function resolveMarkRange(
+  mark: LedgerMark,
+  ix: SeqIndex
+): { lo: number; hi: number } | null {
+  const first = (mark as { anchor_first_event?: unknown }).anchor_first_event;
+  const last = (mark as { anchor_last_event?: unknown }).anchor_last_event;
+  if (typeof first !== "string" || !first || typeof last !== "string" || !last) {
+    return { lo: Number(mark.seq_start), hi: Number(mark.seq_end) };
   }
-  /** Undecoded rows, so a caller can stop before the first row it cannot decode. */
-  rows(range: RowRange = {}): TranscriptRow[] {
-    if (this.compressed === null) {
-      const cols = this.db.prepare("PRAGMA table_info(transcript_events)").all() as Array<{
-        name?: unknown;
-      }>;
-      const names = new Set(cols.map((col) => String(col.name)));
-      this.compressed = names.has("event_zstd") && names.has("event_utf8_bytes");
-    }
-    const where = ["session_id = ?"];
-    const args: Array<string | number> = [this.sessionId];
-    for (const [op, v] of [
-      ["seq > ?", range.after],
-      ["seq >= ?", range.lo],
-      ["seq <= ?", range.hi],
-    ] as const) {
-      if (v !== undefined) (where.push(op), args.push(v));
-    }
-    const cols = this.compressed
-      ? "seq, event_json, event_zstd, event_utf8_bytes"
-      : "seq, event_json";
-    const limit = range.limit !== undefined ? (args.push(range.limit), " LIMIT ?") : "";
-    return this.db
-      .prepare(
-        `SELECT ${cols} FROM transcript_events WHERE ${where.join(" AND ")} ORDER BY seq ${range.descending ? "DESC" : "ASC"}${limit}`
-      )
-      .all(...args) as TranscriptRow[];
-  }
-  /** Decoded events; throws on a row it cannot decode. */
-  events(range: RowRange = {}): Array<{ seq: number; eventJson: string }> {
-    return this.rows(range).map((r) => ({
-      seq: Number(r.seq),
-      eventJson: decodeTranscriptEventJson(r),
-    }));
-  }
-  seqBounds(): { min: number | null; max: number | null } {
-    const r = this.db
-      .prepare("SELECT MIN(seq) AS lo, MAX(seq) AS hi FROM transcript_events WHERE session_id = ?")
-      .get(this.sessionId) as { lo?: number | null; hi?: number | null } | undefined;
-    return { min: r?.lo ?? null, max: r?.hi ?? null };
-  }
-  createdAt(seq: number): number | null {
-    const r = this.db
-      .prepare("SELECT created_at FROM transcript_events WHERE session_id = ? AND seq = ?")
-      .get(this.sessionId, seq) as { created_at?: unknown } | undefined;
-    return typeof r?.created_at === "number" ? r.created_at : null;
-  }
-  /** Host event ids of the first and last identified rows in [lo, hi]; null when none. */
-  anchorsFor(lo: number, hi: number): { first: string; last: string } | null {
-    let first: string | null = null;
-    let last: string | null = null;
-    for (const r of this.rows({ lo, hi })) {
-      let id: string | null = null;
-      try {
-        id = eventIdOf(decodeTranscriptEventJson(r));
-      } catch {
-        return null; // an undecodable row inside the range: do not guess
-      }
-      if (id) (first ??= id), (last = id);
-    }
-    return first && last ? { first, last } : null;
-  }
-  /** The host's current rewrite generation for this session (A2); null when it cannot be read. */
-  generation(): string | null {
-    try {
-      const row = this.db
-        .prepare("SELECT generation FROM transcript_rewrite_watermarks WHERE session_id = ?")
-        .get(this.sessionId) as { generation?: unknown } | undefined;
-      return typeof row?.generation === "string" && row.generation ? row.generation : null;
-    } catch {
-      return null;
-    }
-  }
-  close(): void {
-    this.db.close();
-  }
+  const a = ix.eventSeq(first);
+  const b = ix.eventSeq(last);
+  if (a === null || b === null) return null;
+  return { lo: Math.min(a, b), hi: Math.max(a, b) };
 }
 
 /**
@@ -371,21 +208,15 @@ function slimBlocks(msg: unknown): unknown {
 }
 
 export class SeqIndex {
-  private db: HostTranscript | null = null;
+  private db: DatabaseSync | null = null;
   private lastSeq = 0;
-  /** Event id at lastSeq; when that row changes, the transcript was reindexed. */
+  /** Event id indexed at lastSeq. Its disappearance means the rows were reindexed. */
   private lastSeqId: string | null = null;
   private readonly map = new Map<string, number>();
-  private readonly byEventId = new Map<string, number>();
   private loadedOnce = false;
   failed = false;
-  /** Set when the last refresh stopped at a row it could not read; lastSeq stays before it. */
-  readError: string | null = null;
 
-  constructor(
-    readonly dbPath: string,
-    readonly sessionId: string
-  ) {}
+  constructor(readonly dbPath: string, readonly sessionId: string) {}
 
   private open(): boolean {
     if (this.db) return true;
@@ -394,7 +225,7 @@ export class SeqIndex {
       return false;
     }
     try {
-      this.db = HostTranscript.open(this.dbPath, this.sessionId);
+      this.db = new DatabaseSync(this.dbPath, { readOnly: true });
       return true;
     } catch {
       this.failed = true;
@@ -402,55 +233,61 @@ export class SeqIndex {
     }
   }
 
-  /** One refresh per pass (M5); loop until a chunk comes back short so a fresh index converges.
-   *  A row that cannot be decoded stops the refresh BEFORE it (lastSeq is not advanced past it)
-   *  and sets readError, so the caller reports the store unreadable instead of unmapped. */
+  /** One refresh per pass (M5); loop until a chunk comes back short so a fresh index converges. */
+  /** True when the row at lastSeq still carries the id this index recorded for it. */
+  private tailUnchanged(): boolean {
+    if (this.lastSeqId === null) return true;
+    try {
+      const row = this.db!
+        .prepare("SELECT event_json FROM transcript_events WHERE session_id = ? AND seq = ?")
+        .get(this.sessionId, this.lastSeq) as { event_json: string } | undefined;
+      if (!row) return false;
+      return eventIdOf(row.event_json) === this.lastSeqId;
+    } catch {
+      return false;
+    }
+  }
+
   refresh(): void {
     if (!this.open()) return;
-    this.readError = null;
     try {
-      // A trim or header repair keeps event ids but renumbers rows, and the incremental read
-      // below only walks seq > lastSeq, so survivors would keep stale coordinates. Reload
-      // from scratch when the row at lastSeq no longer carries the id recorded for it.
+      // A manual trim or a header repair keeps event ids but moves them, and the
+      // incremental read below only walks seq > lastSeq, so every surviving row
+      // would keep its old coordinate. Reload from zero when the tail moved.
       if (this.loadedOnce && !this.tailUnchanged()) {
         this.map.clear();
-        this.byEventId.clear();
         this.lastSeq = -1;
         this.lastSeqId = null;
       }
-      let rows: TranscriptRow[] = [];
+      let rows: Array<{ seq: number; event_json: string }> = [];
       do {
-        rows = this.db!.rows({ after: this.lastSeq, limit: LOAD_CHUNK });
+        rows = this.db!
+          .prepare(
+            "SELECT seq, event_json FROM transcript_events WHERE session_id = ? AND seq > ? ORDER BY seq LIMIT ?"
+          )
+          .all(this.sessionId, this.lastSeq, LOAD_CHUNK) as Array<{ seq: number; event_json: string }>;
         for (const r of rows) {
-          let eventJson: string;
-          try {
-            eventJson = decodeTranscriptEventJson(r);
-          } catch (e) {
-            this.readError = `seq ${Number(r.seq)}: ${(e as Error)?.message ?? e}`;
-            return;
+          const key = eventIdentity(r.event_json);
+          if (Number(r.seq) > this.lastSeq) {
+            this.lastSeq = Number(r.seq);
+            this.lastSeqId = eventIdOf(r.event_json);
           }
-          const key = eventIdentity(eventJson);
-          const eid = eventIdOf(eventJson);
-          if (eid) this.byEventId.set(eid, Number(r.seq));
-          if (Number(r.seq) > this.lastSeq) (this.lastSeq = Number(r.seq)), (this.lastSeqId = eid);
           if (!key) continue;
           this.map.set(key, Number(r.seq));
           try {
-            const ev = JSON.parse(eventJson) as Record<string, unknown>;
+            const ev = JSON.parse(r.event_json) as Record<string, unknown>;
             const tcKey = toolCallKeyOf((ev.message ?? ev) as Record<string, unknown>);
             if (tcKey) {
               const prev = this.map.get(tcKey);
               if (prev === undefined) this.map.set(tcKey, Number(r.seq));
               else if (prev !== Number(r.seq)) this.map.set(tcKey, -1); // ambiguous: refuse
             }
-          } catch {
-            /* bonus key only */
-          }
+          } catch { /* bonus key only */ }
         }
       } while (rows.length === LOAD_CHUNK);
       this.loadedOnce = true;
-    } catch (e) {
-      this.readError = `transcript read failed: ${(e as Error)?.message ?? e}`;
+    } catch {
+      /* degrade: whatever is indexed still resolves */
     }
   }
 
@@ -458,26 +295,28 @@ export class SeqIndex {
     return this.loadedOnce;
   }
 
-  private tailUnchanged(): boolean {
-    if (this.lastSeqId === null) return true;
+  /** Current coordinate of a host event id, or null when it is gone. */
+  eventSeq(eventId: string): number | null {
+    if (!this.open()) return null;
     try {
-      const row = this.db!.rows({ lo: this.lastSeq, hi: this.lastSeq })[0];
-      return !!row && eventIdOf(decodeTranscriptEventJson(row)) === this.lastSeqId;
+      const row = this.db!
+        .prepare(
+          "SELECT seq FROM transcript_event_identities WHERE session_id = ? AND event_id = ?"
+        )
+        .get(this.sessionId, eventId) as { seq?: number } | undefined;
+      const seq = Number(row?.seq);
+      return Number.isFinite(seq) ? seq : null;
     } catch {
-      return false;
+      return null;
     }
   }
 
-  seqOfEventId(id: string): number | null {
-    return this.byEventId.get(id) ?? null;
-  }
-
-  /** Release the read handle (Windows refuses to delete a directory with an open DB). */
+  /** Release the read handle. Windows refuses to delete a directory holding an open DB. */
   close(): void {
     try {
       this.db?.close();
     } catch {
-      /* already closed */
+      /* already closed or unusable */
     }
     this.db = null;
   }
@@ -498,29 +337,35 @@ export class SeqIndex {
   firstUsageAfter(afterSeq: number, limit = 64): ProviderUsage | null {
     if (!this.open()) return null;
     try {
-      for (const r of this.db!.rows({ after: afterSeq, limit })) {
-        let json: string;
-        try {
-          json = decodeTranscriptEventJson(r);
-        } catch {
-          // The host contract always records event_utf8_bytes, but an older compressed row
-          // may not. The anchor path tolerates that (no length check) or skips the row.
-          const bytes = (r as { event_zstd?: unknown }).event_zstd;
-          const zstd = (zlib as unknown as { zstdDecompressSync?: (b: Uint8Array) => Buffer })
-            .zstdDecompressSync;
-          if (!(bytes instanceof Uint8Array) || typeof zstd !== "function") continue;
-          try {
-            json = zstd.call(zlib, bytes).toString("utf8");
-          } catch {
-            continue; // an undecodable row cannot carry usage; the next one may
-          }
-        }
+      const rows = this.db!
+        .prepare(
+          "SELECT seq, event_json, event_zstd FROM transcript_events WHERE session_id = ? AND seq > ? ORDER BY seq LIMIT ?"
+        )
+        .all(this.sessionId, afterSeq, limit) as Array<{
+        seq: number;
+        event_json: string | null;
+        event_zstd: Uint8Array | null;
+      }>;
+      for (const r of rows) {
+        const json = r.event_json ?? decodeZstd(r.event_zstd);
+        if (!json) continue;
         const usage = usageFromEvent({ seq: Number(r.seq), eventJson: json });
         if (usage) return usage;
       }
     } catch {
       /* degrade: no anchor this call */
     }
+    return null;
+  }
+}
+
+function decodeZstd(blob: Uint8Array | null): string | null {
+  if (!blob) return null;
+  const fn = (zlib as unknown as { zstdDecompressSync?: (b: Buffer) => Buffer }).zstdDecompressSync;
+  if (typeof fn !== "function") return null;
+  try {
+    return fn(Buffer.from(blob)).toString("utf8");
+  } catch {
     return null;
   }
 }
@@ -553,30 +398,35 @@ export type ApplyContext = {
   hostDbPath: string;
   sessionId: string; // B1: the HOST session UUID, never the session key
   tokenBudget: number;
-  turnCounter: number; // monotonic (lastCommittedSeq), NOT the capped committedKeys length
-  policy?: Partial<MarksAdmissionPolicy>; // `astinus.marks.*`; DEFAULT_MARKS_POLICY otherwise
-  turnMiddleAgeTurns?: number; // F2: the turn_middle tail floor (default 6)
+  turnCounter?: number; // kept for callers; the prune cycle has no turn clock
+  policy?: Partial<PrunePolicy>; // `astinusMarks.*`; DEFAULT_PRUNE_POLICY otherwise
+  /** The session's current prune epoch (ledger meta.prune_epoch); 0 when it was never pruned. */
+  pruneEpoch?: number;
   /** Provider/host-estimate ratio for this session (count anchor); pressure uses tokensBefore x scale. */
   pressureScale?: number;
 };
 
+export type PruneOutcome = {
+  epoch: number; // the new epoch; the admitted marks and the fallback are stamped with it
+  pressureBefore: number;
+  pressureAfter: number;
+  dropped: number; // earlier-epoch marks whose ranges were removed outright
+  fallback: LedgerMark | null; // the oldest-turns cut, for the caller to insert into the ledger
+};
+
 export type ApplyResult = {
   messages: unknown[];
-  admitted: LedgerMark[]; // newly admitted this pass (stamp these)
-  marksInEffect: number; // admitted-before + admitted-now (B2: authority basis)
+  admitted: LedgerMark[]; // admitted by this call's prune (stamp these with prune.epoch)
+  marksInEffect: number; // every applied mark of the view, own action or drop (authority basis)
   changed: boolean;
-  pendingCount: number; // pending marks considered this call (the share denominator)
+  pendingCount: number; // pending marks waiting for the next prune
   tokensBefore: number;
   tokensAfter: number;
   skipped: string[];
-  /** Host transcript could not be read/decoded; messages are unchanged and nothing admitted. */
-  readError?: string;
   windowFirstSeq: number | null; // min mapped seq of this view (2026-10-07): the pass bounds proposals to the assembled window
   windowLastSeq: number | null; // max mapped seq of this view: the next model call's usage follows it (count anchor)
-  hardCap: { turns: number; pressureBefore: number; pressureAfter: number } | null; // set when the cap reduced turns
+  prune: PruneOutcome | null; // set when this call ran and committed a prune
 };
-
-const lastAdmissionTurn = new Map<string, number>();
 
 /** All toolCall ids in an assistant message (P3: parallel calls defeat a single-id lookup). */
 function toolCallIdsOf(m: unknown): string[] {
@@ -639,125 +489,99 @@ function reduceAssistantBody(msg: Record<string, unknown>): Record<string, unkno
   return { ...msg, content };
 }
 
-function astinusAuthored(m: unknown): boolean {
-  const text = JSON.stringify(((m ?? {}) as Record<string, unknown>).content ?? "");
-  return text.indexOf("[Astinus") !== -1 || text.indexOf("[injected context") !== -1;
+/** A message Astinus wrote into the view (digest, tombstone, fallback cut): an assistant message
+ *  whose first part opens with one of the engine's own prefixes. Callers also require it to map to
+ *  no transcript seq, so a host message slimmed in place is never taken for one. */
+function isAstinusMessage(m: unknown): boolean {
+  const msg = (m ?? {}) as Record<string, unknown>;
+  if (msg.role !== "assistant" || !Array.isArray(msg.content)) return false;
+  const first = (msg.content as Array<Record<string, unknown>>)[0];
+  const text = typeof first?.text === "string" ? first.text : "";
+  return text.startsWith("[Astinus") || text.startsWith("[injected context");
 }
 
-/** The hard cap (2026-11-03, item 4; Astinus's Q3 answer: "apply the strongest admissible set
- *  and, if still over, reduce the oldest non-preserved turns to stubs deterministically instead
- *  of waiting for the host's timeout-triggered compaction"). Runs after marks, on every view.
- *  Oldest turn first: the user message stays, its interior becomes one tombstone. A turn is
- *  skipped when a tool pair would cross its edge or it holds unmapped host content (a
- *  compaction summary); the first user message and the preserved tail are never touched. */
-function applyHardCap(out: ApplyResult, ctx: ApplyContext, policy: MarksAdmissionPolicy): void {
-  if (!(ctx.tokenBudget > 0) || !(policy.hardCapPressure > 0)) return;
-  const scale = typeof ctx.pressureScale === "number" && ctx.pressureScale > 0 ? ctx.pressureScale : 1;
-  const pressureOf = (t: number) => (t * scale) / ctx.tokenBudget;
-  const startTotal = out.changed ? out.tokensAfter : out.tokensBefore;
-  const pressureBefore = pressureOf(startTotal);
-  if (pressureBefore <= policy.hardCapPressure) return;
-  const target = Math.min(policy.hardCapTarget, policy.hardCapPressure);
-  const list = out.messages.slice();
-  const ix = seqIndexFor(ctx.hostDbPath, ctx.sessionId);
-  ix.refresh();
+function timestampOf(m: unknown): number {
+  const ts = ((m ?? {}) as Record<string, unknown>).timestamp;
+  return typeof ts === "number" ? ts : 0;
+}
+
+/** The prune's last resort: the oldest whole turns after the first user message, user messages
+ *  included, as ONE range ending at a user-turn boundary, until pressure is at the target. Vern:
+ *  "oldest is not best" - the pass's topic-based marks go first; this only guarantees the target.
+ *  The range must be tool-pair-closed and stays clear of the preserved tail. Returns a digest mark
+ *  of the new epoch (the caller writes it to the ledger, so a rebuilt view reproduces the cut). */
+function fallbackCut(
+  list: unknown[],
+  ix: SeqIndex,
+  tokens: number,
+  pressureOf: (t: number) => number,
+  target: number,
+  epoch: number,
+  sessionId: string
+): LedgerMark | null {
+  const firstUser = list.findIndex((m) => ((m ?? {}) as Record<string, unknown>).role === "user");
+  if (firstUser < 0) return null;
   const tailFloor = preservedFloorIdx(list);
-  const users: number[] = [];
-  for (let i = 0; i < tailFloor; i++) {
-    if (((list[i] ?? {}) as Record<string, unknown>).role === "user") users.push(i);
+  const start = firstUser + 1;
+  if (start >= tailFloor) return null;
+  const cost = list.map((m) => estimateTokensHost([m]));
+  let removed = 0;
+  let best: { end: number; turns: number } | null = null;
+  let turns = 0;
+  const calls = new Set<string>();
+  const results = new Set<string>();
+  for (let i = start; i < tailFloor; i++) {
+    removed += cost[i];
+    for (const id of toolCallIdsOf(list[i])) calls.add(canonicalId(id));
+    for (const id of toolResultCallIds(list[i])) results.add(canonicalId(id));
+    const nextIsUser = ((list[i + 1] ?? {}) as Record<string, unknown>).role === "user";
+    if (!nextIsUser) continue;
+    turns++;
+    let closed = calls.size === results.size;
+    for (const id of calls) if (!results.has(id)) closed = false;
+    if (!closed) continue;
+    best = { end: i, turns };
+    if (pressureOf(tokens - removed) <= target) break;
   }
-  let total = startTotal;
-  const chosen: Array<{ a: number; b: number; stub: unknown }> = [];
-  for (let k = 0; k < users.length && pressureOf(total) > target; k++) {
-    const a = users[k] + 1;
-    const b = (k + 1 < users.length ? users[k + 1] : tailFloor) - 1;
-    if (a > b) continue;
-    const interior = list.slice(a, b + 1);
-    let lo: number | null = null;
-    let hi: number | null = null;
-    let foreign = false;
-    const calls = new Set<string>();
-    const results = new Set<string>();
-    for (const m of interior) {
-      const s = ix.seqOf(m);
-      if (s === null) {
-        if (!astinusAuthored(m)) foreign = true;
-      } else {
-        if (lo === null || s < lo) lo = s;
-        if (hi === null || s > hi) hi = s;
-      }
-      for (const id of toolCallIdsOf(m)) calls.add(canonicalId(id));
-      for (const id of toolResultCallIds(m)) results.add(canonicalId(id));
-    }
-    if (foreign || lo === null || hi === null) continue;
-    let paired = calls.size === results.size;
-    for (const id of calls) if (!results.has(id)) paired = false;
-    if (!paired) continue;
-    // Byte-stable: the stub depends only on the turn it replaces, never on the current pressure
-    // or clock, so a rebuilt view reproduces it exactly and the provider's prefix cache survives.
-    const firstTs = ((interior[0] ?? {}) as Record<string, unknown>).timestamp;
-    const stub = {
-      role: "assistant",
-      timestamp: typeof firstTs === "number" ? firstTs : 0,
-      content: [
-        {
-          type: "text",
-          text:
-            `[Astinus hard cap: turn interior removed - ${interior.length} messages, ` +
-            `${calls.size} tool calls | seq ${lo}-${hi}; recover it from the transcript by seq range]`,
-        },
-      ],
-    };
-    const delta = estimateTokensHost(interior) - estimateTokensHost([stub]);
-    if (delta <= 0) continue;
-    chosen.push({ a, b, stub });
-    total -= delta;
+  if (!best) return null;
+  let lo: number | null = null;
+  let hi: number | null = null;
+  for (let i = start; i <= best.end; i++) {
+    const s = ix.seqOf(list[i]);
+    if (s === null) continue;
+    if (lo === null || s < lo) lo = s;
+    if (hi === null || s > hi) hi = s;
   }
-  if (chosen.length === 0) {
-    out.skipped.push(`hard cap: pressure ${pressureBefore.toFixed(2)} > ${policy.hardCapPressure} but no reducible turn outside the preserved tail`);
-    return;
-  }
-  for (let j = chosen.length - 1; j >= 0; j--) {
-    list.splice(chosen[j].a, chosen[j].b - chosen[j].a + 1, chosen[j].stub);
-  }
-  out.messages = list;
-  out.changed = true;
-  out.tokensAfter = estimateTokensHost(list);
-  out.hardCap = { turns: chosen.length, pressureBefore, pressureAfter: pressureOf(out.tokensAfter) };
-  out.skipped.push(
-    `hard cap: ${chosen.length} turn(s) reduced, pressure ${pressureBefore.toFixed(2)} -> ${out.hardCap.pressureAfter.toFixed(2)}`
-  );
+  if (lo === null || hi === null) return null;
+  return {
+    session_id: sessionId,
+    seq_start: lo,
+    seq_end: hi,
+    kind: "turn",
+    action: "digest",
+    digest:
+      `${best.turns} earlier turn(s) removed at prune ${epoch}; recall, enrich or the transcript ` +
+      `(seq ${lo}-${hi}) hold them`,
+    reason: "prune_fallback",
+    applied_at: 1,
+    prune_epoch: epoch,
+  };
 }
 
 /** The index of the first message inside the preserved tail: the last PRESERVE_USER_TURNS user
  *  turns (M3), not a fixed message count. */
-function preservedFloorIdx(messages: unknown[], keep = PRESERVE_USER_TURNS): number {
+function preservedFloorIdx(messages: unknown[]): number {
   let userTurns = 0;
   for (let i = messages.length - 1; i >= 0; i--) {
     if (((messages[i] ?? {}) as Record<string, unknown>).role === "user") {
       userTurns++;
-      if (userTurns >= keep) return i;
+      if (userTurns >= PRESERVE_USER_TURNS) return i;
     }
   }
   return 0;
 }
 
 export function applyMarks(
-  messages: unknown[],
-  marks: LedgerMark[],
-  ctx: ApplyContext
-): ApplyResult {
-  const out = applyLedgerMarks(messages, marks, ctx);
-  // The cap runs on every view, marks or not: a desk with an empty ledger can still overflow.
-  try {
-    applyHardCap(out, ctx, { ...DEFAULT_MARKS_POLICY, ...(ctx.policy ?? {}) });
-  } catch {
-    /* degrade: no cap this call, the marked view stands */
-  }
-  return out;
-}
-
-function applyLedgerMarks(
   messages: unknown[],
   marks: LedgerMark[],
   ctx: ApplyContext
@@ -774,7 +598,7 @@ function applyLedgerMarks(
     pendingCount: 0,
     windowFirstSeq: null,
     windowLastSeq: null,
-    hardCap: null,
+    prune: null,
   };
   // 2026-10-07 (Vern: "so fix it"): the assembled window's first mapped seq. The pass bounds
   // its proposals to the window the host actually assembles - marks outside it can never
@@ -804,17 +628,11 @@ function applyLedgerMarks(
   try {
     const dix = seqIndexFor(ctx.hostDbPath, ctx.sessionId);
     dix.refresh();
-    let dn = 0,
-      dres = 0,
-      dtsNum = 0,
-      dtsStr = 0,
-      dtsUndef = 0,
-      dstamped = 0;
+    let dn = 0, dres = 0, dtsNum = 0, dtsStr = 0, dtsUndef = 0, dstamped = 0;
     for (const m of messages) {
       const msg = (m ?? {}) as Record<string, unknown>;
       const inner = (msg.message ?? {}) as Record<string, unknown>;
-      const role =
-        typeof msg.role === "string" ? msg.role : typeof inner.role === "string" ? inner.role : "";
+      const role = typeof msg.role === "string" ? msg.role : typeof inner.role === "string" ? inner.role : "";
       if (role !== "toolResult") continue;
       dn++;
       if (dix.seqOf(m) !== null) dres++;
@@ -824,144 +642,162 @@ function applyLedgerMarks(
       else dtsUndef++;
       const c = msg.content;
       const text = typeof c === "string" ? c : JSON.stringify(c ?? "");
-      if (
-        text.indexOf("Astinus digest of seq") !== -1 ||
-        text.indexOf("tool output pruned by Astinus") !== -1
-      )
-        dstamped++;
+      if (text.indexOf("Astinus digest of seq") !== -1 || text.indexOf("tool output pruned by Astinus") !== -1) dstamped++;
     }
-    (out as unknown as Record<string, unknown>).trDiag = {
-      n: dn,
-      resolved: dres,
-      tsNum: dtsNum,
-      tsStr: dtsStr,
-      tsUndef: dtsUndef,
-      stamped: dstamped,
-    };
-  } catch {
-    /* degrade: no diag; never affects the view */
-  }
-  const wellFormed = marks.filter(
-    (m) => m && Number.isFinite(m.seq_start) && Number.isFinite(m.seq_end)
-  );
-  if (wellFormed.length === 0) return out;
+    (out as unknown as Record<string, unknown>).trDiag = { n: dn, resolved: dres, tsNum: dtsNum, tsStr: dtsStr, tsUndef: dtsUndef, stamped: dstamped };
+  } catch { /* degrade: no diag; never affects the view */ }
+
+  const policy = { ...DEFAULT_PRUNE_POLICY, ...(ctx.policy ?? {}) };
+  const epoch = typeof ctx.pruneEpoch === "number" && ctx.pruneEpoch > 0 ? Math.floor(ctx.pruneEpoch) : 0;
   // Count anchor (2026-11-03): the char estimate is scaled by the session's measured
   // provider/estimate ratio, so pressure reflects what the model actually receives.
   const scale = typeof ctx.pressureScale === "number" && ctx.pressureScale > 0 ? ctx.pressureScale : 1;
-  const pressure = ctx.tokenBudget > 0 ? (tokensBefore * scale) / ctx.tokenBudget : 0;
-  // B2: admission (NEW marks) is gated; re-application (admitted marks) is unconditional.
-  // The original justification ("the view is rebuilt from the transcript every turn, so
-  // admitted marks ARE the view") was FALSIFIED 2026-10-11 by the view-ratchet finding: the
-  // host writes the assembled list back at attempt-history-prepare.ts:230-232, so the view is
-  // CARRIED FORWARD, not rebuilt. Re-application still runs unconditionally; whether that is
-  // redundant when the effect persists is unmeasured - the section-8 census will say.
-  // A digest mark with no digest text cannot replace anything: it maps to a range, counts
-  // as in effect, and changes nothing. turn_middle marks are the exception - they redact
-  // in place and intentionally carry no digest.
-  const actionable = wellFormed.filter(
+  const pressureOf = (t: number) => (ctx.tokenBudget > 0 ? (t * scale) / ctx.tokenBudget : 0);
+  // Usable marks: well formed, not retired by the one-time rebase (2026-11-02), and able to change
+  // something - a digest mark with no digest text replaces nothing (item 1), except turn_middle,
+  // which redacts in place and carries no digest by design.
+  const usable = marks.filter(
     (m) =>
-      m.action !== "digest" ||
-      (typeof m.digest === "string" && m.digest.length > 0) ||
-      (typeof m.reason === "string" && m.reason.indexOf("turn_middle") === 0)
+      m &&
+      Number.isFinite(m.seq_start) &&
+      Number.isFinite(m.seq_end) &&
+      (m as { retired_at?: number | null }).retired_at == null &&
+      (m.action !== "digest" ||
+        (typeof m.digest === "string" && m.digest.length > 0) ||
+        (typeof m.reason === "string" && m.reason.indexOf("turn_middle") === 0))
   );
-  const admitted = actionable.filter((m) => m.applied_at != null);
-  let pending = actionable.filter((m) => m.applied_at == null);
-  const policy = { ...DEFAULT_MARKS_POLICY, ...(ctx.policy ?? {}) };
-  const pendingBefore = pending.length;
-  out.pendingCount = pendingBefore;
-  if (pending.length > 0) {
-    if (pressure > 1) {
-      // Over budget (2026-11-03): the host is already in overflow territory. Waiting on the
-      // debounce or the admission share is how a session reaches the provider ceiling with
-      // marks sitting idle. Admit everything pending.
-      out.skipped.push(`admission forced: pressure ${pressure.toFixed(2)} > 1 (over budget)`);
-    } else if (pressure < policy.minPressure) {
-      // Below the floor nothing is admitted and the debounce clock restarts from zero for the
-      // next time it crosses 0.30. Already-applied marks are NOT reverted (B2).
-      lastAdmissionTurn.delete(ctx.sessionKey);
-      out.skipped.push(
-        `admission held: pressure ${pressure.toFixed(2)} < ${policy.minPressure} (idle; debounce reset)`
-      );
-      pending = [];
-    } else {
-      const lastAt = lastAdmissionTurn.get(ctx.sessionKey);
-      const since = lastAt === undefined ? Number.POSITIVE_INFINITY : ctx.turnCounter - lastAt;
-      if (since < policy.debounceTurns && pressure < policy.criticalPressure) {
-        out.skipped.push(
-          `admission held: debounce ${since}/${policy.debounceTurns} turns (cache-hit ruling)`
-        );
-        pending = [];
-      } else if (policy.admitShare) {
-        // Admit the SHARE of the pending pool, in priority order: pressure desc, then topic
-        // dormancy desc, then statement age desc. The rest stay pending for the next admission.
-        const shareCount = Math.min(pending.length, Math.ceil(pressure * pending.length));
-        pending = [...pending]
-          .sort(
-            (a, b) =>
-              Number(b.pressure ?? 0) - Number(a.pressure ?? 0) ||
-              Number(b.topic_dormancy_s ?? 0) - Number(a.topic_dormancy_s ?? 0) ||
-              Number(b.stmt_age_s ?? 0) - Number(a.stmt_age_s ?? 0)
-          )
-          .slice(0, shareCount);
-        out.skipped.push(
-          `admission share: admitted=${pending.length}/${pendingBefore} share=${pressure.toFixed(2)}`
-        );
-      }
-      // B1 (review 2026-09-21): do NOT stamp the debounce here. A held turn must not move the
-      // clock, or `since` stays 1 forever and the debounce never expires below critical. The
-      // stamp belongs after an actual admission - see `out.admitted.length > 0` below.
-    }
-  }
-  const toApply = [...admitted, ...pending].filter((m) => m.retired_at == null);
-  if (toApply.length === 0) return out;
+  const applied = usable.filter((m) => m.applied_at != null);
+  const pending = usable.filter((m) => m.applied_at == null);
+  out.pendingCount = pending.length;
+  const epochOf = (m: LedgerMark) => {
+    const e = Number(m.prune_epoch ?? 0);
+    return Number.isFinite(e) ? e : 0;
+  };
+  // An earlier epoch's mark removes its range outright: nothing a prune leaves lasts past the next
+  // one (Vern: "whats the point of keeping tombstones forever ? memory is recall and enrich").
+  const asDrop = (m: LedgerMark): LedgerMark => ({ ...m, action: "drop", reason: "prune_dropped" });
 
-  const ix = seqIndexFor(ctx.hostDbPath, ctx.sessionId);
-  ix.refresh();
-  if (ix.readError) {
-    out.readError = ix.readError;
-    out.skipped.push(`transcript unreadable: ${ix.readError}`);
+  // Steady view: the current epoch's marks with their own action, earlier epochs dropped, pending
+  // marks waiting. A fixed function of the ledger, so request after request it is byte-identical.
+  const steadySet = applied.map((m) => (epochOf(m) < epoch ? asDrop(m) : m));
+  const steady = applySet(messages, steadySet, ctx);
+  const steadyTokens = steady.changed ? estimateTokensHost(steady.list) : tokensBefore;
+  const steadyPressure = pressureOf(steadyTokens);
+  const settleSteady = () => {
+    out.messages = steady.changed ? steady.list : messages;
+    out.changed = steady.changed;
+    out.tokensAfter = steadyTokens;
+    out.marksInEffect = steadySet.length;
+    out.skipped.push(...steady.skipped);
+  };
+  if (!(ctx.tokenBudget > 0) || steadyPressure < policy.pruneAtPressure) {
+    settleSteady();
+    if (pending.length > 0) {
+      out.skipped.push(
+        `prune held: pressure ${steadyPressure.toFixed(2)} < ${policy.pruneAtPressure}; ${pending.length} mark(s) wait`
+      );
+    }
     return out;
   }
-  const seqs: (number | null)[] = messages.map((m) => ix.seqOf(m));
-  const firstUser = messages.findIndex(
-    (m) => ((m ?? {}) as Record<string, unknown>).role === "user"
-  );
-  const floorIdx = firstUser < 0 ? 0 : firstUser;
-  const tailFloor = preservedFloorIdx(messages);
-  const turnMiddleFloor = preservedFloorIdx(
-    messages,
-    ctx.turnMiddleAgeTurns ?? DEFAULT_TURN_MIDDLE_AGE_TURNS
-  );
-  let list = messages.slice();
 
-  const ordered = [...toApply].sort((a, b) => b.seq_start - a.seq_start);
-  for (const mark of ordered) {
-    let lo = Number(mark.seq_start);
-    let hi = Number(mark.seq_end);
-    if (mark.anchor_first_event && mark.anchor_last_event) {
-      const a = ix.seqOfEventId(mark.anchor_first_event);
-      const b = ix.seqOfEventId(mark.anchor_last_event);
-      if (a === null || b === null) {
-        out.skipped.push(`seq ${lo}-${hi}: anchor gone from the transcript (not re-aimed)`);
-        continue;
+  // The prune. Everything the previous prune left goes: its own messages (digests, tombstones,
+  // fallback cuts) are stripped from a view the host carried forward, and every earlier mark
+  // drops its range. Then all pending marks are admitted at once - the pass picked them for being
+  // off-topic or incidental, so they go first - and only then the oldest-turns fallback.
+  const next = epoch + 1;
+  const ix = seqIndexFor(ctx.hostDbPath, ctx.sessionId);
+  ix.refresh();
+  const base = messages.filter((m) => !(isAstinusMessage(m) && ix.seqOf(m) === null));
+  const pruned = applySet(base, [...applied.map(asDrop), ...pending], ctx);
+  let list = pruned.changed ? pruned.list : base;
+  let tokens = estimateTokensHost(list);
+  const admitted = pruned.applied.filter((m) => m.applied_at == null);
+  let fallback: LedgerMark | null = null;
+  if (pressureOf(tokens) > policy.pruneToPressure) {
+    fallback = fallbackCut(list, ix, tokens, pressureOf, policy.pruneToPressure, next, ctx.sessionId);
+    if (fallback) {
+      const cut = applySet(list, [fallback], ctx);
+      if (cut.changed) {
+        list = cut.list;
+        tokens = estimateTokensHost(list);
+      } else {
+        fallback = null;
       }
-      lo = Math.min(a, b);
-      hi = Math.max(a, b);
     }
-    const isTurnMiddle =
-      mark.action === "turn_middle" ||
-      (typeof mark.reason === "string" && mark.reason.indexOf("turn_middle") === 0);
-    const floor = isTurnMiddle ? turnMiddleFloor : tailFloor;
+  }
+  const gain = steadyTokens > 0 ? (steadyTokens - tokens) / steadyTokens : 0;
+  if (gain < MIN_PRUNE_GAIN) {
+    settleSteady();
+    out.skipped.push(
+      `prune skipped: pressure ${steadyPressure.toFixed(2)} but it would remove ${(gain * 100).toFixed(1)}% (< ${MIN_PRUNE_GAIN * 100}%)`
+    );
+    return out;
+  }
+  out.messages = list;
+  out.changed = true;
+  out.tokensAfter = tokens;
+  out.admitted = admitted;
+  out.marksInEffect = applied.length + admitted.length + (fallback ? 1 : 0);
+  out.skipped.push(...pruned.skipped);
+  out.prune = {
+    epoch: next,
+    pressureBefore: steadyPressure,
+    pressureAfter: pressureOf(tokens),
+    dropped: applied.length,
+    fallback,
+  };
+  out.skipped.push(
+    `prune ${next}: pressure ${steadyPressure.toFixed(2)} -> ${out.prune.pressureAfter.toFixed(2)}; ` +
+      `${admitted.length} admitted, ${applied.length} dropped` +
+      (fallback ? `, oldest turns cut at seq ${fallback.seq_start}-${fallback.seq_end}` : "")
+  );
+  return out;
+}
+
+type SetResult = { list: unknown[]; changed: boolean; skipped: string[]; applied: LedgerMark[] };
+
+/** Apply one set of marks to a view. Idempotent: run again on its own output it changes nothing,
+ *  so a view the host carries forward and a view rebuilt from the transcript come out the same.
+ *  Invariants: never the first user message, tool pairs travel together, nothing in the preserved
+ *  tail. The seq map and the tail index follow every splice, so overlapping ranges stay exact. */
+function applySet(messages: unknown[], marks: LedgerMark[], ctx: ApplyContext): SetResult {
+  const res: SetResult = { list: messages, changed: false, skipped: [], applied: [] };
+  if (marks.length === 0) return res;
+  const ix = seqIndexFor(ctx.hostDbPath, ctx.sessionId);
+  ix.refresh();
+  const list = messages.slice();
+  const seqs: (number | null)[] = list.map((m) => ix.seqOf(m));
+  const firstUser = list.findIndex((m) => ((m ?? {}) as Record<string, unknown>).role === "user");
+  const floorIdx = firstUser < 0 ? 0 : firstUser;
+  let tailFloor = preservedFloorIdx(list);
+  const replace = (start: number, count: number, items: unknown[], itemSeqs: (number | null)[]) => {
+    list.splice(start, count, ...items);
+    seqs.splice(start, count, ...itemSeqs);
+    tailFloor = preservedFloorIdx(list);
+    res.changed = true;
+  };
+
+  const ordered = [...marks].sort((a, b) => b.seq_start - a.seq_start);
+  for (const mark of ordered) {
+    // Anchors are the authority; the numbers are a cache (2026-11-02). A mark whose
+    // boundary events are gone must not fall back to numbers that now hold other content.
+    const resolved = resolveMarkRange(mark, ix);
+    if (resolved === null) {
+      res.skipped.push(`mark ${mark.mark_id}: anchored content is gone`);
+      continue;
+    }
+    const lo = resolved.lo;
+    const hi = resolved.hi;
     // A mark may partially overlap the preserved tail; the in-view part applies, the tail
     // part is protected by construction (it has no eligible index below tailFloor).
     const idxs: number[] = [];
     for (let i = floorIdx + 1; i < list.length; i++) {
-      if (i >= floor) continue;
+      if (i >= tailFloor) continue;
       const s = seqs[i];
       if (s !== null && s >= lo && s <= hi) idxs.push(i);
     }
     if (idxs.length === 0) {
-      out.skipped.push(`seq ${lo}-${hi}: no eligible message in view (preserved/unmapped)`);
+      res.skipped.push(`seq ${lo}-${hi}: no eligible message in view (preserved/unmapped/already applied)`);
       continue;
     }
     let start = idxs[0];
@@ -987,15 +823,13 @@ function applyLedgerMarks(
           start--;
           for (const cid of toolResultCallIds(list[start + 1])) needIds.add(cid);
           for (const cid of toolCallIdsOf(list[start])) needIds.add(cid);
-        } else if (isToolResult(prev) && start - 1 < floor) {
+        } else if (isToolResult(prev) && start - 1 < tailFloor) {
           start--; // absorb an immediately preceding result so it is not orphaned
-          // ...and its call: without its id the next step stops at that call and orphans it.
-          for (const cid of toolResultCallIds(list[start])) needIds.add(cid);
         } else break;
       }
       // P2: forward extension NEVER crosses tailFloor — pruning inside the preserved tail is
       // worse than leaving a mark unapplied.
-      while (end + 1 < list.length && end + 1 < floor) {
+      while (end + 1 < list.length && end + 1 < tailFloor) {
         const next = list[end + 1];
         const linked = toolCallIdsOf(next).some((id) => needIds.has(id));
         if (linked) {
@@ -1007,25 +841,20 @@ function applyLedgerMarks(
       }
       // P2 guard: if completing any needed pair would enter the tail, leave BOTH messages.
       let neededInTail = false;
-      for (let i = floor; i < list.length && !neededInTail; i++) {
+      for (let i = tailFloor; i < list.length && !neededInTail; i++) {
         if (toolResultCallIds(list[i]).some((cid) => needIds.has(cid))) neededInTail = true;
         else if (toolCallIdsOf(list[i]).some((cid) => needIds.has(cid))) neededInTail = true;
       }
       if (neededInTail) {
-        out.skipped.push(
+        res.skipped.push(
           `seq ${lo}-${hi}: completing the tool pair would enter the preserved tail; left both messages`
         );
         continue;
       }
     }
-    if (mark.action !== "placeholder" && !spanIsPairClosed(list, start, end)) {
-      out.skipped.push(`seq ${lo}-${hi}: the range would split a tool pair; left as is`);
-      continue;
-    }
     if (mark.action === "drop") {
-      list.splice(start, end - start + 1);
-      out.changed = true;
-    } else if (isTurnMiddle) {
+      replace(start, end - start + 1, [], []);
+    } else if (mark.action === "turn_middle" || (typeof mark.reason === "string" && mark.reason.indexOf("turn_middle") === 0)) {
       // Turn-middle redaction (design A.11; Vern #5502/#5503): preserve the span boundaries
       // and every steer (user input) inside; replace the model interior - reasoning, calls,
       // results - with tombstone segments carrying counts and the ledger lookup pointer.
@@ -1036,23 +865,20 @@ function applyLedgerMarks(
         const r = (list[i] as Record<string, unknown> | null)?.role;
         if (r === "user") keep.add(i);
       }
-      // A kept boundary must not keep half of a tool pair whose other half is redacted: a result
-      // whose call goes joins the interior, and a kept call whose result goes becomes text.
-      for (const i of [start, end]) {
-        if (!isToolResult(list[i])) continue;
-        const ids = toolResultCallIds(list[i]);
-        const callKept = [...keep].some((k) => k !== i && toolCallIdsOf(list[k]).some((id) => ids.includes(id)));
-        if (!callKept) keep.delete(i);
-      }
-      const keptResults = new Set<string>();
-      for (const k of keep) for (const id of toolResultCallIds(list[k])) keptResults.add(id);
       let interiorCount = 0;
-      for (let i = start; i <= end; i++) if (!keep.has(i)) interiorCount++;
-      if (interiorCount === 0) {
-        out.skipped.push(`seq ${lo}-${hi}: turn_middle found no interior to redact`);
+      let alreadyRedacted = true;
+      for (let i = start; i <= end; i++) {
+        if (keep.has(i)) continue;
+        interiorCount++;
+        if (!(isAstinusMessage(list[i]) && seqs[i] === null)) alreadyRedacted = false;
+      }
+      if (interiorCount === 0 || alreadyRedacted) {
+        // Idempotence: a carried-forward view already holds this redaction.
+        res.skipped.push(`seq ${lo}-${hi}: turn_middle found no interior to redact`);
         continue;
       }
       const replacements: unknown[] = [];
+      const replacementSeqs: (number | null)[] = [];
       let segStart = -1;
       let segCalls = 0;
       let segReason = 0;
@@ -1062,7 +888,7 @@ function applyLedgerMarks(
         const n = segEnd - segStart + 1;
         replacements.push({
           role: "assistant",
-          timestamp: Date.now(),
+          timestamp: timestampOf(list[segStart]),
           content: [
             {
               type: "text",
@@ -1073,6 +899,7 @@ function applyLedgerMarks(
             },
           ],
         });
+        replacementSeqs.push(null);
         segStart = -1;
         segCalls = 0;
         segReason = 0;
@@ -1083,9 +910,9 @@ function applyLedgerMarks(
           flushSeg(i - 1);
           // Item 3 (2026-11-03): a preserved boundary message still carries its own reasoning
           // and tool-call argument bodies. Marks must be able to reach those, or turn_middle
-          // only trims the messages it already deletes. Pair safety (stack c8caedefc) is
-          // applied to the slimmed result: an unpaired call becomes a text line.
-          replacements.push(withoutUnpairedCalls(slimBlocks(list[i]), keptResults));
+          // only trims the messages it already deletes.
+          replacements.push(slimBlocks(list[i]));
+          replacementSeqs.push(seqs[i]);
           continue;
         }
         if (segStart < 0) segStart = i;
@@ -1096,12 +923,12 @@ function applyLedgerMarks(
         if (Array.isArray(content) && content.some((b: any) => b?.type === "thinking")) segReason++;
       }
       flushSeg(end);
-      list.splice(start, end - start + 1, ...replacements);
-      out.changed = true;
+      replace(start, end - start + 1, replacements, replacementSeqs);
     } else if (mark.action === "digest" && mark.digest) {
       const digestMsg = {
         role: "assistant",
-        timestamp: Date.now(),
+        // Byte-stable: no clock in anything the engine writes, so a rebuilt view reproduces it.
+        timestamp: timestampOf(list[start]),
         content: [
           {
             type: "text",
@@ -1111,8 +938,7 @@ function applyLedgerMarks(
           },
         ],
       };
-      list.splice(start, end - start + 1, digestMsg);
-      out.changed = true;
+      replace(start, end - start + 1, [digestMsg], [null]);
     } else if (mark.action === "placeholder") {
       let placeholdered = false;
       for (let i = start; i <= end; i++) {
@@ -1127,6 +953,10 @@ function applyLedgerMarks(
           continue;
         }
         const c = msg.content;
+        const first = Array.isArray(c) ? (c[0] as Record<string, unknown> | undefined)?.text : c;
+        // Idempotence: a placeholder already in place keeps its bytes (re-measuring it would
+        // write its own length and change the text on every carried-forward request).
+        if (typeof first === "string" && first.startsWith("[tool output pruned by Astinus")) continue;
         const text = typeof c === "string" ? c : JSON.stringify(c ?? "");
         // M1: replace the ELEMENT — never mutate the host's message object in place. The
         // placeholder is a parts array, the same shape as the digest message.
@@ -1141,54 +971,17 @@ function applyLedgerMarks(
         };
         placeholdered = true;
       }
-      if (placeholdered) out.changed = true;
+      if (placeholdered) res.changed = true;
       else {
-        out.skipped.push(`seq ${lo}-${hi}: placeholder found nothing to prune`);
+        res.skipped.push(`seq ${lo}-${hi}: placeholder found nothing to prune`);
         continue;
       }
     } else {
-      out.skipped.push(`seq ${lo}-${hi}: unknown action ${mark.action}`);
+      res.skipped.push(`seq ${lo}-${hi}: unknown action ${mark.action}`);
       continue;
     }
-    if (mark.applied_at == null) out.admitted.push(mark);
+    res.applied.push(mark);
   }
-  out.marksInEffect = admitted.length + out.admitted.length;
-  if (out.admitted.length > 0) lastAdmissionTurn.set(ctx.sessionKey, ctx.turnCounter);
-  if (out.changed) {
-    out.tokensAfter = estimateTokensHost(list);
-    out.messages = list;
-  }
-  return out;
-}
-
-/** True when removing list[start..end] leaves no tool call without its result and no result
- *  without its call: every id the span holds on one side it also holds on the other. */
-function spanIsPairClosed(list: unknown[], start: number, end: number): boolean {
-  const calls = new Set<string>();
-  const results = new Set<string>();
-  for (let i = start; i <= end; i++) {
-    for (const id of toolCallIdsOf(list[i])) calls.add(canonicalId(id));
-    for (const id of toolResultCallIds(list[i])) results.add(canonicalId(id));
-  }
-  if (calls.size !== results.size) return false;
-  for (const id of calls) if (!results.has(id)) return false;
-  return true;
-}
-
-/** A kept turn_middle boundary whose tool-call results are redacted: each such call becomes a
- *  text line, so the view never holds a call without its result. Returns the message itself
- *  when nothing changes (M1: the host's object is never mutated). */
-function withoutUnpairedCalls(msg: unknown, keptResults: Set<string>): unknown {
-  const m = (msg ?? {}) as Record<string, unknown>;
-  if (m.role !== "assistant" || !Array.isArray(m.content)) return msg;
-  let changed = false;
-  const content = (m.content as Array<Record<string, unknown>>).map((b) => {
-    if (!b || typeof b !== "object" || (b.type !== "toolCall" && b.type !== "tool_use")) return b;
-    const id = b.id ?? b.toolCallId;
-    if (typeof id === "string" && keptResults.has(id)) return b;
-    changed = true;
-    const name = typeof b.name === "string" ? b.name : "";
-    return { type: "text", text: `[Astinus: tool call ${name} trimmed with its result]` };
-  });
-  return changed ? { ...m, content } : msg;
+  res.list = list;
+  return res;
 }

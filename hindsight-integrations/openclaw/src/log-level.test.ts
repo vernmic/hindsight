@@ -53,8 +53,8 @@ it("reads the deprecated allowKnowledgeDelete as allowPageDelete's fallback", ()
 
 it("keeps object fields without a top-level default through getPluginConfig", () => {
   // The default sweep above cannot see these: astinusMarks has per-property defaults only, and
-  // it was dropped until 2026-11-03, hard cap included.
-  const marks = { hardCapPressure: 0.8, hardCapTarget: 0.6, minPressure: 0.4 };
+  // it was dropped until 2026-11-03.
+  const marks = { pruneAtPressure: 0.7, pruneToPressure: 0.3 };
   const parsed = getPluginConfig(apiWith({ astinusMarks: marks, promptCapture: true })) as unknown as Record<string, unknown>;
   expect(parsed.astinusMarks).toEqual(marks);
   expect(parsed.promptCapture).toBe(true);
