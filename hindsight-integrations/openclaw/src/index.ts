@@ -2290,6 +2290,8 @@ export function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
         ? config.retainEveryNTurns
         : 1,
     durableTurns: config.durableTurns === true,
+    // Engine-view prompt capture (token-accounting P2): default off.
+    promptCapture: config.promptCapture === true,
     turnMiddleAgeTurns:
       Number.isInteger(config.turnMiddleAgeTurns) && config.turnMiddleAgeTurns! >= 1
         ? config.turnMiddleAgeTurns
@@ -2435,6 +2437,7 @@ export default function (api: MoltbotPluginAPI) {
         turnMiddleAgeTurns: pluginConfig.turnMiddleAgeTurns,
         passProviders: pluginConfig.passProviders,
         retainScope: pluginConfig.retainScope,
+        getPromptCapture: () => lifecycle.config?.promptCapture === true,
       }
     );
 
