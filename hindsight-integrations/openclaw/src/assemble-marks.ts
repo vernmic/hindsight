@@ -736,6 +736,8 @@ export function applyMarks(
           for (const cid of toolCallIdsOf(list[start])) needIds.add(cid);
         } else if (isToolResult(prev) && start - 1 < floor) {
           start--; // absorb an immediately preceding result so it is not orphaned
+          // ...and its call: without its id the next step stops at that call and orphans it.
+          for (const cid of toolResultCallIds(list[start])) needIds.add(cid);
         } else break;
       }
       // P2: forward extension NEVER crosses tailFloor — pruning inside the preserved tail is
@@ -763,6 +765,10 @@ export function applyMarks(
         continue;
       }
     }
+    if (mark.action !== "placeholder" && !spanIsPairClosed(list, start, end)) {
+      out.skipped.push(`seq ${lo}-${hi}: the range would split a tool pair; left as is`);
+      continue;
+    }
     if (mark.action === "drop") {
       list.splice(start, end - start + 1);
       out.changed = true;
@@ -777,6 +783,16 @@ export function applyMarks(
         const r = (list[i] as Record<string, unknown> | null)?.role;
         if (r === "user") keep.add(i);
       }
+      // A kept boundary must not keep half of a tool pair whose other half is redacted: a result
+      // whose call goes joins the interior, and a kept call whose result goes becomes text.
+      for (const i of [start, end]) {
+        if (!isToolResult(list[i])) continue;
+        const ids = toolResultCallIds(list[i]);
+        const callKept = [...keep].some((k) => k !== i && toolCallIdsOf(list[k]).some((id) => ids.includes(id)));
+        if (!callKept) keep.delete(i);
+      }
+      const keptResults = new Set<string>();
+      for (const k of keep) for (const id of toolResultCallIds(list[k])) keptResults.add(id);
       let interiorCount = 0;
       for (let i = start; i <= end; i++) if (!keep.has(i)) interiorCount++;
       if (interiorCount === 0) {
@@ -812,7 +828,7 @@ export function applyMarks(
       for (let i = start; i <= end; i++) {
         if (keep.has(i)) {
           flushSeg(i - 1);
-          replacements.push(list[i]);
+          replacements.push(withoutUnpairedCalls(list[i], keptResults));
           continue;
         }
         if (segStart < 0) segStart = i;
@@ -878,4 +894,36 @@ export function applyMarks(
     out.messages = list;
   }
   return out;
+}
+
+/** True when removing list[start..end] leaves no tool call without its result and no result
+ *  without its call: every id the span holds on one side it also holds on the other. */
+function spanIsPairClosed(list: unknown[], start: number, end: number): boolean {
+  const calls = new Set<string>();
+  const results = new Set<string>();
+  for (let i = start; i <= end; i++) {
+    for (const id of toolCallIdsOf(list[i])) calls.add(canonicalId(id));
+    for (const id of toolResultCallIds(list[i])) results.add(canonicalId(id));
+  }
+  if (calls.size !== results.size) return false;
+  for (const id of calls) if (!results.has(id)) return false;
+  return true;
+}
+
+/** A kept turn_middle boundary whose tool-call results are redacted: each such call becomes a
+ *  text line, so the view never holds a call without its result. Returns the message itself
+ *  when nothing changes (M1: the host's object is never mutated). */
+function withoutUnpairedCalls(msg: unknown, keptResults: Set<string>): unknown {
+  const m = (msg ?? {}) as Record<string, unknown>;
+  if (m.role !== "assistant" || !Array.isArray(m.content)) return msg;
+  let changed = false;
+  const content = (m.content as Array<Record<string, unknown>>).map((b) => {
+    if (!b || typeof b !== "object" || (b.type !== "toolCall" && b.type !== "tool_use")) return b;
+    const id = b.id ?? b.toolCallId;
+    if (typeof id === "string" && keptResults.has(id)) return b;
+    changed = true;
+    const name = typeof b.name === "string" ? b.name : "";
+    return { type: "text", text: `[Astinus: tool call ${name} trimmed with its result]` };
+  });
+  return changed ? { ...m, content } : msg;
 }
