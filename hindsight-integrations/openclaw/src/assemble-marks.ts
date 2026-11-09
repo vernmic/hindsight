@@ -179,7 +179,7 @@ function resolveMarkRange(
  * Replace reasoning and tool-call payloads in one message, keeping its text and identity.
  * Tool-call arguments stay an empty object so the provider still receives valid JSON.
  */
-function slimBlocks(msg: unknown): unknown {
+function slimBlocks(msg: unknown, keptResults?: Set<string>): unknown {
   const m = (msg ?? {}) as Record<string, unknown>;
   if (!Array.isArray(m.content)) return msg;
   let changed = false;
@@ -200,6 +200,12 @@ function slimBlocks(msg: unknown): unknown {
       type === "function_call"
     ) {
       changed = true;
+      const id = b.id ?? b.toolCallId;
+      if (keptResults && !(typeof id === "string" && keptResults.has(id))) {
+        // Its result is redacted with the interior, so the call cannot stay a call.
+        const name = typeof b.name === "string" ? b.name : "";
+        return { type: "text", text: `[Astinus: tool call ${name} trimmed with its result]` };
+      }
       return { ...b, arguments: {}, input: {} };
     }
     return b;
@@ -835,6 +841,8 @@ function applySet(messages: unknown[], marks: LedgerMark[], ctx: ApplyContext): 
           for (const cid of toolCallIdsOf(list[start])) needIds.add(cid);
         } else if (isToolResult(prev) && start - 1 < tailFloor) {
           start--; // absorb an immediately preceding result so it is not orphaned
+          // ...and its call: without its id the next step stops at that call and orphans it.
+          for (const cid of toolResultCallIds(list[start])) needIds.add(cid);
         } else break;
       }
       // P2: forward extension NEVER crosses tailFloor — pruning inside the preserved tail is
@@ -862,6 +870,10 @@ function applySet(messages: unknown[], marks: LedgerMark[], ctx: ApplyContext): 
         continue;
       }
     }
+    if (mark.action !== "placeholder" && !spanIsPairClosed(list, start, end)) {
+      res.skipped.push(`seq ${lo}-${hi}: the range would split a tool pair; left as is`);
+      continue;
+    }
     if (mark.action === "drop") {
       replace(start, end - start + 1, [], []);
     } else if (mark.action === "turn_middle" || (typeof mark.reason === "string" && mark.reason.indexOf("turn_middle") === 0)) {
@@ -875,6 +887,16 @@ function applySet(messages: unknown[], marks: LedgerMark[], ctx: ApplyContext): 
         const r = (list[i] as Record<string, unknown> | null)?.role;
         if (r === "user") keep.add(i);
       }
+      // A kept boundary must not keep half of a tool pair whose other half is redacted: a result
+      // whose call goes joins the interior, and a kept call whose result goes becomes text.
+      for (const i of [start, end]) {
+        if (!isToolResult(list[i])) continue;
+        const ids = toolResultCallIds(list[i]);
+        const callKept = [...keep].some((k) => k !== i && toolCallIdsOf(list[k]).some((id) => ids.includes(id)));
+        if (!callKept) keep.delete(i);
+      }
+      const keptResults = new Set<string>();
+      for (const k of keep) for (const id of toolResultCallIds(list[k])) keptResults.add(id);
       let interiorCount = 0;
       let alreadyRedacted = true;
       for (let i = start; i <= end; i++) {
@@ -921,7 +943,7 @@ function applySet(messages: unknown[], marks: LedgerMark[], ctx: ApplyContext): 
           // Item 3 (2026-11-03): a preserved boundary message still carries its own reasoning
           // and tool-call argument bodies. Marks must be able to reach those, or turn_middle
           // only trims the messages it already deletes.
-          replacements.push(slimBlocks(list[i]));
+          replacements.push(slimBlocks(list[i], keptResults));
           replacementSeqs.push(seqs[i]);
           continue;
         }
@@ -994,4 +1016,18 @@ function applySet(messages: unknown[], marks: LedgerMark[], ctx: ApplyContext): 
   }
   res.list = list;
   return res;
+}
+
+/** True when removing list[start..end] leaves no tool call without its result and no result
+ *  without its call: every id the span holds on one side it also holds on the other. */
+function spanIsPairClosed(list: unknown[], start: number, end: number): boolean {
+  const calls = new Set<string>();
+  const results = new Set<string>();
+  for (let i = start; i <= end; i++) {
+    for (const id of toolCallIdsOf(list[i])) calls.add(canonicalId(id));
+    for (const id of toolResultCallIds(list[i])) results.add(canonicalId(id));
+  }
+  if (calls.size !== results.size) return false;
+  for (const id of calls) if (!results.has(id)) return false;
+  return true;
 }
