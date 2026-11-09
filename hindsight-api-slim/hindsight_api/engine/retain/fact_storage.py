@@ -493,6 +493,21 @@ async def sync_document_attachments(
         )
 
 
+
+def _retain_preserve_prefixes() -> list[str]:
+    """Configured tag prefixes a document-level tags write must not strip (opt-in).
+
+    retain_preserve_tag_prefixes (env HINDSIGHT_API_RETAIN_PRESERVE_TAG_PREFIXES)
+    defaults to None - feature off, in which case every statement and tag merge in this
+    module stays byte-identical to stock and the consolidation module's deferred import
+    of this accessor agrees with the write path on parsing and the off/empty default.
+    """
+    from ...config import _get_raw_config  # noqa: PLC0415
+
+    prefixes = getattr(_get_raw_config(), "retain_preserve_tag_prefixes", None)
+    if not prefixes:
+        return []
+    return [str(p) for p in prefixes if str(p)]
 def protected_tags(tags: list[str] | None, prefixes: list[str] | None) -> list[str]:
     """The tags in ``tags`` that start with one of ``prefixes`` (``retain_preserve_tag_prefixes``).
 
