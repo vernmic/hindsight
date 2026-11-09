@@ -1,3 +1,5 @@
+import json
+
 from conftest import FakeClient
 
 
@@ -16,7 +18,7 @@ def test_legacy_count_cap_and_uncapped_mode(provider):
 def test_saved_bridge_is_snapshotted_and_cleared_on_session_switch(provider):
     instance, fake = provider({"bank_id": "hermes-ops"})
     instance._previous_retained_turn = "Nimbus option: three parcel comparisons."
-    instance._session_turns = ["This option remains deferred."]
+    instance._session_turns = [json.dumps([{"role": "user", "content": "This option remains deferred."}])]
     job = instance._make_turn_retain_job(
         list(instance._session_turns), document_id="old", update_mode="append", label="test", track_ops=False
     )
@@ -25,7 +27,7 @@ def test_saved_bridge_is_snapshotted_and_cleared_on_session_switch(provider):
     assert "Nimbus option" in fake.retains[-1]["items"][0]["context"]
     instance._session_turns = []
     instance.on_session_switch("next-session")
-    instance._session_turns = ["An unrelated new claim."]
+    instance._session_turns = [json.dumps([{"role": "user", "content": "An unrelated new claim."}])]
     instance._make_turn_retain_job(
         list(instance._session_turns), document_id="new", update_mode="append", label="test", track_ops=False
     )()
