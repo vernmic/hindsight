@@ -4218,27 +4218,20 @@ async def _protected_prefix_tags_of_sources(
 
     Keeps only entries starting with one of ``prefixes`` so a keeper inherits the protection
     tier without vacuuming up unrelated tags its sources happen to carry. Deterministic: the
-    caller's source order first, then each row's own tag order, deduplicated. A SQL store reads
+    caller's source order first, then each row's own tag order, deduplicated. Both SQL-backed and store-owned backends answer through the store get_memories API (#4969).
     ``memory_units``; a store that owns its rows answers through ``get_memories``.
     """
     if not source_memory_ids or not prefixes:
         return []
     tags_by_id: dict[str, list[str]] = {}
     store = get_memories()
-    if not store.store_owned_for(bank_id):
-        rows = await conn.fetch(
-            f"SELECT id, tags FROM {fq_table('memory_units')} WHERE id = ANY($1::uuid[]) AND bank_id = $2",
-            source_memory_ids,
-            bank_id,
-        )
-        for row in rows:
-            tags_by_id[str(row["id"])] = list(row["tags"] or [])
-    else:
-        present = await store.get_memories(
-            conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[str(mid) for mid in source_memory_ids]
-        )
-        for memory in present:
-            tags_by_id[str(memory.unit_id)] = list(memory.tags or [])
+    # #4969: engine modules read memory_units through the store API, never raw SQL;
+    # the same get_memories call answers SQL-backed and store-owned backends alike.
+    present = await store.get_memories(
+        conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[str(mid) for mid in source_memory_ids]
+    )
+    for memory in present:
+        tags_by_id[str(memory.unit_id)] = list(memory.tags or [])
     out: list[str] = []
     seen: set[str] = set()
     for mid in source_memory_ids:
