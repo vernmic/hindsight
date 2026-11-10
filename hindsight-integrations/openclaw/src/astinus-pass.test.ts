@@ -339,7 +339,7 @@ describe("package 31: incarnation attribution and terminal reservations", () => 
     expect(rows.every((r) => r.finished_at !== null)).toBe(true);
   });
 
-  it("gate: proposals below 0.40 are discarded by code, not by the model (turn-203 case)", async () => {
+  it("gate: proposals below 0.40, and with unknown pressure, are discarded by code", async () => {
     const { payload, ledger } = setup(3);
     const fetchMock = vi.fn(async () =>
       answer({
@@ -349,7 +349,7 @@ describe("package 31: incarnation attribution and terminal reservations", () => 
         marks: [{ range: [1, 3], action: "placeholder", digest: null, reason: "below gate" }],
       })
     );
-    // 386/1000 = 0.386: the pressure that produced 26 marks in production parity.
+    // 386/1000 = 0.386, below the 0.40 gate.
     expect(
       await runPass(
         { ...payload, view_tokens: 386, token_budget: 1000, providers, turn_middle_age_turns: 99 },
@@ -360,5 +360,21 @@ describe("package 31: incarnation attribution and terminal reservations", () => 
     const row = db.prepare("SELECT count(*) AS c FROM marks").get() as { c: number };
     db.close();
     expect(row.c).toBe(0);
+
+    // Unknown pressure is conservative: no proposals either.
+    const second = setup(3);
+    const fetchMock2 = vi.fn(async () =>
+      answer({ class: "topic", topics: [], supersessions: [], marks: [{ range: [1, 3], action: "placeholder" }] })
+    );
+    expect(
+      await runPass(
+        { ...second.payload, view_tokens: undefined as never, token_budget: undefined as never, providers, turn_middle_age_turns: 99 },
+        { fetch: fetchMock2 as never }
+      )
+    ).toBe("ok");
+    const db2 = second.ledger();
+    const row2 = db2.prepare("SELECT count(*) AS c FROM marks").get() as { c: number };
+    db2.close();
+    expect(row2.c).toBe(0);
   });
 });
