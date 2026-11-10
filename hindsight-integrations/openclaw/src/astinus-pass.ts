@@ -72,16 +72,18 @@ Rules, in order:
    - action "digest" replaces the range with the one-line \`digest\` you write (it must stand
      alone); "drop" removes it; "placeholder" is ONLY for tool-result bodies (keep the call).
    - never mark the newest turn's own messages. Editing the current turn is not your job.
-   - grade by the PRESSURE line: propose NOTHING below 0.30.
-   - 0.30 and up: \`placeholder\` marks for the largest tool-result ranges listed as candidates
-     outside the tail.
-   - 0.45 and up: also \`digest\` marks for whole dormant-topic segments (a topic whose
-     last_seen_seq is far behind the live end).
-   - 0.65 and up: everything the two clocks allow.
+   - grade by the PRESSURE line: propose NOTHING below 0.40. The engine prunes at 0.60, so the
+     pool must already exist when it fires; from 0.40 on, keep proposing.
+   - RANK by topic dormancy FIRST, then one-off evidence: single-statement topics, turns with no
+     follow-up, incidental tool traffic. Recency only breaks ties. Oldest is not best.
+   - 0.40 and up: \`placeholder\` marks for the largest tool-result ranges outside the tail, and
+     \`digest\` marks for random-class turns (a one-off answered once is worth nothing later).
+   - 0.55 and up: also whole dormant-topic segments (a topic whose last_seen_seq is far behind
+     the live end).
+   - each prune cuts the view to 0.25; the pool is what it chooses from, so an idle mark costs
+     nothing until then.
    - NEVER propose a range that intersects the preserved tail - the prompt states its first seq.
      A mark inside it cannot apply for eight turns and only pads the pool.
-   - BATCH SIZE: propose enough ranges that their token weight covers (pressure - 0.25) x the
-     view tokens; that is what keeps the pending pool ahead of the window.
 4. SUPERSESSIONS. When this turn asserts a different reality for an existing
    (entity, attribute) - a version, pid, port, count, path, model id - record it, naming the
    old and new values.
