@@ -3242,6 +3242,7 @@ async def _process_memory_batch(
                             memory_engine=memory_engine,
                             bank_id=bank_id,
                             prepared=prepared_create,
+                            config=config,
                             perf=perf,
                         )
                         # Count a memory as created only when an observation was actually written (the
@@ -3567,6 +3568,7 @@ async def _apply_create_action(
     memory_engine: "MemoryEngine",
     bank_id: str,
     prepared: "_PreparedCreate",
+    config: Any = None,
     perf: ConsolidationPerfLog | None = None,
 ) -> str:
     """
@@ -3589,6 +3591,7 @@ async def _apply_create_action(
         occurred_start=prepared.agg.occurred_start,
         occurred_end=prepared.agg.occurred_end,
         mentioned_at=prepared.agg.mentioned_at,
+        config=config,
         perf=perf,
     )
     # Map the new observation onto the consolidation trace as a produced memory.
@@ -4195,19 +4198,6 @@ async def _consolidate_batch_with_llm(
     )
 
 
-def _protected_retain_prefixes() -> list[str]:
-    """Protected tag prefixes a derivation keeper must carry over from its sources (T-117 fix A).
-
-    Reads the retain-side gate (env ``HINDSIGHT_API_RETAIN_PRESERVE_TAG_PREFIXES``) through the
-    same accessor the document-tags write path uses, so both readers of "protected prefixes"
-    agree on parsing and on the off/empty default. Deferred import: the retain pipeline pulls in
-    engines this module already depends on, so a module-level import would close a cycle.
-    """
-    from ..retain.fact_storage import _retain_preserve_prefixes  # noqa: PLC0415
-
-    return _retain_preserve_prefixes()
-
-
 async def _protected_prefix_tags_of_sources(
     conn: "Connection",
     bank_id: str,
@@ -4256,6 +4246,7 @@ async def _apply_create_observation(
     occurred_start: datetime | None = None,
     occurred_end: datetime | None = None,
     mentioned_at: datetime | None = None,
+    config: Any = None,
     perf: ConsolidationPerfLog | None = None,
 ) -> dict[str, Any]:
     """Insert one observation from pre-embedded text.
@@ -4298,7 +4289,9 @@ async def _apply_create_observation(
     # unrelated source tag stays on its own row). Gated on
     # HINDSIGHT_API_RETAIN_PRESERVE_TAG_PREFIXES: gate off/empty issues no read and leaves the tag
     # list exactly as the caller passed it.
-    preserve_prefixes = _protected_retain_prefixes()
+    # The bank's effective config is resolved by the consolidation pass; never the
+    # process-global raw accessor (R2).
+    preserve_prefixes = getattr(config, "retain_preserve_tag_prefixes", None)
     if preserve_prefixes:
         inherited_tags = await _protected_prefix_tags_of_sources(
             conn, bank_id, source_memory_ids, preserve_prefixes
