@@ -20,10 +20,19 @@ its siblings or to genuinely new facts corrupts maintenance protection and filte
    unit's text takes that unit's tags (several identical old units: only when they agree).
 2. **Genuinely new text**: a unit extracted from a chunk that lies wholly after the pre-append
    text keeps the request's tags only.
-3. **Similar text**: otherwise the old unit with the best word overlap (Jaccard >= 0.5) gives
-   its tags. Candidates are the old units of the overlapping old chunk(s) when positions are
-   known, else every old unit (e.g. a JSON-array merge whose body is not a plain prefix
-   extension). A tie between old units with different tags is ambiguous: no carry.
+3. **Appended provenance**: a unit whose own text occurs verbatim only in the appended
+   region of the new body keeps the request's tags only, even when its chunk also holds
+   old text.
+4. **Straddling chunks**: when a chunk spans the pre-append/appended boundary, a unit
+   that is not an exact old text gets no carry; provenance is ambiguous and uncertainty
+   must not transfer another unit's tags.
+5. **Unknown positions**: when the new body does not extend the stored one verbatim
+   (e.g. a JSON-array merge), only exact text carries. There is no global similarity
+   fallback.
+6. **Similar text**: only for a chunk wholly inside the pre-append region (all of its
+   text predates the append) may the best word overlap (Jaccard >= 0.5) give the old
+   unit's tags; ties between differently tagged units carry nothing.
+7. **Anything else** keeps the request's tags only.
 4. **Anything else** keeps the request's tags only.
 
 Inherited tags exclude entity-label projections (``label_tag_keys``): those are derived from
@@ -128,12 +137,18 @@ class AppendTagCarry:
         new_spans: list[tuple[int, int] | None] | None,
         snapshot: OldDocumentSnapshot,
         label_tag_keys: set[str] | None = None,
+        combined_text: str | None = None,
     ) -> None:
         from .entity_labels import split_label_tags
 
         self._split_labels = lambda tags: split_label_tags(list(tags), label_tag_keys)
         self._units = snapshot.units
         self._base_len = len(base_text)
+        # Normalised bodies for fact-level append provenance (empty when the new body is
+        # not a verbatim extension of the stored one).
+        self._base_norm = _norm(base_text)
+        combined_norm = _norm(combined_text) if combined_text else ""
+        self._combined_norm = combined_norm if combined_norm.startswith(self._base_norm) else ""
         # None: positions unusable (the new body does not extend the stored one verbatim).
         self._new_spans = new_spans or []
         ordered = sorted(snapshot.chunks.items())
@@ -181,8 +196,26 @@ class AppendTagCarry:
         first = set(self._inheritable(units[:1]))
         return list(units) if all(set(self._inheritable([u])) == first for u in units[1:]) else []
 
+    def _fact_region(self, fact_text: str) -> str:
+        """Where this unit's own text occurs in the new body: base, appended, both, unknown."""
+        fact = _norm(fact_text)
+        if not fact or not self._combined_norm:
+            return "unknown"
+        first = self._combined_norm.find(fact)
+        if first < 0:
+            return "unknown"
+        last = self._combined_norm.rfind(fact)
+        base_len = len(self._base_norm)
+        first_in_base = first < base_len
+        last_in_base = last < base_len
+        if first_in_base and last_in_base:
+            return "base"
+        if not first_in_base and not last_in_base:
+            return "appended"
+        return "both"
+
     def _match(self, fact_text: str, chunk_position: int | None, current: list[str]):
-        """``(tags, matched old units)`` for one re-extracted unit (rules 1-4)."""
+        """The tags for one re-extracted unit (rules 1-7), plus the matched old units."""
         own_labels = self._split_labels(current)
         span = None
         if chunk_position is not None and 0 <= chunk_position < len(self._new_spans):
@@ -190,9 +223,17 @@ class AppendTagCarry:
 
         hit = self._agreed(self._by_text.get(_norm(fact_text)) or [])
         if not hit:
-            if span is not None and span[0] >= self._base_len:
+            region = self._fact_region(fact_text)
+            if region in {"appended", "both"}:
+                return current, []  # provably, or ambiguously, from the appended text
+            if span is None:
+                return current, []  # positions unusable: identity is unavailable
+            if span[0] >= self._base_len:
                 return current, []  # genuinely new text
-            candidates = self._candidates(span) if span is not None else list(self._units)
+            if span[1] > self._base_len:
+                return current, []  # straddles the append boundary: ambiguous provenance
+            # Only a chunk wholly inside the pre-append region may use similarity.
+            candidates = self._candidates(span)
             hit = self._agreed(self._best(fact_text, candidates))
         if not hit:
             return current, []

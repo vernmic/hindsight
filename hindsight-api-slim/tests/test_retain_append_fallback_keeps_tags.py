@@ -23,6 +23,8 @@ import pytest
 
 from hindsight_api.engine.providers.mock_llm import MockLLM
 
+from tests.ml_independent_fixtures import cross_encoder, embeddings  # noqa: F401
+
 
 @pytest.fixture(scope="session")
 def db_url():
@@ -33,15 +35,17 @@ def db_url():
 @pytest.fixture(autouse=True)
 def one_fact_per_chunk(monkeypatch):
     def _facts(messages):
-        user_text = ""
-        for m in messages:
-            if m.get("role") == "user":
-                user_text = m.get("content", "")
-                break
+        user_text = "\n".join(
+            m.get("content", "") for m in messages if m.get("role") == "user"
+        )
+        found = [s for s in (_A, _B, _C, _D) if s in user_text]
+        if not found:
+            lines = [line.strip() for line in user_text.splitlines() if line.strip()]
+            found = [lines[-1][-300:]] if lines else []
         return {
             "facts": [
                 {
-                    "what": f"Fact about {user_text[-40:]}",
+                    "what": s,
                     "when": "N/A",
                     "where": "N/A",
                     "who": "N/A",
@@ -49,6 +53,7 @@ def one_fact_per_chunk(monkeypatch):
                     "fact_kind": "conversation",
                     "fact_type": "world",
                 }
+                for s in found
             ]
         }
 
@@ -140,5 +145,79 @@ async def test_append_fallback_keeps_old_unit_tags(memory, request_context, how)
             if row["chunk"].strip() == _D:
                 assert row["tags"] == {"topic:three"}, (uid, row)
         assert old_text  # keep the snapshot readable in failure output
+    finally:
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+
+async def _by_text(memory, bank_id, doc):
+    async with memory._pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT text, tags FROM memory_units WHERE bank_id = $1 AND document_id = $2 "
+            "AND fact_type IN ('world', 'experience')",
+            bank_id,
+            doc,
+        )
+    return {r["text"]: set(r["tags"] or []) for r in rows}
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(600)
+async def test_append_negation_in_straddling_chunk_keeps_request_tags(memory, request_context, monkeypatch):
+    """R1 counterprobe through the production append/fallback boundary.
+
+    The old approval and the appended negation are extracted verbatim from ONE rebalanced
+    chunk. The old fact keeps its classification; the newly appended negation must keep
+    only the append request's tags.
+    """
+    base = "Alice approved Project Atlas."
+    added = "Alice never approved Project Atlas."
+
+    def _facts(messages):
+        text = "\n".join(m.get("content", "") for m in messages if m.get("role") == "user")
+        return {
+            "facts": [
+                {
+                    "what": s,
+                    "when": "N/A",
+                    "where": "N/A",
+                    "who": "N/A",
+                    "why": "N/A",
+                    "fact_kind": "conversation",
+                    "fact_type": "world",
+                }
+                for s in (base, added)
+                if s in text
+            ]
+        }
+
+    monkeypatch.setattr(MockLLM, "_build_mock_facts", staticmethod(_facts))
+    bank_id = f"test_append_negation_{datetime.now(timezone.utc).timestamp()}"
+    doc = "fx-negation-doc"
+    try:
+        await memory._ensure_bank_exists(bank_id, request_context)
+        await memory._config_resolver.update_bank_config(bank_id, {"retain_chunk_size": 400})
+        await _retain(memory, bank_id, request_context, content=base, document_id=doc, tags=["topic:one"])
+        old = await _by_text(memory, bank_id, doc)
+        assert old == {base: {"topic:one"}}, old
+        async with memory._pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE memory_units SET tags = tags || $2::varchar[] WHERE bank_id = $1 AND text = $3",
+                bank_id,
+                ["decision:approved", "retain:permanent"],
+                base,
+            )
+        await _retain(
+            memory,
+            bank_id,
+            request_context,
+            content=added,
+            document_id=doc,
+            tags=["request:new"],
+            update_mode="append",
+            force_reextract=True,
+        )
+        after = await _by_text(memory, bank_id, doc)
+        assert after.get(base) == {"decision:approved", "retain:permanent", "topic:one"}, after
+        assert after.get(added) == {"request:new"}, after
     finally:
         await memory.delete_bank(bank_id, request_context=request_context)
