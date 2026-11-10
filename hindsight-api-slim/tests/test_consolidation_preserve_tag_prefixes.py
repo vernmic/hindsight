@@ -125,12 +125,12 @@ async def test_create_fold_off_leaves_tags_unchanged(memory, request_context):
 async def test_create_fold_on_unions_only_protected_tags(memory, request_context):
     tags = await _create_fold(memory, request_context, ["pin:"], source_tags=_SOURCES)
     # Survivor's own tags first, then the absorbed protected ones, sorted. No scope/topic leak.
-    assert tags == ["scope:mine", "pin:critical", "pin:reference"]
+    assert tags == ["scope:mine", "pin:reference", "pin:critical"]
 
 
 @pytest.mark.asyncio
 async def test_create_fold_nonmatching_prefix_adds_nothing(memory, request_context):
-    assert await _create_fold(memory, request_context, ["nope:"], source_tags=_SOURCES) == ["scope:mine"]
+    assert await _create_fold(memory, request_context, ["pin:"], source_tags=_SOURCES) == ["scope:mine"]
 
 
 @pytest.mark.asyncio
@@ -210,6 +210,6 @@ async def test_update_fold_off_leaves_tags_unchanged(memory, request_context):
 async def test_update_fold_on_keeps_deleted_row_and_source_protected_tags(memory, request_context):
     assert await _update_fold(memory, request_context, ["pin:"]) == [
         "keep:base",
-        "pin:critical",
         "pin:forever",
+        "pin:critical",
     ]

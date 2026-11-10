@@ -608,20 +608,24 @@ async def update_memory_units_metadata_and_tags(
         Number of memory units updated.
     """
     from ..memories import get_memories
+    from .entity_labels import carried_label_tags
 
     def _tags_for(existing: list[str] | None) -> list[str]:
-        """The document tags, plus this unit's OWN protected tags when the gate is on.
+        """The document tags, plus the label projection this unit already carries.
 
-        On an append, the unit's own tags, untouched. With the gate off the write is an
-        exact replace: no tag the write did not send survives. The label projection is not
-        carried here -- it belongs to the extraction path, and carrying it (ungated) made
-        every non-append write a union that leaked "label:one" onto survivors."""
+        On an append, the unit's own tags, untouched."""
         if append:
             return list(existing or [])
         merged = list(tags or [])
-        if not [p for p in (preserve_tag_prefixes or []) if p]:
-            return merged
-        return _union_tags(merged, protected_tags(existing, preserve_tag_prefixes))
+        seen = set(merged)
+        for t in [
+            *carried_label_tags(existing, label_tag_keys, previous_document_tags),
+            *protected_tags(existing, preserve_tag_prefixes),
+        ]:
+            if t not in seen:
+                seen.add(t)
+                merged.append(t)
+        return merged
 
     store = get_memories()
     # The survivors' tags, metadata and scoping, written by whichever store holds them. It
