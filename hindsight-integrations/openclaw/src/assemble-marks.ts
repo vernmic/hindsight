@@ -459,7 +459,17 @@ export class SeqIndex {
         try {
           json = decodeTranscriptEventJson(r);
         } catch {
-          continue; // an undecodable row cannot carry usage; the next one may
+          // The host contract always records event_utf8_bytes, but an older compressed row
+          // may not. The anchor path tolerates that (no length check) or skips the row.
+          const bytes = (r as { event_zstd?: unknown }).event_zstd;
+          const zstd = (zlib as unknown as { zstdDecompressSync?: (b: Uint8Array) => Buffer })
+            .zstdDecompressSync;
+          if (!(bytes instanceof Uint8Array) || typeof zstd !== "function") continue;
+          try {
+            json = zstd.call(zlib, bytes).toString("utf8");
+          } catch {
+            continue; // an undecodable row cannot carry usage; the next one may
+          }
         }
         const usage = usageFromEvent({ seq: Number(r.seq), eventJson: json });
         if (usage) return usage;
