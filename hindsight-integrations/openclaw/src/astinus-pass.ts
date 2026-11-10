@@ -84,6 +84,8 @@ Rules, in order:
      nothing until then.
    - NEVER propose a range that intersects the preserved tail - the prompt states its first seq.
      A mark inside it cannot apply for eight turns and only pads the pool.
+   - BATCH SIZE: propose enough ranges that their token weight covers (pressure - 0.25) x the
+     view tokens; that is what keeps the pending pool ahead of the window.
 4. SUPERSESSIONS. When this turn asserts a different reality for an existing
    (entity, attribute) - a version, pid, port, count, path, model id - record it, naming the
    old and new values.
