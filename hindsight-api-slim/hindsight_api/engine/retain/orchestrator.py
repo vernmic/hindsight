@@ -2204,11 +2204,12 @@ async def retain_batch(
     all_pre_chunks: list[str] = []
     chunk_to_content: list[int] = []  # maps chunk index -> index into contents
     from .append_tag_carry import append_chunk_regions
-
     for content_idx, content in enumerate(contents):
-        # Streamed: iter_chunks yields one chunk at a time. An append body is split at
-        # the stored-text boundary first, so no chunk straddles the append point and
-        # an old tail fact keeps its provenance while the appended text stays new.
+        # Streamed, not materialised per content: `iter_chunks` yields each chunk as it is
+        # cut, so the peak here is one chunk rather than the intermediate splits an eager
+        # chunker builds for the whole body (a 45 MB one cost ~130 MB live before #3756).
+        # An append body is split at the stored-text boundary first, so no chunk straddles
+        # the append point; the old tail keeps its provenance while the new text stays new.
         for region in append_chunk_regions(content.content, append_base_text):
             for chunk in fact_extraction.iter_chunks(
                 region,
@@ -2218,6 +2219,14 @@ async def retain_batch(
             ):
                 all_pre_chunks.append(chunk)
                 chunk_to_content.append(content_idx)
+
+    # Memory: after chunking, the original content bodies in RetainContent are
+    # no longer needed (all_pre_chunks holds the working set). Clear them so
+    # Python can reclaim the (potentially multi-MB) strings.
+    # Note: contents_dicts["content"] is still needed briefly for hash computation
+    # inside _streaming_retain_batch, but gets cleared there after use.
+    for content in contents:
+        content.content = ""
 
     total_pre_chunks = len(all_pre_chunks)
     num_batches = (total_pre_chunks + chunk_batch_size - 1) // chunk_batch_size if total_pre_chunks > 0 else 1
@@ -4916,13 +4925,22 @@ def _build_contents(
 def _chunk_contents_for_delta(
     contents: list[RetainContent], config, append_base_text: str | None = None
 ) -> dict[int, str]:
-    """Chunk contents the same way the streaming path does.
+    """
+    Chunk contents the same way the streaming path does, returning a map of
+    global_chunk_index -> chunk_text.
 
-    The append boundary split is shared with the streaming path, so both sides of a
-    delta plan derive the same chunk boundaries.
+    Must read chunk_size/structured_chunk_size off the same resolved ``config``
+    the streaming path uses, so chunk boundaries match and delta can detect
+    unchanged chunks. Two earlier incidents came from this drifting: a 120000
+    default made all chunks appear changed on retry, and a getattr default
+    silently swapped a bank's resolved size for the global one.
+
+    A verbatim-prefix append is split at the stored-text boundary first, so the
+    delta plan derives the same chunk boundaries as the streaming path.
     """
     result = {}
     global_chunk_idx = 0
+    # Same resolved-config invariant as the streaming path — see the note there.
     chunk_size = config.retain_chunk_size
     structured_chunk_size = config.retain_structured_chunk_size
     from .append_tag_carry import append_chunk_regions
