@@ -1,4 +1,4 @@
-"""Pure unit tests for the append fallback tag mapping (``retain.append_tag_carry``)."""
+"""Pure unit tests for the append fallback tag mapping (retain.append_tag_carry)."""
 
 from hindsight_api.engine.retain.append_tag_carry import (
     AppendTagCarry,
@@ -18,6 +18,7 @@ def _carry(units, chunks, new_chunks, base=BASE, combined=NEW, labels=None):
         new_spans=new_chunk_spans(base, combined, new_chunks),
         snapshot=OldDocumentSnapshot(units=units, chunks=chunks),
         label_tag_keys=labels,
+        combined_text=combined,
     )
 
 
@@ -71,6 +72,28 @@ def test_straddling_chunk_without_match_keeps_request_tags_only():
     assert c.tags_for("Gamma ships", 1, []) == []
 
 
+def test_straddling_chunk_does_not_carry_old_tags_to_appended_fact():
+    """Review counterprobe: a negation appended into one rebalanced chunk is new text."""
+    base = "Alice approved Project Atlas."
+    added = "Alice never approved Project Atlas."
+    combined = base + "\n" + added
+    unit = OldUnit(base, "world", ("decision:approved", "retain:permanent"), 0)
+    c = _carry([unit], {0: base}, [combined], base=base, combined=combined)
+    assert c.tags_for(base, 0, ["request:new"]) == ["decision:approved", "retain:permanent"]
+    assert c.tags_for(added, 0, ["request:new"]) == ["request:new"]
+    assert c.tags_for(added, 0, []) == []
+
+
+def test_separate_new_chunk_control_keeps_request_tags():
+    base = "Alice approved Project Atlas."
+    added = "Alice never approved Project Atlas."
+    combined = base + "\n" + added
+    unit = OldUnit(base, "world", ("decision:approved",), 0)
+    c = _carry([unit], {0: base}, [base, added], base=base, combined=combined)
+    assert c.tags_for(base, 0, ["request:new"]) == ["decision:approved"]
+    assert c.tags_for(added, 1, ["request:new"]) == ["request:new"]
+
+
 def test_label_tags_are_not_inherited():
     u = OldUnit("Alpha team uses Redis for caching", "world", ("topic:one", "person:alice"), 0)
     c = _carry([u], OLD_CHUNKS, [BASE, "Gamma team ships Friday."], labels={"person"})
@@ -80,12 +103,11 @@ def test_label_tags_are_not_inherited():
     }
 
 
-def test_unknown_positions_fall_back_to_text_similarity():
+def test_unknown_positions_do_not_carry_ambiguous_tags():
+    """When the body is not a verbatim extension, only exact text carries (R1)."""
     c = _carry([U0, U1], OLD_CHUNKS, ["x"], combined='[{"different": "body"}]')
-    assert set(c.tags_for("Beta team uses Postgres for its reports", 0, ["topic:new"])) == {
-        "topic:one",
-        "kind:decision",
-    }
+    assert c.tags_for("Beta team uses Postgres for its reports", 0, ["topic:new"]) == ["topic:new"]
+    assert c.tags_for("Beta team uses Postgres for reports", 0, ["topic:new"]) == ["topic:one", "kind:decision"]
     assert c.tags_for("unrelated", 0, ["topic:new"]) == ["topic:new"]
     assert c.tags_for("unrelated", 0, []) == []
 
@@ -133,10 +155,13 @@ import pytest  # noqa: E402
     ids=["different_tags", "empty_tags", "omitted_tags"],
 )
 def test_hermes_json_append_new_facts_get_only_request_tags(request_tags):
+    base = '[{"role": "user", "content": "A"}]'
+    combined = '[{"role": "user", "content": "A"}, {}]'
     c = AppendTagCarry(
-        base_text='[{"role": "user", "content": "A"}]',
-        new_spans=new_chunk_spans('[{"role": "user", "content": "A"}]', '[{"role": "user", "content": "A"}, {}]', ["x"]),
+        base_text=base,
+        new_spans=new_chunk_spans(base, combined, ["x"]),
         snapshot=OldDocumentSnapshot(units=[_HA, _HB], chunks={0: "x"}),
+        combined_text=combined,
     )
     current = list(request_tags or [])
     out = c.assign([(_HA.text, 0, current), (_HB.text, 0, current)] + [(f, 0, current) for f in _NEW_FACTS])

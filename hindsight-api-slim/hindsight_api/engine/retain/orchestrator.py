@@ -2927,6 +2927,7 @@ async def _streaming_retain_batch(
             base_text=append_base_text,
             new_spans=append_new_spans,
             snapshot=snapshot,
+            combined_text=combined_content or "",
             label_tag_keys=label_tag_keys(getattr(config, "entity_labels", None)),
         )
         if snapshot.units:
