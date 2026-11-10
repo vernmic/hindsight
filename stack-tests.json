@@ -1,0 +1,882 @@
+{
+ "base": "85ab32ebe",
+ "keyed_by": "subject+patch-id",
+ "commits": [
+  {
+   "key": "fix(retain): preserve each surviving memory's tags on append",
+   "patch_id": "af9d28c6ec6a6320e2cedda31165d5c596a1e67c",
+   "files": [
+    "hindsight-api-slim/hindsight_api/engine/retain/fact_storage.py",
+    "hindsight-api-slim/hindsight_api/engine/retain/orchestrator.py",
+    "hindsight-api-slim/tests/test_retain_append_preserves_unit_tags.py"
+   ],
+   "tests": [
+    "hindsight-api-slim/tests/test_retain_append_preserves_unit_tags.py"
+   ]
+  },
+  {
+   "key": "feat(config): consolidation/retain preserve-tag-prefix settings",
+   "patch_id": "ed1b6f098aacdb186a355ccd2fcc3d5fde9b49f1",
+   "files": [
+    "hindsight-api-slim/hindsight_api/config.py",
+    "hindsight-api-slim/hindsight_api/config_resolver.py",
+    "hindsight-api-slim/hindsight_api/engine/bank_templates.py",
+    "hindsight-api-slim/tests/test_bank_config_value_types.py",
+    "hindsight-api-slim/tests/test_bank_template_full_roundtrip.py",
+    "hindsight-api-slim/tests/test_hierarchical_config.py"
+   ],
+   "tests": [
+    "hindsight-api-slim/tests/test_bank_config_value_types.py",
+    "hindsight-api-slim/tests/test_bank_template_full_roundtrip.py",
+    "hindsight-api-slim/tests/test_hierarchical_config.py"
+   ]
+  },
+  {
+   "key": "feat(retain): bank-gated retain_preserve_tag_prefixes",
+   "patch_id": "aa27c93baa90c56c259202f17af00639f6f6fe9c",
+   "files": [
+    "hindsight-api-slim/hindsight_api/engine/memories/base.py",
+    "hindsight-api-slim/hindsight_api/engine/memories/pg/retain.py",
+    "hindsight-api-slim/hindsight_api/engine/memories/postgres.py",
+    "hindsight-api-slim/hindsight_api/engine/retain/fact_storage.py",
+    "hindsight-api-slim/hindsight_api/engine/retain/orchestrator.py",
+    "hindsight-api-slim/tests/test_retain_preserve_tag_prefixes.py"
+   ],
+   "tests": [
+    "hindsight-api-slim/tests/test_retain_preserve_tag_prefixes.py"
+   ]
+  },
+  {
+   "key": "feat(consolidation): bank-gated consolidation_preserve_tag_prefixes on dedup folds",
+   "patch_id": "1519d07a7e3b634439dafcabcf56f57e11cc70cb",
+   "files": [
+    "hindsight-api-slim/hindsight_api/engine/consolidation/consolidator.py",
+    "hindsight-api-slim/hindsight_api/engine/memories/base.py",
+    "hindsight-api-slim/hindsight_api/engine/memories/pg/consolidation.py",
+    "hindsight-api-slim/hindsight_api/engine/memories/postgres.py",
+    "hindsight-api-slim/tests/test_consolidation_preserve_tag_prefixes.py"
+   ],
+   "tests": [
+    "hindsight-api-slim/tests/test_consolidation_preserve_tag_prefixes.py"
+   ]
+  },
+  {
+   "key": "fix(consolidation): read the folded row's tags only when preservation is on",
+   "patch_id": "5b4d50dd9a51cd240a817054dfc530b19d7c4f8c",
+   "files": [
+    "hindsight-api-slim/hindsight_api/engine/memories/pg/consolidation.py"
+   ],
+   "tests": [
+    "hindsight-api-slim/tests/test_consolidation_preserve_tag_prefixes.py"
+   ]
+  },
+  {
+   "key": "docs(tags): describe protected-prefix policies and synchronize schemas",
+   "patch_id": "70ffbd1a0640f6ea4f11ecd01b4cccd3d1aeeee7",
+   "files": [
+    ".env.example",
+    "hindsight-api-slim/tests/test_hierarchical_config.py",
+    "hindsight-api-slim/tests/test_retain_preserve_tag_prefixes.py",
+    "hindsight-docs/docs/developer/configuration.mdx",
+    "hindsight-docs/static/bank-template-schema.json",
+    "hindsight-docs/static/openapi.json"
+   ],
+   "tests": [
+    "hindsight-api-slim/tests/test_hierarchical_config.py",
+    "hindsight-api-slim/tests/test_retain_preserve_tag_prefixes.py"
+   ]
+  },
+  {
+   "key": "feat(retain): preserve opt-in neighboring source context during extraction",
+   "patch_id": "5424a938b72c9a1b7f8f5ef77f5f2d646b395317",
+   "files": [
+    "hindsight-api-slim/hindsight_api/engine/retain/fact_extraction.py",
+    "hindsight-api-slim/hindsight_api/engine/retain/orchestrator.py",
+    "hindsight-api-slim/hindsight_api/engine/retain/source_context.py",
+    "hindsight-api-slim/tests/check_hermes_source_context_314.py",
+    "hindsight-api-slim/tests/test_hermes_context_llm.py",
+    "hindsight-api-slim/tests/test_hermes_context_prompt.py",
+    "hindsight-api-slim/tests/test_hermes_source_context.py"
+   ],
+   "tests": [
+    "hindsight-api-slim/tests/check_hermes_source_context_314.py",
+    "hindsight-api-slim/tests/test_hermes_context_llm.py",
+    "hindsight-api-slim/tests/test_hermes_context_prompt.py",
+    "hindsight-api-slim/tests/test_hermes_source_context.py"
+   ]
+  },
+  {
+   "key": "test(retain): an append that falls back to full re-extraction must keep old unit tags",
+   "patch_id": "cdbef7e6bc368a78f4133244af5994b146e74553",
+   "files": [
+    "hindsight-api-slim/tests/test_retain_append_fallback_keeps_tags.py"
+   ],
+   "tests": [
+    "hindsight-api-slim/tests/test_retain_append_fallback_keeps_tags.py"
+   ]
+  },
+  {
+   "key": "retain: append tag carry mapping (exact text, chunk overlap, orphans) + unit tests",
+   "patch_id": "a3f48a343180448c58e70429ffb65cf598b53537",
+   "files": [
+    "hindsight-api-slim/hindsight_api/engine/retain/append_tag_carry.py",
+    "hindsight-api-slim/tests/test_append_tag_carry_unit.py"
+   ],
+   "tests": [
+    "hindsight-api-slim/tests/test_append_tag_carry_unit.py"
+   ]
+  },
+  {
+   "key": "memories: append_tag_snapshot store method",
+   "patch_id": "a5dec052793ea2b9e6ab8a8b839035abceb299a1",
+   "files": [
+    "hindsight-api-slim/hindsight_api/engine/memories/base.py",
+    "hindsight-api-slim/hindsight_api/engine/memories/pg/retain.py",
+    "hindsight-api-slim/hindsight_api/engine/memories/postgres.py"
+   ],
+   "tests": [
+    "hindsight-api-slim/tests/test_retain_append_preserves_unit_tags.py"
+   ]
+  },
+  {
+   "key": "retain: carry earlier unit tags through append full re-extraction",
+   "patch_id": "3bf02be1f811b8649ed830acb2db6b55b1ee15c8",
+   "files": [
+    "hindsight-api-slim/hindsight_api/engine/retain/orchestrator.py"
+   ],
+   "tests": [
+    "hindsight-api-slim/tests/test_retain_append_preserves_unit_tags.py"
+   ]
+  },
+  {
+   "key": "retain: append tag carry is precise - inherit only the replaced unit's tags, never a union",
+   "patch_id": "53807ddcfde3d8b2a68d2b5bbcdea30209ec7ef8",
+   "files": [
+    "hindsight-api-slim/hindsight_api/engine/retain/append_tag_carry.py",
+    "hindsight-api-slim/tests/test_append_tag_carry_precision.py",
+    "hindsight-api-slim/tests/test_append_tag_carry_unit.py"
+   ],
+   "tests": [
+    "hindsight-api-slim/tests/test_append_tag_carry_precision.py",
+    "hindsight-api-slim/tests/test_append_tag_carry_unit.py"
+   ]
+  },
+  {
+   "key": "test(retain): append fallback contract is precise (one old unit's tags or the request's)",
+   "patch_id": "2b4d209b494c87e4fe6f9ea96aa98c467870493e",
+   "files": [
+    "hindsight-api-slim/tests/test_retain_append_fallback_keeps_tags.py"
+   ],
+   "tests": [
+    "hindsight-api-slim/tests/test_retain_append_fallback_keeps_tags.py"
+   ]
+  },
+  {
+   "key": "fix(retain): append carry uses fact-level provenance; drop ambiguous boundary similarity",
+   "patch_id": "0aed5db89c468133a070edad4e0932984dde6b30",
+   "files": [
+    "hindsight-api-slim/hindsight_api/engine/retain/append_tag_carry.py",
+    "hindsight-api-slim/hindsight_api/engine/retain/orchestrator.py",
+    "hindsight-api-slim/tests/test_append_tag_carry_unit.py",
+    "hindsight-api-slim/tests/test_retain_append_fallback_keeps_tags.py"
+   ],
+   "tests": [
+    "hindsight-api-slim/tests/test_append_tag_carry_unit.py",
+    "hindsight-api-slim/tests/test_retain_append_fallback_keeps_tags.py"
+   ]
+  },
+  {
+   "key": "fix(retain): force the append chunk boundary at the stored-text end",
+   "patch_id": "6c5f404a53877792a3d6c98b7afad27d77416e24",
+   "files": [
+    "hindsight-api-slim/hindsight_api/engine/retain/append_tag_carry.py",
+    "hindsight-api-slim/hindsight_api/engine/retain/orchestrator.py",
+    "hindsight-api-slim/tests/test_append_tag_carry_unit.py",
+    "hindsight-api-slim/tests/test_retain_append_fallback_keeps_tags.py"
+   ],
+   "tests": [
+    "hindsight-api-slim/tests/test_append_tag_carry_unit.py",
+    "hindsight-api-slim/tests/test_retain_append_fallback_keeps_tags.py"
+   ]
+  },
+  {
+   "key": "fix(retain): keep upstream chunk cleanup and comments while forcing the append boundary",
+   "patch_id": "150f217a8d389dc4606a3219e7ff8cd4843f970c",
+   "files": [
+    "hindsight-api-slim/hindsight_api/engine/retain/orchestrator.py"
+   ],
+   "tests": [
+    "hindsight-api-slim/tests/test_retain_append_preserves_unit_tags.py"
+   ]
+  },
+  {
+   "key": "fix(consolidation): derivation keepers inherit protected tag prefixes from their sources",
+   "patch_id": "49bf6f3fd358545e53586cbaa854363240ea0bf9",
+   "files": [
+    "hindsight-api-slim/hindsight_api/engine/consolidation/consolidator.py",
+    "hindsight-api-slim/tests/test_derivation_inherit_prefixes.py"
+   ],
+   "tests": [
+    "hindsight-api-slim/tests/test_derivation_inherit_prefixes.py"
+   ]
+  },
+  {
+   "key": "fix(consolidation): provide the retain-gate accessor the derivation keeper reads",
+   "patch_id": "b01665d979a5f5f03d1a931fdd375557fbcf838c",
+   "files": [
+    "hindsight-api-slim/hindsight_api/engine/retain/fact_storage.py"
+   ],
+   "tests": [
+    "hindsight-api-slim/tests/test_consolidation_preserve_tag_prefixes.py"
+   ]
+  },
+  {
+   "key": "fix(consolidation): read derivation source units through the store API",
+   "patch_id": "3006c86dbdebd5c630f5ab475d005a3e016780e7",
+   "files": [
+    "hindsight-api-slim/hindsight_api/engine/consolidation/consolidator.py"
+   ],
+   "tests": [
+    "hindsight-api-slim/tests/test_consolidation_preserve_tag_prefixes.py"
+   ]
+  },
+  {
+   "key": "fix(consolidation): derivation reads the bank's effective retain prefix config",
+   "patch_id": "9196eeadf6edd2015318d70f9e6dfd044404f2dd",
+   "files": [
+    "hindsight-api-slim/hindsight_api/engine/consolidation/consolidator.py",
+    "hindsight-api-slim/hindsight_api/engine/retain/fact_storage.py",
+    "hindsight-api-slim/tests/test_derivation_inherit_prefixes.py"
+   ],
+   "tests": [
+    "hindsight-api-slim/tests/test_derivation_inherit_prefixes.py"
+   ]
+  },
+  {
+   "key": "feat(hermes): add optional total recall result limit",
+   "patch_id": "9cb6d38477bac2e4fa0564ec750394f015868273",
+   "files": [
+    "hindsight-integrations/hermes/README.md",
+    "hindsight-integrations/hermes/__init__.py",
+    "hindsight-integrations/hermes/tests/test_recall_result_limit.py"
+   ],
+   "tests": [
+    "hindsight-integrations/hermes/tests/test_recall_result_limit.py"
+   ]
+  },
+  {
+   "key": "feat(hermes): add identified recall candidates and complete retain context",
+   "patch_id": "24a0d41b300a36ce96e92bc9cb1c61be2d4a5da6",
+   "files": [
+    "hindsight-integrations/hermes/__init__.py",
+    "hindsight-integrations/hermes/tests/test_hermes_context_recall.py"
+   ],
+   "tests": [
+    "hindsight-integrations/hermes/tests/test_hermes_context_recall.py"
+   ]
+  },
+  {
+   "key": "test(hermes): adapt portable context-recall test to flat-message turns",
+   "patch_id": "1afd49dbefc7740d3e1a0913cc247e784f6ca566",
+   "files": [
+    "hindsight-integrations/hermes/tests/test_hermes_context_recall.py"
+   ],
+   "tests": [
+    "hindsight-integrations/hermes/tests/test_hermes_context_recall.py"
+   ]
+  },
+  {
+   "key": "test(hermes): expect provenance defaults in the self-parent case",
+   "patch_id": "e771f997789b52b5ce89e7be1531a2b54174a642",
+   "files": [
+    "hindsight-integrations/hermes/tests/test_provider.py"
+   ],
+   "tests": [
+    "hindsight-integrations/hermes/tests/test_provider.py"
+   ]
+  },
+  {
+   "key": "test(retain): run row/fold assertions with native ML-independent fixtures",
+   "patch_id": "3662f0c3cd2c6eb8268f004d823902c1db9cf5c8",
+   "files": [
+    "hindsight-api-slim/tests/ml_independent_fixtures.py",
+    "hindsight-api-slim/tests/test_append_tag_carry_precision.py",
+    "hindsight-api-slim/tests/test_consolidation_preserve_tag_prefixes.py",
+    "hindsight-api-slim/tests/test_retain_append_preserves_unit_tags.py",
+    "hindsight-api-slim/tests/test_retain_preserve_tag_prefixes.py"
+   ],
+   "tests": [
+    "hindsight-api-slim/tests/ml_independent_fixtures.py",
+    "hindsight-api-slim/tests/test_append_tag_carry_precision.py",
+    "hindsight-api-slim/tests/test_consolidation_preserve_tag_prefixes.py",
+    "hindsight-api-slim/tests/test_retain_append_preserves_unit_tags.py",
+    "hindsight-api-slim/tests/test_retain_preserve_tag_prefixes.py"
+   ]
+  },
+  {
+   "key": "fix(retain): gate tag preservation on the bank prefix gate and keep exact replace exact",
+   "patch_id": "dd4e37a38faea718abb5c175817c244f4904b832",
+   "files": [
+    "hindsight-api-slim/hindsight_api/engine/memory_engine.py",
+    "hindsight-api-slim/hindsight_api/engine/retain/fact_storage.py",
+    "hindsight-api-slim/tests/test_consolidation_preserve_tag_prefixes.py"
+   ],
+   "tests": [
+    "hindsight-api-slim/tests/test_consolidation_preserve_tag_prefixes.py"
+   ]
+  },
+  {
+   "key": "Revert \"fix(retain): gate tag preservation on the bank prefix gate and keep exact replace exact\"",
+   "patch_id": "77e5afbad6f44e1824d7cac9398fe7465a70abd9",
+   "files": [
+    "hindsight-api-slim/hindsight_api/engine/memory_engine.py",
+    "hindsight-api-slim/hindsight_api/engine/retain/fact_storage.py",
+    "hindsight-api-slim/tests/test_consolidation_preserve_tag_prefixes.py"
+   ],
+   "tests": [
+    "hindsight-api-slim/tests/test_consolidation_preserve_tag_prefixes.py"
+   ]
+  },
+  {
+   "key": "test(tags): align tag-preservation expectations with upstream #6336",
+   "patch_id": "90f4a1935ffbe59715a6b2286927ebbf7bd178db",
+   "files": [
+    "hindsight-api-slim/tests/test_consolidation_preserve_tag_prefixes.py",
+    "hindsight-api-slim/tests/test_retain_preserve_tag_prefixes.py"
+   ],
+   "tests": [
+    "hindsight-api-slim/tests/test_consolidation_preserve_tag_prefixes.py",
+    "hindsight-api-slim/tests/test_retain_preserve_tag_prefixes.py"
+   ]
+  },
+  {
+   "key": "refactor(tags): narrow preservation to what upstream #6336 does not cover",
+   "patch_id": "b8821aca7a5cf1910c34099c1bf8c62fdd0dfc60",
+   "files": [
+    "hindsight-api-slim/hindsight_api/engine/retain/fact_storage.py",
+    "hindsight-api-slim/tests/test_retain_preserve_tag_prefixes.py"
+   ],
+   "tests": [
+    "hindsight-api-slim/tests/test_retain_preserve_tag_prefixes.py"
+   ]
+  },
+  {
+   "key": "feat(openclaw): extract engine id and turn-ownership predicate (preparatory)",
+   "patch_id": "50cbd56a53d3026799abe868e9c9a4729e7d9d32",
+   "files": [
+    "hindsight-integrations/openclaw/src/engine-compat.test.ts",
+    "hindsight-integrations/openclaw/src/engine-compat.ts"
+   ],
+   "tests": [
+    "hindsight-integrations/openclaw/src/engine-compat.test.ts"
+   ]
+  },
+  {
+   "key": "feat(openclaw): port session ledger and checkpoint store (storage only)",
+   "patch_id": "8f5423a22c470c4f32748dbdb8f0cb1a9ae1b955",
+   "files": [
+    "hindsight-integrations/openclaw/src/checkpoint-store.bindings.test.ts",
+    "hindsight-integrations/openclaw/src/checkpoint-store.harness.test.ts",
+    "hindsight-integrations/openclaw/src/checkpoint-store.ts",
+    "hindsight-integrations/openclaw/src/host-paths.test.ts",
+    "hindsight-integrations/openclaw/src/host-paths.ts",
+    "hindsight-integrations/openclaw/src/node-sqlite.d.ts",
+    "hindsight-integrations/openclaw/src/session-ledger.harness.test.ts",
+    "hindsight-integrations/openclaw/src/session-ledger.ts",
+    "hindsight-integrations/openclaw/src/types.ts"
+   ],
+   "tests": [
+    "hindsight-integrations/openclaw/src/checkpoint-store.bindings.test.ts",
+    "hindsight-integrations/openclaw/src/checkpoint-store.harness.test.ts",
+    "hindsight-integrations/openclaw/src/host-paths.test.ts",
+    "hindsight-integrations/openclaw/src/session-ledger.harness.test.ts"
+   ]
+  },
+  {
+   "key": "feat(openclaw): register non-persisting context engine shell",
+   "patch_id": "a3fca833856fbdb45f51796868a38fb0d047ca01",
+   "files": [
+    "hindsight-integrations/openclaw/src/context-engine.test.ts",
+    "hindsight-integrations/openclaw/src/context-engine.ts",
+    "hindsight-integrations/openclaw/src/index.ts",
+    "hindsight-integrations/openclaw/src/types.ts"
+   ],
+   "tests": [
+    "hindsight-integrations/openclaw/src/context-engine.test.ts"
+   ]
+  },
+  {
+   "key": "openclaw: read-side assemble marks for context engine (wave 7, Codex review 8 approved)",
+   "patch_id": "9e2b5089ec0332f31806aa025566e1fdd779493f",
+   "files": [
+    "hindsight-integrations/openclaw/src/assemble-marks.test.ts",
+    "hindsight-integrations/openclaw/src/assemble-marks.ts",
+    "hindsight-integrations/openclaw/src/context-engine.test.ts",
+    "hindsight-integrations/openclaw/src/context-engine.ts",
+    "hindsight-integrations/openclaw/src/index.ts"
+   ],
+   "tests": [
+    "hindsight-integrations/openclaw/src/assemble-marks.test.ts",
+    "hindsight-integrations/openclaw/src/context-engine.test.ts"
+   ]
+  },
+  {
+   "key": "openclaw: configurable context engine marks admission policy (wave 9, Codex review 10 approved)",
+   "patch_id": "49a311665c44e506f5a22fe4c246e4231f0a1865",
+   "files": [
+    "hindsight-integrations/openclaw/openclaw.plugin.json",
+    "hindsight-integrations/openclaw/src/context-engine.test.ts",
+    "hindsight-integrations/openclaw/src/context-engine.ts",
+    "hindsight-integrations/openclaw/src/index.ts",
+    "hindsight-integrations/openclaw/src/types.ts"
+   ],
+   "tests": [
+    "hindsight-integrations/openclaw/src/context-engine.test.ts"
+   ]
+  },
+  {
+   "key": "openclaw: per-root assemble bookkeeping and marks cache (wave 10, Codex review 12 approved)",
+   "patch_id": "613665d7dd0150f33824e53af81a9c9bbfc558c1",
+   "files": [
+    "hindsight-integrations/openclaw/src/context-engine.test.ts",
+    "hindsight-integrations/openclaw/src/context-engine.ts"
+   ],
+   "tests": [
+    "hindsight-integrations/openclaw/src/context-engine.test.ts"
+   ]
+  },
+  {
+   "key": "openclaw: session state read side for context engine (wave 11, Codex review 13 approved)",
+   "patch_id": "6f6147be1d039a0e9fff5a0d973dc817327bdbe2",
+   "files": [
+    "hindsight-integrations/openclaw/src/context-engine.test.ts",
+    "hindsight-integrations/openclaw/src/context-engine.ts",
+    "hindsight-integrations/openclaw/src/session-state.test.ts",
+    "hindsight-integrations/openclaw/src/session-state.ts"
+   ],
+   "tests": [
+    "hindsight-integrations/openclaw/src/context-engine.test.ts",
+    "hindsight-integrations/openclaw/src/session-state.test.ts"
+   ]
+  },
+  {
+   "key": "openclaw: P3 per-root lifecycle authority, runtime gate, P4 durable retain delivery and capture (packages 14,16-25, Codex review 25)",
+   "patch_id": "a1b9f066150c5b305de75ac7e851df8999a5d9ce",
+   "files": [
+    "hindsight-integrations/openclaw/openclaw.plugin.json",
+    "hindsight-integrations/openclaw/src/assemble-marks.ts",
+    "hindsight-integrations/openclaw/src/bank-defaults-concurrent.test.ts",
+    "hindsight-integrations/openclaw/src/bank-defaults-lifetime.test.ts",
+    "hindsight-integrations/openclaw/src/context-engine.ts",
+    "hindsight-integrations/openclaw/src/index.ts",
+    "hindsight-integrations/openclaw/src/lifecycle-authority.test.ts",
+    "hindsight-integrations/openclaw/src/lifecycle-authority.ts",
+    "hindsight-integrations/openclaw/src/lifecycle-cross-copy.test.ts",
+    "hindsight-integrations/openclaw/src/p3-identity.test.ts",
+    "hindsight-integrations/openclaw/src/p3-transitions.test.ts",
+    "hindsight-integrations/openclaw/src/registration-isolation.test.ts",
+    "hindsight-integrations/openclaw/src/retain-capture.test.ts",
+    "hindsight-integrations/openclaw/src/retain-delivery.test.ts",
+    "hindsight-integrations/openclaw/src/retain-delivery.ts",
+    "hindsight-integrations/openclaw/src/retain-queue.integration.test.ts",
+    "hindsight-integrations/openclaw/src/retain-queue.test.ts",
+    "hindsight-integrations/openclaw/src/retain-queue.ts",
+    "hindsight-integrations/openclaw/src/retain-wiring.test.ts",
+    "hindsight-integrations/openclaw/src/run-start-retain.test.ts",
+    "hindsight-integrations/openclaw/src/runtime-gate.test.ts",
+    "hindsight-integrations/openclaw/src/types.ts"
+   ],
+   "tests": [
+    "hindsight-integrations/openclaw/src/bank-defaults-concurrent.test.ts",
+    "hindsight-integrations/openclaw/src/bank-defaults-lifetime.test.ts",
+    "hindsight-integrations/openclaw/src/lifecycle-authority.test.ts",
+    "hindsight-integrations/openclaw/src/lifecycle-cross-copy.test.ts",
+    "hindsight-integrations/openclaw/src/p3-identity.test.ts",
+    "hindsight-integrations/openclaw/src/p3-transitions.test.ts",
+    "hindsight-integrations/openclaw/src/registration-isolation.test.ts",
+    "hindsight-integrations/openclaw/src/retain-capture.test.ts",
+    "hindsight-integrations/openclaw/src/retain-delivery.test.ts",
+    "hindsight-integrations/openclaw/src/retain-queue.integration.test.ts",
+    "hindsight-integrations/openclaw/src/retain-queue.test.ts",
+    "hindsight-integrations/openclaw/src/retain-wiring.test.ts",
+    "hindsight-integrations/openclaw/src/run-start-retain.test.ts",
+    "hindsight-integrations/openclaw/src/runtime-gate.test.ts"
+   ]
+  },
+  {
+   "key": "openclaw: P4 keyed committed-range matching, drop generation filter (package 26, Codex review 26)",
+   "patch_id": "479e1288dacc13d00ccad8286da497269122c3c1",
+   "files": [
+    "hindsight-integrations/openclaw/src/retain-queue.test.ts",
+    "hindsight-integrations/openclaw/src/retain-queue.ts"
+   ],
+   "tests": [
+    "hindsight-integrations/openclaw/src/retain-queue.test.ts"
+   ]
+  },
+  {
+   "key": "openclaw: P4 durable state writer, applyCompletedRetain, commitTurn (packages 27,29,30, Codex review 30)",
+   "patch_id": "e10e4589068ae0fecab1c0d93d6a5244bf3d15fa",
+   "files": [
+    "hindsight-integrations/openclaw/openclaw.plugin.json",
+    "hindsight-integrations/openclaw/src/context-engine.test.ts",
+    "hindsight-integrations/openclaw/src/context-engine.ts",
+    "hindsight-integrations/openclaw/src/durable-turns.test.ts",
+    "hindsight-integrations/openclaw/src/index.ts",
+    "hindsight-integrations/openclaw/src/retain-wiring.test.ts",
+    "hindsight-integrations/openclaw/src/session-state.test.ts",
+    "hindsight-integrations/openclaw/src/session-state.ts",
+    "hindsight-integrations/openclaw/src/types.ts"
+   ],
+   "tests": [
+    "hindsight-integrations/openclaw/src/context-engine.test.ts",
+    "hindsight-integrations/openclaw/src/durable-turns.test.ts",
+    "hindsight-integrations/openclaw/src/retain-wiring.test.ts",
+    "hindsight-integrations/openclaw/src/session-state.test.ts"
+   ]
+  },
+  {
+   "key": "openclaw: host transcript reader and explicit pass providers (package 28a, Codex review 28)",
+   "patch_id": "e9c0aa96a42c862b4e17eeaa32700a0848c5b80a",
+   "files": [
+    "hindsight-integrations/openclaw/src/assemble-marks.ts",
+    "hindsight-integrations/openclaw/src/pass-provider.test.ts",
+    "hindsight-integrations/openclaw/src/pass-provider.ts"
+   ],
+   "tests": [
+    "hindsight-integrations/openclaw/src/pass-provider.test.ts"
+   ]
+  },
+  {
+   "key": "openclaw: TS astinus pass, turnMiddleAgeTurns, durable-only spawn (packages 28b,31, Codex review 31)",
+   "patch_id": "f4086e66383e2bbdb89dd396ea4e51e4f2ec38dc",
+   "files": [
+    "hindsight-integrations/openclaw/openclaw.plugin.json",
+    "hindsight-integrations/openclaw/src/assemble-marks.ts",
+    "hindsight-integrations/openclaw/src/astinus-pass.test.ts",
+    "hindsight-integrations/openclaw/src/astinus-pass.ts",
+    "hindsight-integrations/openclaw/src/context-engine.ts",
+    "hindsight-integrations/openclaw/src/durable-turns.test.ts",
+    "hindsight-integrations/openclaw/src/index.ts",
+    "hindsight-integrations/openclaw/src/types.ts"
+   ],
+   "tests": [
+    "hindsight-integrations/openclaw/src/astinus-pass.test.ts",
+    "hindsight-integrations/openclaw/src/durable-turns.test.ts"
+   ]
+  },
+  {
+   "key": "openclaw: digest-named session ledgers, refuse legacy lossy names (package 32, Codex review 32)",
+   "patch_id": "0234a864b3a22b6362b2145aaba6507e50ef842b",
+   "files": [
+    "hindsight-integrations/openclaw/src/session-ledger.harness.test.ts",
+    "hindsight-integrations/openclaw/src/session-ledger.ts",
+    "hindsight-integrations/openclaw/src/session-state.ts"
+   ],
+   "tests": [
+    "hindsight-integrations/openclaw/src/session-ledger.harness.test.ts"
+   ]
+  },
+  {
+   "key": "openclaw: adopt matching-key legacy ledgers on first open (package 33)",
+   "patch_id": "942716ea00088c137158ef1f3ff05b409748168f",
+   "files": [
+    "hindsight-integrations/openclaw/src/session-ledger.harness.test.ts",
+    "hindsight-integrations/openclaw/src/session-ledger.ts"
+   ],
+   "tests": [
+    "hindsight-integrations/openclaw/src/session-ledger.harness.test.ts"
+   ]
+  },
+  {
+   "key": "openclaw: mark anchors + one-time rebase (B9), seq-index tail reload (B10), retain scope (B4)",
+   "patch_id": "5d37b72c8a0340d09dd6a9f09b38869bcec894c0",
+   "files": [
+    "hindsight-integrations/openclaw/src/assemble-marks.ts",
+    "hindsight-integrations/openclaw/src/astinus-pass.test.ts",
+    "hindsight-integrations/openclaw/src/astinus-pass.ts",
+    "hindsight-integrations/openclaw/src/context-engine.test.ts",
+    "hindsight-integrations/openclaw/src/context-engine.ts",
+    "hindsight-integrations/openclaw/src/package36.test.ts",
+    "hindsight-integrations/openclaw/src/retain-scope.ts",
+    "hindsight-integrations/openclaw/src/session-ledger.ts"
+   ],
+   "tests": [
+    "hindsight-integrations/openclaw/src/astinus-pass.test.ts",
+    "hindsight-integrations/openclaw/src/context-engine.test.ts",
+    "hindsight-integrations/openclaw/src/package36.test.ts"
+   ]
+  },
+  {
+   "key": "openclaw: package 36 follow-up - rebase generation from the host watermark (Codex A2); A3/A4 parity tests",
+   "patch_id": "76224cce1f23010bdb8cc6b4b03783568b8143a6",
+   "files": [
+    "hindsight-integrations/openclaw/src/assemble-marks.ts",
+    "hindsight-integrations/openclaw/src/context-engine.ts",
+    "hindsight-integrations/openclaw/src/package36.test.ts",
+    "hindsight-integrations/openclaw/src/session-ledger.ts"
+   ],
+   "tests": [
+    "hindsight-integrations/openclaw/src/package36.test.ts"
+   ]
+  },
+  {
+   "key": "openclaw: B4 retain scope - generic default skips heartbeat/cron/keepalive/poll/status only; subagents retained; retainScope skip/allow patterns in config",
+   "patch_id": "b6a6bee736662b3dfcca316c4b38b8bd994e2905",
+   "files": [
+    "hindsight-integrations/openclaw/openclaw.plugin.json",
+    "hindsight-integrations/openclaw/src/context-engine.ts",
+    "hindsight-integrations/openclaw/src/index.ts",
+    "hindsight-integrations/openclaw/src/package36.test.ts",
+    "hindsight-integrations/openclaw/src/retain-scope.ts",
+    "hindsight-integrations/openclaw/src/types.ts"
+   ],
+   "tests": [
+    "hindsight-integrations/openclaw/src/package36.test.ts"
+   ]
+  },
+  {
+   "key": "openclaw: review 36 fixes - legacy numeric marks apply only after the rebase commits (R36.1); all-invalid allowlist matches nothing (R36.2); retainScope README",
+   "patch_id": "6470bbdb7f194701e9ef60e565e80fa818608042",
+   "files": [
+    "hindsight-integrations/openclaw/README.md",
+    "hindsight-integrations/openclaw/src/package36.test.ts",
+    "hindsight-integrations/openclaw/src/retain-scope.ts",
+    "hindsight-integrations/openclaw/src/session-ledger.ts"
+   ],
+   "tests": [
+    "hindsight-integrations/openclaw/src/package36.test.ts"
+   ]
+  },
+  {
+   "key": "openclaw: review 36 r2 - subagent sessions are ordinary sessions by default (R36.3); skipOperationalSessions covers cron/heartbeat only",
+   "patch_id": "3ab1a226c9ce266e955eb43e9471cffdc20b4c93",
+   "files": [
+    "hindsight-integrations/openclaw/README.md",
+    "hindsight-integrations/openclaw/openclaw.plugin.json",
+    "hindsight-integrations/openclaw/src/index.test.ts",
+    "hindsight-integrations/openclaw/src/index.ts",
+    "hindsight-integrations/openclaw/src/package36.test.ts"
+   ],
+   "tests": [
+    "hindsight-integrations/openclaw/src/index.test.ts",
+    "hindsight-integrations/openclaw/src/package36.test.ts"
+   ]
+  },
+  {
+   "key": "openclaw: marks never split a tool pair",
+   "patch_id": "ab6b4cf09fbb65cd15083b515a41967bddf81d7d",
+   "files": [
+    "hindsight-integrations/openclaw/src/assemble-marks.ts",
+    "hindsight-integrations/openclaw/src/pair-closure.test.ts"
+   ],
+   "tests": [
+    "hindsight-integrations/openclaw/src/pair-closure.test.ts"
+   ]
+  },
+  {
+   "key": "feat(openclaw): carry the token accounting modules on the production branch",
+   "patch_id": "8ba1518d128f8d34ec0122a3d3960929a16d0b88",
+   "files": [
+    "hindsight-integrations/openclaw/package.json",
+    "hindsight-integrations/openclaw/src/packaging.test.ts",
+    "hindsight-integrations/openclaw/src/prompt-accounting.ts",
+    "hindsight-integrations/openclaw/src/prompt-capture-engine.ts",
+    "hindsight-integrations/openclaw/src/prompt-capture-fs.ts",
+    "hindsight-integrations/openclaw/src/prompt-capture.ts",
+    "hindsight-integrations/openclaw/src/token-count.ts",
+    "hindsight-integrations/openclaw/tsconfig.json"
+   ],
+   "tests": [
+    "hindsight-integrations/openclaw/src/packaging.test.ts"
+   ]
+  },
+  {
+   "key": "feat(openclaw): count the exact view with the tokenizer for view_tokens",
+   "patch_id": "1cb18e5a5abc5d5097aaade49b74bb53c0e539f5",
+   "files": [
+    "hindsight-integrations/openclaw/src/context-engine.test.ts",
+    "hindsight-integrations/openclaw/src/context-engine.ts"
+   ],
+   "tests": [
+    "hindsight-integrations/openclaw/src/context-engine.test.ts"
+   ]
+  },
+  {
+   "key": "chore(openclaw): lock gpt-tokenizer so the install is reproducible",
+   "patch_id": "540c93f5c8eced4fb604935e649cd726cc6a3da4",
+   "files": [
+    "hindsight-integrations/openclaw/package-lock.json"
+   ],
+   "tests": [],
+   "no_test_reason": "lockfile only"
+  },
+  {
+   "key": "fix(openclaw): propagate retirement and prove the host generation (Codex A1/A2/A4)",
+   "patch_id": "79c1c4dc87dac50a89f5076889a9684263ae67e7",
+   "files": [
+    "hindsight-integrations/openclaw/src/context-engine.ts"
+   ],
+   "tests": [
+    "hindsight-integrations/openclaw/src/context-engine.test.ts"
+   ]
+  },
+  {
+   "key": "feat(openclaw): calibrate view_tokens and pressure to the provider's prompt tokens",
+   "patch_id": "f837f6e1f0d50652cdb8e8f4ed70c2a6d55985d6",
+   "files": [
+    "hindsight-integrations/openclaw/src/assemble-marks.ts",
+    "hindsight-integrations/openclaw/src/context-engine.ts",
+    "hindsight-integrations/openclaw/src/count-anchor.test.ts",
+    "hindsight-integrations/openclaw/src/count-anchor.ts",
+    "hindsight-integrations/openclaw/src/lifecycle-authority.ts"
+   ],
+   "tests": [
+    "hindsight-integrations/openclaw/src/count-anchor.test.ts"
+   ]
+  },
+  {
+   "key": "feat(openclaw): wire the engine-view prompt capture; retire the request-file sampler",
+   "patch_id": "1bde2b263855c742762074f89dfa8a96bb719bc0",
+   "files": [
+    "hindsight-integrations/openclaw/openclaw.plugin.json",
+    "hindsight-integrations/openclaw/src/context-engine.ts",
+    "hindsight-integrations/openclaw/src/index.ts",
+    "hindsight-integrations/openclaw/src/prompt-capture.ts",
+    "hindsight-integrations/openclaw/src/prompt-capture.wiring.test.ts",
+    "hindsight-integrations/openclaw/src/types.ts"
+   ],
+   "tests": [
+    "hindsight-integrations/openclaw/src/prompt-capture.wiring.test.ts"
+   ]
+  },
+  {
+   "key": "fix(openclaw): anchor read tolerates a compressed row without its recorded length",
+   "patch_id": "01020903d188cc9c7c22abbf0a37d1a160d2d0d4",
+   "files": [
+    "hindsight-integrations/openclaw/src/assemble-marks.ts"
+   ],
+   "tests": [
+    "hindsight-integrations/openclaw/src/assemble-marks.test.ts"
+   ]
+  },
+  {
+   "key": "fix(openclaw): empty-digest marks are not in effect",
+   "patch_id": "fbd06a511bcd18e116770401bb4dfbe4001a1722",
+   "files": [
+    "hindsight-integrations/openclaw/src/assemble-marks.ts"
+   ],
+   "tests": [
+    "hindsight-integrations/openclaw/src/assemble-marks.test.ts"
+   ]
+  },
+  {
+   "key": "feat(openclaw): placeholder marks reach reasoning and call bodies; engine hard cap",
+   "patch_id": "fcbb843c8f333b8542b97840349842996fe18fdd",
+   "files": [
+    "hindsight-integrations/openclaw/openclaw.plugin.json",
+    "hindsight-integrations/openclaw/src/assemble-marks.ts",
+    "hindsight-integrations/openclaw/src/context-engine.ts",
+    "hindsight-integrations/openclaw/src/log-level.test.ts",
+    "hindsight-integrations/openclaw/src/reach-cap.test.ts",
+    "hindsight-integrations/openclaw/src/types.ts"
+   ],
+   "tests": [
+    "hindsight-integrations/openclaw/src/log-level.test.ts",
+    "hindsight-integrations/openclaw/src/reach-cap.test.ts"
+   ]
+  },
+  {
+   "key": "feat(openclaw): marks reach reasoning and tool-call bodies; admission is forced over budget",
+   "patch_id": "3145713108510f6e14b350b7413b3752de428429",
+   "files": [
+    "hindsight-integrations/openclaw/src/assemble-marks.ts"
+   ],
+   "tests": [
+    "hindsight-integrations/openclaw/src/assemble-marks.test.ts"
+   ]
+  },
+  {
+   "key": "test(openclaw): forced admission and turn_middle boundary reach",
+   "patch_id": "4db53e7a3489c83e505766d99255c4a98390c206",
+   "files": [
+    "hindsight-integrations/openclaw/src/followup-admission-reach.test.ts"
+   ],
+   "tests": [
+    "hindsight-integrations/openclaw/src/followup-admission-reach.test.ts"
+   ]
+  },
+  {
+   "key": "fix(openclaw): turn_middle boundary reach drops signed reasoning instead of editing it",
+   "patch_id": "02ed21424ed7800c95afe54d0525053f10c9f68a",
+   "files": [
+    "hindsight-integrations/openclaw/src/assemble-marks.ts"
+   ],
+   "tests": [
+    "hindsight-integrations/openclaw/src/assemble-marks.test.ts"
+   ]
+  },
+  {
+   "key": "fix(openclaw): hard-cap stub is byte-stable so it does not break the prefix cache",
+   "patch_id": "fc8fb552c80ad7402762a23e4144cf4c88d0be06",
+   "files": [
+    "hindsight-integrations/openclaw/src/assemble-marks.ts",
+    "hindsight-integrations/openclaw/src/reach-cap.test.ts"
+   ],
+   "tests": [
+    "hindsight-integrations/openclaw/src/reach-cap.test.ts"
+   ]
+  },
+  {
+   "key": "fix(openclaw): close the astinusMarks schema description",
+   "patch_id": "3b8ae37a8a7e41ea130f2d9482fe58db1d281aa6",
+   "files": [
+    "hindsight-integrations/openclaw/openclaw.plugin.json"
+   ],
+   "tests": [],
+   "no_test_reason": "manifest/schema description"
+  },
+  {
+   "key": "feat(openclaw): TS pass adopts the 0.40 continuous-proposal policy and dormancy-first ranking",
+   "patch_id": "7e5ad4c156d780dd138f1f1761b164f9572164e2",
+   "files": [
+    "hindsight-integrations/openclaw/src/astinus-pass.ts"
+   ],
+   "tests": [
+    "hindsight-integrations/openclaw/src/astinus-pass.test.ts"
+   ]
+  },
+  {
+   "key": "fix(openclaw): restore the batch-size rule to the TS pass policy",
+   "patch_id": "27bfc5d6b00adb132e9f354b4d7d03486886c569",
+   "files": [
+    "hindsight-integrations/openclaw/src/astinus-pass.ts"
+   ],
+   "tests": [
+    "hindsight-integrations/openclaw/src/astinus-pass.test.ts"
+   ]
+  },
+  {
+   "key": "fix(openclaw): enforce the 0.40 and 0.55 gates in code, not the prompt",
+   "patch_id": "5328d19b39192b02dd44bc2a7861def2f4b0c26f",
+   "files": [
+    "hindsight-integrations/openclaw/src/astinus-pass.test.ts",
+    "hindsight-integrations/openclaw/src/astinus-pass.ts"
+   ],
+   "tests": [
+    "hindsight-integrations/openclaw/src/astinus-pass.test.ts"
+   ]
+  },
+  {
+   "key": "fix(openclaw): unknown pressure makes no proposals",
+   "patch_id": "c1f58a7d4980bc558f177aed12a017897f3b8edf",
+   "files": [
+    "hindsight-integrations/openclaw/src/astinus-pass.test.ts",
+    "hindsight-integrations/openclaw/src/astinus-pass.ts"
+   ],
+   "tests": [
+    "hindsight-integrations/openclaw/src/astinus-pass.test.ts"
+   ]
+  }
+ ]
+}
