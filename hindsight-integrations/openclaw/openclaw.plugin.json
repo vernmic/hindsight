@@ -429,7 +429,7 @@
       },
       "astinusMarks": {
         "type": "object",
-        "description": "Context engine marks admission policy: the engine admits a SHARE of the pending marks, in priority order (pressure, then topic dormancy, then statement age), on a turn cadence. Defaults: mark from 0.30, admit ceil(pressure x pending), hold five turns after an admission, and 0.65 bypasses the debounce. Only read when plugins.slots.contextEngine selects hindsight-openclaw. Above hardCapPressure (default 0.90 of the host message budget) the oldest non-preserved turns are reduced to their user message plus a tombstone until pressure is at hardCapTarget (default 0.70); 0 disables the cap."
+        "description": "Context engine marks admission policy: the engine admits a SHARE of the pending marks, in priority order (pressure, then topic dormancy, then statement age), on a turn cadence. Defaults: mark from 0.30, admit ceil(pressure x pending), hold five turns after an admission, and 0.65 bypasses the debounce. Only read when plugins.slots.contextEngine selects hindsight-openclaw. Above hardCapPressure (default 0.90 of the host message budget) the oldest non-preserved turns are reduced to their user message plus a tombstone until pressure is at hardCapTarget (default 0.70); 0 disables the cap.",
         "additionalProperties": false,
         "properties": {
           "minPressure": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.3 },
