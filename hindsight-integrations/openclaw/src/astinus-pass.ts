@@ -435,7 +435,7 @@ export async function runPass(payload: PassPayload, deps: PassDeps = {}): Promis
     const pressureLine =
       pressure === null
         ? `PRESSURE: unknown (estimator=${estimator})`
-        : `PRESSURE: view ${Math.trunc(vt!)} / budget ${Math.trunc(tb!)} = ${pressure.toFixed(2)} (estimator=${estimator})`;
+        : `PRESSURE: view ${Math.trunc(vt!)} / budget ${Math.trunc(tb!)} = ${pressure.toFixed(3)} (estimator=${estimator})`;
     const tailLine =
       tailFloor > 0
         ? `PRESERVED TAIL: seq >= ${tailFloor} is kept verbatim; a mark ending at or above it cannot apply.`
@@ -573,7 +573,15 @@ export async function runPass(payload: PassPayload, deps: PassDeps = {}): Promis
         const insertMark = db.prepare(
           "INSERT INTO marks(session_id,seq_start,seq_end,kind,action,digest,reason,stmt_age_s,topic_dormancy_s,pressure,proposed_at,anchor_first_event,anchor_last_event) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
-        for (const m of (answer.marks ?? []) as Json[]) {
+        // Gate (2026-11-10): the 0.40 policy is enforced in code, not trusted to the model.
+        // topic_1959 turn-203 returned 26 marks at pressure 0.386, so the prompt alone is not
+        // an invariant. Below the gate, proposals are discarded before any hygiene check.
+        const belowGate = pressure !== null && pressure < 0.4;
+        const belowDigGate = pressure !== null && pressure < 0.55;
+        for (const m of (belowGate ? [] : (answer.marks ?? [])) as Json[]) {
+          // The 0.55 tier is the first one that allows dormant-topic digs; below it, placeholders
+          // only. Enforced here so an over-eager model cannot smuggle a dig past the tier.
+          if (belowDigGate && String(m.action) === "digest") continue;
           const ms = Math.trunc(Number(m.range[0]));
           const me = Math.trunc(Number(m.range[1]));
           if (!Number.isFinite(ms) || !Number.isFinite(me)) continue;
