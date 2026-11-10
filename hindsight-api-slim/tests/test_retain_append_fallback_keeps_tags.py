@@ -221,3 +221,70 @@ async def test_append_negation_in_straddling_chunk_keeps_request_tags(memory, re
         assert after.get(added) == {"request:new"}, after
     finally:
         await memory.delete_bank(bank_id, request_context=request_context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(600)
+async def test_append_reworded_old_fact_keeps_protection(memory, request_context, monkeypatch):
+    """Claude cover review R1-a through the production boundary.
+
+    The reworded old fact is extracted from the wholly-old chunk (similarity carries its
+    decision:approved/retain:permanent), while the appended negation stays request-only.
+    """
+    base = "Alice approved Project Atlas."
+    reworded = "Alice approved the Project Atlas."
+    added = "Alice never approved Project Atlas."
+
+    def _facts(messages):
+        text = "\n".join(m.get("content", "") for m in messages if m.get("role") == "user")
+        found = []
+        if base in text:
+            found.append(reworded)
+        if added in text:
+            found.append(added)
+        return {
+            "facts": [
+                {
+                    "what": s,
+                    "when": "N/A",
+                    "where": "N/A",
+                    "who": "N/A",
+                    "why": "N/A",
+                    "fact_kind": "conversation",
+                    "fact_type": "world",
+                }
+                for s in found
+            ]
+        }
+
+    bank_id = f"test_append_reworded_{datetime.now(timezone.utc).timestamp()}"
+    doc = "fx-reworded-doc"
+    try:
+        await memory._ensure_bank_exists(bank_id, request_context)
+        await memory._config_resolver.update_bank_config(bank_id, {"retain_chunk_size": 400})
+        await _retain(memory, bank_id, request_context, content=base, document_id=doc, tags=["topic:one"])
+        old = await _by_text(memory, bank_id, doc)
+        assert old == {base: {"topic:one"}}, old
+        async with memory._pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE memory_units SET tags = tags || $2::varchar[] WHERE bank_id = $1 AND text = $3",
+                bank_id,
+                ["decision:approved", "retain:permanent"],
+                base,
+            )
+        monkeypatch.setattr(MockLLM, "_build_mock_facts", staticmethod(_facts))
+        await _retain(
+            memory,
+            bank_id,
+            request_context,
+            content=added,
+            document_id=doc,
+            tags=["request:new"],
+            update_mode="append",
+            force_reextract=True,
+        )
+        after = await _by_text(memory, bank_id, doc)
+        assert after.get(reworded) == {"topic:one", "decision:approved", "retain:permanent"}, after
+        assert after.get(added) == {"request:new"}, after
+    finally:
+        await memory.delete_bank(bank_id, request_context=request_context)
