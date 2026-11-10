@@ -11874,7 +11874,10 @@ class MemoryEngine(MemoryEngineInterface):
                             return list(existing or [])
                         merged = list(retag)
                         seen = set(merged)
-                        for t in carried_label_tags(existing, _label_keys, current_tags):
+                        # Only the current config's label keys: this PATCH is a deliberate
+                        # exact replace, so every other key:value tag (a pin, or a projection
+                        # group no longer configured) is the caller's to remove.
+                        for t in carried_label_tags(existing, _label_keys, None):
                             if t not in seen:
                                 seen.add(t)
                                 merged.append(t)
