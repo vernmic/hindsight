@@ -367,16 +367,19 @@ export function createContextEngine(log: Logger, options: ContextEngineOptions =
                 `[hindsight-engine] view: ${res.messages.length} msgs, ~${res.tokensAfter} tok (from ${res.tokensBefore}; ${marksInEffect} marks in effect, ${admittedIds.length} admitted of ${res.pendingCount} pending; session=${key})`
               );
             }
-            if (marksInEffect > 0 && outList !== list) {
-              // P6: view_tokens is the exact view the model receives, counted with the
-              // tokenizer module. The host estimate stays as the fallback so a tokenizer
-              // failure degrades to today's number rather than breaking assemble.
-              try {
-                estimatedTokens = countPromptTokens(outList as PromptMessage[]).total;
-              } catch {
-                estimatedTokens = side.estimateTokensHost(outList);
-              }
+            // P6/A4 (Codex 11-03): view_tokens is the exact view the model receives,
+            // counted with the tokenizer regardless of whether marks changed it. The
+            // host estimate is only the failure fallback, so a tokenizer failure
+            // degrades to today's number rather than breaking assemble.
+            let exactView: number | null = null;
+            try {
+              exactView = countPromptTokens(outList as PromptMessage[]).total;
+            } catch {
+              exactView = null;
             }
+            estimatedTokens =
+              exactView ??
+              (marksInEffect > 0 && outList !== list ? side.estimateTokensHost(outList) : estimatedTokens);
           }
         } catch (e) {
           // Any failure degrades to "less pruned", never an error.
