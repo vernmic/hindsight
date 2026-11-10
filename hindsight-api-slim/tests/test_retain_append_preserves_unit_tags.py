@@ -18,6 +18,8 @@ import pytest
 
 from hindsight_api.engine.providers.mock_llm import MockLLM
 
+from tests.ml_independent_fixtures import cross_encoder, embeddings  # noqa: F401
+
 
 @pytest.fixture(scope="session")
 def db_url():
