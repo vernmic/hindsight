@@ -173,10 +173,11 @@ async def test_replace_reretain_survivors_keep_only_their_own_protected_tags(mem
         assert survivors and fresh
 
         for uid, unit in survivors.items():
-            own_protected = [t for t in before[uid]["tags"] if t.startswith("pin:")]
-            expected = ["topic:two", *own_protected] if gate else ["topic:two"]
-            # Exact list: document tags first, then this unit's own protected tags only.
-            assert unit["tags"] == expected, (uid, before[uid]["tags"], unit["tags"])
+            # #6336 (entity_labels.py:378-395): every key:value tag the outgoing document
+            # did not carry survives the delta rewrite, whether or not the bank gate is set.
+            carried = [t for t in before[uid]["tags"] if ":" in t and t not in {"topic:one", "pin:doc", "note:x"}]
+            # Exact list: document tags first, then this unit's own carried tags in order.
+            assert unit["tags"] == ["topic:two", *carried], (uid, before[uid]["tags"], unit["tags"])
         for uid, unit in fresh.items():
             assert unit["tags"] == ["topic:two"], (uid, unit["tags"])
 
@@ -219,8 +220,10 @@ async def test_only_configured_prefixes_are_preserved(memory, request_context):
         await _retain(memory, bank_id, request_context, content=_A + "\n\n" + _C, document_id=doc, tags=["topic:two"])
         after = await _units(memory, bank_id, doc)
         for uid in set(before) & set(after):
-            own_tier = [t for t in before[uid]["tags"] if t.startswith("tier:")]
-            assert after[uid]["tags"] == ["topic:two", *own_tier], (uid, after[uid]["tags"])
+            # #6336 (entity_labels.py:378-395): label:/pin: are key:value tags the document
+            # did not carry, so they survive even though the gate lists only "tier:".
+            carried = [t for t in before[uid]["tags"] if ":" in t and t not in {"topic:one", "pin:doc", "note:x"}]
+            assert after[uid]["tags"] == ["topic:two", *carried], (uid, after[uid]["tags"])
         assert await _doc_tags(memory, bank_id, doc) == ["topic:two"]
     finally:
         await memory.delete_bank(bank_id, request_context=request_context)
@@ -233,11 +236,14 @@ async def test_explicit_document_tag_update_is_an_exact_replace(memory, request_
     bank_id = await _bank(memory, request_context, "patch", gate=["pin:"])
     doc = "doc"
     try:
-        await _seed(memory, bank_id, doc, request_context)
+        before = await _seed(memory, bank_id, doc, request_context)
         assert await memory.update_document(doc, bank_id, tags=["topic:new"], request_context=request_context)
+        # The document row remains an exact replace; #6336 (entity_labels.py:378-395)
+        # keeps each unit's key:value tags the outgoing document did not carry.
         assert await _doc_tags(memory, bank_id, doc) == ["topic:new"]
         for uid, unit in (await _units(memory, bank_id, doc)).items():
-            assert unit["tags"] == ["topic:new"], (uid, unit["tags"])
+            carried = [t for t in before[uid]["tags"] if ":" in t and t not in {"topic:one", "pin:doc", "note:x"}]
+            assert unit["tags"] == ["topic:new", *carried], (uid, unit["tags"])
     finally:
         await memory.delete_bank(bank_id, request_context=request_context)
 
