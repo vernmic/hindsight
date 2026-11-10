@@ -183,6 +183,11 @@ async def test_replace_reretain_survivors_keep_only_their_own_protected_tags(mem
 
         # Document row: protected pin kept on the in-place upsert, the rest replaced.
         assert await _doc_tags(memory, bank_id, doc) == (["topic:two", "pin:doc"] if gate else ["topic:two"])
+        if gate:
+            # A replace that already carries the document-level protected tag still unions the
+            # stored one exactly once: the kept document-row behaviour (no drop beyond #6336).
+            await _retain(memory, bank_id, request_context, content=_A + "\n\n" + _C, document_id=doc, tags=["topic:three", "pin:doc"])
+            assert await _doc_tags(memory, bank_id, doc) == ["topic:three", "pin:doc"]
     finally:
         await memory.delete_bank(bank_id, request_context=request_context)
 

@@ -599,10 +599,6 @@ async def update_memory_units_metadata_and_tags(
     and ``observation_scopes`` still propagate: they are the document-level bag the caller
     owns. A survivor's tags are then unchanged, so it is reported as rescoped only when its
     ``observation_scopes`` actually moved.
-    ``preserve_tag_prefixes`` (the bank's ``retain_preserve_tag_prefixes``, default off)
-    extends the carry-forward to tags the bank protects: a survivor keeps its OWN tags under
-    those prefixes on a re-retain, unioned after the document tags. Each unit
-    keeps only what it already carried; nothing is spread to sibling units.
 
     Returns:
         Number of memory units updated.
@@ -618,10 +614,7 @@ async def update_memory_units_metadata_and_tags(
             return list(existing or [])
         merged = list(tags or [])
         seen = set(merged)
-        for t in [
-            *carried_label_tags(existing, label_tag_keys, previous_document_tags),
-            *protected_tags(existing, preserve_tag_prefixes),
-        ]:
+        for t in carried_label_tags(existing, label_tag_keys, previous_document_tags):
             if t not in seen:
                 seen.add(t)
                 merged.append(t)
