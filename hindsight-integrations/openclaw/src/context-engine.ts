@@ -26,6 +26,7 @@ import { fileURLToPath } from "node:url";
 import type { PassPayload, PassProvider } from "./astinus-pass.js";
 import type { MarksAdmissionPolicy } from "./assemble-marks.js";
 import { shouldQueueRetain, type RetainScopeConfig } from "./retain-scope.js";
+import { countPromptTokens, type PromptMessage } from "./token-count.js";
 import { ENGINE_ID } from "./engine-compat.js";
 import {
   appendPendingRange,
@@ -367,7 +368,14 @@ export function createContextEngine(log: Logger, options: ContextEngineOptions =
               );
             }
             if (marksInEffect > 0 && outList !== list) {
-              estimatedTokens = side.estimateTokensHost(outList);
+              // P6: view_tokens is the exact view the model receives, counted with the
+              // tokenizer module. The host estimate stays as the fallback so a tokenizer
+              // failure degrades to today's number rather than breaking assemble.
+              try {
+                estimatedTokens = countPromptTokens(outList as PromptMessage[]).total;
+              } catch {
+                estimatedTokens = side.estimateTokensHost(outList);
+              }
             }
           }
         } catch (e) {

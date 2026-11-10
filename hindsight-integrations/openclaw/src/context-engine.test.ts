@@ -166,7 +166,9 @@ describe("assemble with marks (read side)", () => {
     }).assemble(params);
     expect(out.messages).toBe(pruned);
     expect(out.promptAuthority).toBe("assembled");
-    expect(out.estimatedTokens).toBe(3);
+    // P6: the applied view is counted with the tokenizer, not the host estimate
+    // (estimateTokensHost is stubbed to 3; "y" is one token).
+    expect(out.estimatedTokens).toBe(1);
     const ctx = (s.applyMarks as unknown as { mock: { calls: unknown[][] } }).mock
       .calls[0][2] as Record<string, unknown>;
     expect(ctx.sessionId).toBe("uuid-1");
@@ -236,7 +238,8 @@ describe("last-assemble bookkeeping and cached marks index (wave 11)", () => {
       { messages: msgs, sessionKey: "agent:main:w11b", sessionId: "u" }
     );
     expect(getLastAssembleFact("/w11b", "agent:main:w11b")).toMatchObject({
-      viewTokens: 3,
+      // P6: exact tokenizer count of the applied view ("y"), not estimateTokensHost's 3.
+      viewTokens: 1,
       tokenBudget: null,
       estimator: "host",
       windowFirstSeq: 42,
