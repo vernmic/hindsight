@@ -4,6 +4,7 @@ from hindsight_api.engine.retain.append_tag_carry import (
     AppendTagCarry,
     OldDocumentSnapshot,
     OldUnit,
+    append_chunk_regions,
     locate_spans,
     new_chunk_spans,
 )
@@ -174,3 +175,33 @@ def test_hermes_json_append_new_facts_get_only_request_tags(request_tags):
 def test_no_old_units_is_a_no_op():
     c = _carry([], {}, [BASE])
     assert c.assign([("anything", 0, ["t"])]) == [["t"]]
+
+
+def test_append_chunk_regions_split_at_the_stored_text_boundary():
+    base = "Alice approved Project Atlas."
+    added = "Alice never approved Project Atlas."
+    combined = base + "\n" + added
+    assert append_chunk_regions(combined, base) == (base, "\n" + added)
+    # Non-prefix bodies keep one region and rely on the exact-text rule.
+    assert append_chunk_regions('[{"a": 1}]', '[{"a": 1}]') == ('[{"a": 1}]',)
+    assert append_chunk_regions("different body", base) == ("different body",)
+
+
+def test_reworded_old_fact_keeps_tags_when_boundary_is_split():
+    """Claude cover review R1-a: the old tail is not stripped by the boundary rule."""
+    base = "Alice approved Project Atlas."
+    added = "Alice never approved Project Atlas."
+    reworded = "Alice approved the Project Atlas."
+    combined = base + "\n" + added
+    regions = append_chunk_regions(combined, base)
+    unit = OldUnit(base, "world", ("decision:approved", "retain:permanent"), 0)
+    carry = AppendTagCarry(
+        base_text=base,
+        new_spans=new_chunk_spans(base, combined, list(regions)),
+        snapshot=OldDocumentSnapshot(units=[unit], chunks={0: base}),
+        combined_text=combined,
+    )
+    # The reworded old fact comes from the wholly-old chunk: similarity carries the tags.
+    assert carry.tags_for(reworded, 0, ["request:new"]) == ["decision:approved", "retain:permanent"]
+    # The appended negation comes from the wholly-new chunk: request tags only.
+    assert carry.tags_for(added, 1, ["request:new"]) == ["request:new"]

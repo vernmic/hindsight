@@ -33,7 +33,6 @@ its siblings or to genuinely new facts corrupts maintenance protection and filte
    text predates the append) may the best word overlap (Jaccard >= 0.5) give the old
    unit's tags; ties between differently tagged units carry nothing.
 7. **Anything else** keeps the request's tags only.
-4. **Anything else** keeps the request's tags only.
 
 Inherited tags exclude entity-label projections (``label_tag_keys``): those are derived from
 the unit's own entities, so the new unit keeps the label tags its fresh extraction produced.
@@ -116,6 +115,23 @@ def new_chunk_spans(base_text: str | None, combined_text: str, new_chunks: Seque
     if not base_text or not combined_text.startswith(base_text):
         return None
     return locate_spans(new_chunks, combined_text)
+
+
+def append_chunk_regions(text: str, append_base_text: str | None) -> tuple[str, ...]:
+    """Split an append body at the stored-text boundary.
+
+    A chunk that straddles the append point cannot distinguish a reworded old fact
+    from a genuinely new one. Returning the pre-append and appended regions as two
+    bodies lets the caller chunk each separately, so every chunk is wholly old
+    (similarity may carry) or wholly new (request tags only). The split applies only
+    when the stored body is a verbatim prefix; a non-prefix merge (JSON array) keeps
+    its single body and relies on the exact-text rule.
+    """
+    if append_base_text and text.startswith(append_base_text):
+        boundary = len(append_base_text)
+        if 0 < boundary < len(text):
+            return (text[:boundary], text[boundary:])
+    return (text,)
 
 
 def _union(tag_lists: Iterable[Iterable[str]]) -> list[str]:
