@@ -293,7 +293,10 @@ def test_a_session_named_as_its_own_parent_gets_no_parent_tag(provider):
     instance.sync_turn("one", "1")
     instance.shutdown()
 
-    assert _retain_item(fake)["tags"] == ["session:session-1"]
+    tags = _retain_item(fake)["tags"]
+    # Hermes fork: provenance defaults (kind/scope/domain/confidence/source) ride along.
+    assert tags[0] == "session:session-1"
+    assert not any(tag.startswith("parent:") for tag in tags)
 
 
 def test_register_exposes_the_provider_to_hermes():
