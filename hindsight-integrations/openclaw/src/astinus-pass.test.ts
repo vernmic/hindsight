@@ -338,4 +338,27 @@ describe("package 31: incarnation attribution and terminal reservations", () => 
     expect(rows.map((r) => r.outcome)).toEqual(["failed", "ok"]);
     expect(rows.every((r) => r.finished_at !== null)).toBe(true);
   });
+
+  it("gate: proposals below 0.40 are discarded by code, not by the model (turn-203 case)", async () => {
+    const { payload, ledger } = setup(3);
+    const fetchMock = vi.fn(async () =>
+      answer({
+        class: "topic",
+        topics: [],
+        supersessions: [],
+        marks: [{ range: [1, 3], action: "placeholder", digest: null, reason: "below gate" }],
+      })
+    );
+    // 386/1000 = 0.386: the pressure that produced 26 marks in production parity.
+    expect(
+      await runPass(
+        { ...payload, view_tokens: 386, token_budget: 1000, providers, turn_middle_age_turns: 99 },
+        { fetch: fetchMock as never }
+      )
+    ).toBe("ok");
+    const db = ledger();
+    const row = db.prepare("SELECT count(*) AS c FROM marks").get() as { c: number };
+    db.close();
+    expect(row.c).toBe(0);
+  });
 });
