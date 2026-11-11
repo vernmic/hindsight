@@ -30,6 +30,7 @@ import { rotateTurns } from "./prompt-capture.js";
 import { FsTurnStore } from "./prompt-capture-fs.js";
 import { anchoredFigure, calibrate, pressureScale, type AnchorState } from "./count-anchor.js";
 import { shouldQueueRetain, type RetainScopeConfig } from "./retain-scope.js";
+import { isOperationalSessionKey } from "./session-patterns.js";
 import { countPromptTokens, type PromptMessage } from "./token-count.js";
 import { ENGINE_ID } from "./engine-compat.js";
 import {
@@ -256,6 +257,12 @@ export type ContextEngineOptions = {
   passProviders?: PassProvider[];
   /** B4: config `retainScope` (skip / allow session-key patterns). */
   retainScope?: RetainScopeConfig;
+  /**
+   * Derive `isHeartbeat` from the session key when the host does not send it (config
+   * `deriveHeartbeatFromSessionKey`, default off). Uses the same pattern as
+   * skipOperationalSessions: agent:<id>:(cron|heartbeat):...
+   */
+  deriveHeartbeatFromSessionKey?: boolean;
   /** Config `promptCapture` (default false); re-read per assemble so a config reinit is honoured. */
   getPromptCapture?: () => boolean;
   /** Pass spawner override (tests); default spawns dist/astinus-pass.js detached. */
@@ -630,7 +637,9 @@ async function commitTurn(
     return { status: "duplicate" };
   }
   const messages = Array.isArray(params.messages) ? params.messages : [];
-  const heartbeat = params.isHeartbeat === true;
+  const heartbeat =
+    params.isHeartbeat === true ||
+    (options.deriveHeartbeatFromSessionKey === true && isOperationalSessionKey(key));
   const startSeq = typeof params.admission?.rawSeq === "number" ? params.admission.rawSeq : null;
   const endSeq = typeof params.terminal?.rawSeq === "number" ? params.terminal.rawSeq : null;
   const generation =
@@ -761,7 +770,8 @@ export function registerHindsightContextEngine(
   durableTurns = false,
   pass: Pick<
     ContextEngineOptions,
-    "turnMiddleAgeTurns" | "passProviders" | "retainScope" | "getPromptCapture"
+    "turnMiddleAgeTurns" | "passProviders" | "retainScope" | "getPromptCapture" |
+    "deriveHeartbeatFromSessionKey"
   > = {}
 ): boolean {
   const register = api.registerContextEngine;
