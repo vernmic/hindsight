@@ -134,6 +134,27 @@ describe("commitTurn", () => {
     expect(s.lastLedgerFailed).toBe(true);
   });
 
+  it("derives heartbeat from the session key only when the config asks for it", async () => {
+    const rows: any[] = [];
+    const cronKey = "agent:main:cron:nightly";
+    const plain = createContextEngine(quiet, {
+      hostStateRoot: root,
+      durableTurns: true,
+      loadLedger: okLedger(rows),
+    }) as any;
+    await plain.commitTurn(commit(1, { sessionKey: cronKey }));
+    const derived = createContextEngine(quiet, {
+      hostStateRoot: root,
+      durableTurns: true,
+      deriveHeartbeatFromSessionKey: true,
+      loadLedger: okLedger(rows),
+    }) as any;
+    await derived.commitTurn(commit(2, { sessionKey: cronKey }));
+    const beats = rows.filter((r) => r && r.heartbeat !== undefined).map((r) => r.heartbeat);
+    expect(beats[0]).toBe(false);
+    expect(beats[1]).toBe(true);
+  });
+
   it("throws (host retries) without a key, or when the state document is corrupt", async () => {
     const engine = createContextEngine(quiet, {
       hostStateRoot: root,

@@ -17,6 +17,13 @@ export function compileSessionPatterns(patterns: string[]): RegExp[] {
   return patterns.map((pattern) => compileSessionPattern(pattern));
 }
 
+/** Cron and heartbeat sessions: agent:<id>:(cron|heartbeat):... One definition, two callers. */
+export const OPERATIONAL_SESSION_PATTERN = /^agent:[^:]+:(cron|heartbeat):/;
+
+export function isOperationalSessionKey(sessionKey: string | undefined): boolean {
+  return typeof sessionKey === "string" && OPERATIONAL_SESSION_PATTERN.test(sessionKey);
+}
+
 /** Check whether a session key matches any compiled ignore pattern. */
 export function matchesSessionPattern(sessionKey: string, patterns: RegExp[]): boolean {
   return patterns.some((pattern) => pattern.test(sessionKey));

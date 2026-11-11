@@ -427,6 +427,11 @@
         "description": "Capture the engine view (pre-mark and post-mark lists) of each turn's first model call; keeps the last two turns per session under the plugin state directory",
         "default": false
       },
+      "deriveHeartbeatFromSessionKey": {
+        "type": "boolean",
+        "description": "Derive isHeartbeat from the session key (agent:<id>:(cron|heartbeat):...) when the host does not send it. For hosts that send isHeartbeat, leave off. On hosts that never send it, setting this true preserves prior heartbeat behaviour; false makes those turns ordinary.",
+        "default": false
+      },
       "astinusMarks": {
         "type": "object",
         "description": "Context engine marks admission policy: the engine admits a SHARE of the pending marks, in priority order (pressure, then topic dormancy, then statement age), on a turn cadence. Defaults: mark from 0.30, admit ceil(pressure x pending), hold five turns after an admission, and 0.65 bypasses the debounce. Only read when plugins.slots.contextEngine selects hindsight-openclaw. Above hardCapPressure (default 0.90 of the host message budget) the oldest non-preserved turns are reduced to their user message plus a tombstone until pressure is at hardCapTarget (default 0.70); 0 disables the cap.",
@@ -690,6 +695,10 @@
     },
     "promptCapture": {
       "label": "Prompt Capture",
+      "placeholder": "false"
+    },
+    "deriveHeartbeatFromSessionKey": {
+      "label": "Derive Heartbeat From Session Key",
       "placeholder": "false"
     },
     "retainQueuePath": {
