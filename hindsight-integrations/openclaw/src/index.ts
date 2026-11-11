@@ -32,7 +32,11 @@ import {
   oldToolNamesIn,
   RENAMED_TOOL_NAMES,
 } from "./tools.js";
-import { compileSessionPatterns, matchesSessionPattern } from "./session-patterns.js";
+import {
+  compileSessionPatterns,
+  isOperationalSessionKey,
+  matchesSessionPattern,
+} from "./session-patterns.js";
 import { parseSessionFile } from "./session-file.js";
 import { createHash, randomUUID } from "crypto";
 import { dirname, join } from "path";
@@ -1608,7 +1612,7 @@ export function getIdentitySkipReason(
   const allowOperationalSessions = pluginConfig?.skipOperationalSessions === false;
 
   if (typeof sessionKey === "string") {
-    if (!allowOperationalSessions && /^agent:[^:]+:(cron|heartbeat):/.test(sessionKey)) {
+    if (!allowOperationalSessions && isOperationalSessionKey(sessionKey)) {
       return { resolvedCtx, reason: finalSkipReason(`operational session ${sessionKey}`) };
     }
     if (!allowCliSessions && /^agent:[^:]+:main$/.test(sessionKey)) {
@@ -2343,6 +2347,8 @@ export function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
       : [],
     skipStatelessSessions: config.skipStatelessSessions !== false,
     skipOperationalSessions: config.skipOperationalSessions !== false,
+    // New host: commitTurn carries no isHeartbeat, so derive it from the session key when asked.
+    deriveHeartbeatFromSessionKey: config.deriveHeartbeatFromSessionKey === true,
     debug: config.debug ?? false,
     debugPerfTiming: config.debugPerfTiming === true,
     // Both were missing from this whitelist, so the logger always ran at
@@ -2435,6 +2441,7 @@ export default function (api: MoltbotPluginAPI) {
       pluginConfig.durableTurns === true,
       {
         turnMiddleAgeTurns: pluginConfig.turnMiddleAgeTurns,
+        deriveHeartbeatFromSessionKey: pluginConfig.deriveHeartbeatFromSessionKey === true,
         passProviders: pluginConfig.passProviders,
         retainScope: pluginConfig.retainScope,
         getPromptCapture: () => lifecycle.config?.promptCapture === true,
