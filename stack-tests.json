@@ -877,6 +877,22 @@
    "tests": [
     "hindsight-integrations/openclaw/src/astinus-pass.test.ts"
    ]
+  },
+  {
+   "key": "feat(openclaw): derive heartbeat from the session key when the host omits it",
+   "patch_id": "80643b9d3b802cf578762e6154be12ce03416751",
+   "files": [
+    "hindsight-integrations/openclaw/LEDGER.md",
+    "hindsight-integrations/openclaw/openclaw.plugin.json",
+    "hindsight-integrations/openclaw/src/context-engine.ts",
+    "hindsight-integrations/openclaw/src/durable-turns.test.ts",
+    "hindsight-integrations/openclaw/src/index.ts",
+    "hindsight-integrations/openclaw/src/session-patterns.ts",
+    "hindsight-integrations/openclaw/src/types.ts"
+   ],
+   "tests": [
+    "hindsight-integrations/openclaw/src/durable-turns.test.ts"
+   ]
   }
  ]
 }
