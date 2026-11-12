@@ -12,6 +12,7 @@ import {
 export type AdoptOutcome =
   | { status: "adopted"; key: string; carried: number; backup: string }
   | { status: "already" | "absent"; key: string; legacyPath: string }
+  | { status: "already-with-legacy"; key: string; legacyPath: string; detail: string }
   | {
       status:
         | "refuse-collision"
@@ -63,7 +64,21 @@ export function sweepLegacyState(opts: {
       continue;
     }
     if (existsSync(sessionStatePath(opts.stateDir, key))) {
-      outcomes.push({ status: "already", key, legacyPath });
+      // Both documents present. Production cannot produce this (the old plugin writes legacy only,
+      // and the sweep runs before the new plugin starts), so it is reported, never merged.
+      let legacyDebt = 0;
+      try {
+        const raw = JSON.parse(readFileSync(legacyPath, "utf8"));
+        legacyDebt = debtOf(parseState(raw));
+      } catch {
+        legacyDebt = -1;
+      }
+      outcomes.push({
+        status: "already-with-legacy",
+        key,
+        legacyPath,
+        detail: legacyDebt < 0 ? "legacy unreadable" : `legacy debt=${legacyDebt}`,
+      });
       continue;
     }
     let state: SessionState;
