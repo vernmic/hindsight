@@ -41,6 +41,8 @@ export function sweepLegacyState(opts: {
   stateDir: string;
   keys: readonly string[];
   generationFor?: (key: string) => string | null;
+  /** Session ids the host records for this key (current_session_id plus watermark rows). */
+  sessionIdsFor?: (key: string) => readonly string[];
   apply: boolean;
 }): { outcomes: AdoptOutcome[]; counts: SweepCounts; keys: number } {
   const byLossy = new Map<string, string[]>();
@@ -81,12 +83,16 @@ export function sweepLegacyState(opts: {
     const debt = debtOf(state);
     if (debt > 0) {
       const hostGen = opts.generationFor?.(key) ?? null;
-      if (!hostGen || hostGen !== state.lastGenerationSeen) {
+      const genMatch = Boolean(hostGen) && hostGen === state.lastGenerationSeen;
+      const hostIds = new Set(opts.sessionIdsFor?.(key) ?? []);
+      const entries = [...(state.pendingRetain ?? []), ...(state.pendingLegacy ?? [])];
+      const idMatch = entries.some((e: { sessionId?: string }) => e?.sessionId && hostIds.has(e.sessionId));
+      if (!genMatch && !idMatch) {
         outcomes.push({
           status: "refuse-evidence",
           key,
           legacyPath,
-          detail: `debt=${debt} host=${hostGen ?? "none"} doc=${state.lastGenerationSeen ?? "none"}`,
+          detail: `debt=${debt} host=${hostGen ?? "none"} doc=${state.lastGenerationSeen ?? "none"} ids=${hostIds.size}`,
         });
         if (opts.apply) moveAside(legacyPath);
         continue;
