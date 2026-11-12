@@ -2174,7 +2174,6 @@ async def retain_batch(
                 delta_full_body=_delta_full_body,
                 document_body_hash=document_body_hash,
                 append_base_hash=append_base_hash,
-                append_base_text=append_base_text,
                 attachment_loader=attachment_loader,
                 fact_filter=fact_filter,
                 vlm_config=vlm_config,
@@ -4071,7 +4070,6 @@ async def _try_delta_retain(
     delta_full_body: str | None = None,
     document_body_hash: str | None = None,
     append_base_hash: str | None = None,
-    append_base_text: str | None = None,
     attachment_loader: "RetainAttachmentLoader | None" = None,
     fact_filter: "RetainFactFilter | None" = None,
     vlm_config: "LLMConfig | None" = None,
@@ -4187,7 +4185,7 @@ async def _try_delta_retain(
     # `contents` — see the gate in `retain_batch`.
     step_start = time.perf_counter()
     _diff_contents = [RetainContent(content=delta_full_body)] if delta_full_body is not None else contents
-    new_chunks_with_contents = _chunk_contents_for_delta(_diff_contents, config, append_base_text)
+    new_chunks_with_contents = _chunk_contents_for_delta(_diff_contents, config)
     log_buffer.append(
         f"[delta] Chunked new content: {len(new_chunks_with_contents)} chunks in {time.perf_counter() - step_start:.3f}s"
     )
@@ -4922,9 +4920,7 @@ def _build_contents(
     return contents
 
 
-def _chunk_contents_for_delta(
-    contents: list[RetainContent], config, append_base_text: str | None = None
-) -> dict[int, str]:
+def _chunk_contents_for_delta(contents: list[RetainContent], config) -> dict[int, str]:
     """
     Chunk contents the same way the streaming path does, returning a map of
     global_chunk_index -> chunk_text.
@@ -4935,27 +4931,27 @@ def _chunk_contents_for_delta(
     default made all chunks appear changed on retry, and a getattr default
     silently swapped a bank's resolved size for the global one.
 
-    A verbatim-prefix append is split at the stored-text boundary first, so the
-    delta plan derives the same chunk boundaries as the streaming path.
+    An append must cut the SAME boundaries the stored chunks were cut with: the stored
+    body is chunked as one text, so splitting it at the stored-text boundary here would
+    shift every boundary after that point and the delta would report every chunk changed
+    (#6293 regression: the second append re-extracted chunks it never touched). Append
+    provenance is resolved per fact in append_tag_carry, not by chunk boundaries.
     """
     result = {}
     global_chunk_idx = 0
     # Same resolved-config invariant as the streaming path — see the note there.
     chunk_size = config.retain_chunk_size
     structured_chunk_size = config.retain_structured_chunk_size
-    from .append_tag_carry import append_chunk_regions
-
     for content in contents:
-        for region in append_chunk_regions(content.content, append_base_text):
-            chunks = fact_extraction.chunk_text(
-                region,
-                chunk_size,
-                structured_chunk_size=structured_chunk_size,
-                max_attachments_per_chunk=config.retain_max_attachments_per_chunk,
-            )
-            for chunk_text in chunks:
-                result[global_chunk_idx] = chunk_text
-                global_chunk_idx += 1
+        chunks = fact_extraction.chunk_text(
+            content.content,
+            chunk_size,
+            structured_chunk_size=structured_chunk_size,
+            max_attachments_per_chunk=config.retain_max_attachments_per_chunk,
+        )
+        for chunk_text in chunks:
+            result[global_chunk_idx] = chunk_text
+            global_chunk_idx += 1
     return result
 
 
