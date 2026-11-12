@@ -7207,6 +7207,38 @@ class MemoryEngine(MemoryEngineInterface):
         # race each other — unlike the queued path, which still rejects
         # duplicates (see submit_async_retain).
 
+        # An append that omits `tags` inherits the document's current tags: the
+        # caller is adding a turn, not restating the document's labels, and an
+        # omitted field must not read as a request to clear them. `documents.tags`
+        # and every existing memory's tags are both written from the item's tag
+        # set further down, so carrying them onto the ITEM covers the document row
+        # and the units in one place - and does so for every sub-batch and every
+        # mini-batch of an oversized append, each of which replays this item.
+        # `carried_label_tags` does not cover this: it carries only label-derived
+        # `key:value` tags, never the document's own tag set.
+        if document_tags is None:
+            append_doc_ids = {
+                item.get("document_id")
+                for item in contents
+                if item.get("update_mode") == "append" and "tags" not in item and item.get("document_id")
+            }
+            if append_doc_ids:
+                from .memories import get_memories as _get_memories_carry
+
+                async with acquire_with_retry(await self._get_backend()) as _carry_conn:
+                    carried_by_doc = await _get_memories_carry().existing_documents_tags(
+                        conn=_carry_conn,
+                        fq_table=fq_table,
+                        bank_id=bank_id,
+                        document_ids=sorted(append_doc_ids),
+                    )
+                for item in contents:
+                    if item.get("update_mode") != "append" or "tags" in item:
+                        continue
+                    carried = carried_by_doc.get(item.get("document_id") or "")
+                    if carried:
+                        item["tags"] = list(carried)
+
         await self._validate_retain_update_modes(bank_id, contents, request_context)
 
         # Fold items that share an explicit document_id into one document. On the
