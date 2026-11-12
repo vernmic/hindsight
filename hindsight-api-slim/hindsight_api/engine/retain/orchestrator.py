@@ -3316,6 +3316,7 @@ async def _streaming_retain_batch(
                                 ops=pool.ops,
                                 store_document_text=config.store_document_text,
                                 attachment_filenames=_attachment_filenames_for(contents),
+                                preserve_tag_prefixes=getattr(config, "retain_preserve_tag_prefixes", None),
                             )
                         doc_tracking_done[0] = True
                         # Memory: combined_content has been persisted; release
@@ -3531,6 +3532,7 @@ async def _streaming_retain_batch(
                                 ops=pool.ops,
                                 store_document_text=config.store_document_text,
                                 attachment_filenames=_attachment_filenames_for(contents),
+                                preserve_tag_prefixes=getattr(config, "retain_preserve_tag_prefixes", None),
                             )
                             log_buffer.append(f"[streaming] Document {effective_doc_id} tracked (full content)")
                             document_cleared = True
@@ -3815,6 +3817,7 @@ async def _streaming_retain_batch(
                                 ops=pool.ops,
                                 store_document_text=config.store_document_text,
                                 attachment_filenames=_attachment_filenames_for(contents),
+                                preserve_tag_prefixes=getattr(config, "retain_preserve_tag_prefixes", None),
                             )
                         doc_tracking_done[0] = True
                         # Memory: combined_content has been persisted and won't be
