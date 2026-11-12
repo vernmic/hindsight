@@ -1,4 +1,5 @@
-import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import {
   assertModeled,
   legacySessionFileName,
@@ -77,7 +78,7 @@ export function sweepLegacyState(opts: {
         legacyPath,
         detail: String((error as Error)?.message ?? error).slice(0, 160),
       });
-      if (opts.apply) moveAside(legacyPath);
+      if (opts.apply) moveAside(legacyPath, opts.stateDir, "refused");
       continue;
     }
     const debt = debtOf(state);
@@ -94,14 +95,14 @@ export function sweepLegacyState(opts: {
           legacyPath,
           detail: `debt=${debt} host=${hostGen ?? "none"} doc=${state.lastGenerationSeen ?? "none"} ids=${hostIds.size}`,
         });
-        if (opts.apply) moveAside(legacyPath);
+        if (opts.apply) moveAside(legacyPath, opts.stateDir, "refused");
         continue;
       }
     }
     if (opts.apply) {
       const target = sessionStatePath(opts.stateDir, key);
       writeFileSync(target, JSON.stringify({ ...state, sessionKey: key }, null, 2), "utf8");
-      const backup = moveAside(legacyPath);
+      const backup = moveAside(legacyPath, opts.stateDir, "adopted");
       outcomes.push({ status: "adopted", key, carried: debt, backup });
     } else {
       outcomes.push({ status: "adopted", key, carried: debt, backup: "" });
@@ -112,9 +113,18 @@ export function sweepLegacyState(opts: {
   return { outcomes, counts, keys: opts.keys.length };
 }
 
-function moveAside(legacyPath: string): string {
+
+/**
+ * Move a legacy document out of the live state directory. Refusals are named `.refused-...` so a
+ * file never claims a status it did not have, and both kinds land in a sibling directory so nothing
+ * inside the state directory can be re-read as a live document.
+ */
+function moveAside(legacyPath: string, stateDir: string, status: "adopted" | "refused"): string {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const backup = `${legacyPath}.adopted-${stamp}.bak`;
+  const dir = join(dirname(stateDir), "astinus-legacy");
+  mkdirSync(dir, { recursive: true });
+  const name = legacyPath.split(/[\\/]/).pop() ?? "legacy.json";
+  const backup = join(dir, `${name}.${status}-${stamp}.bak`);
   renameSync(legacyPath, backup);
   return backup;
 }
