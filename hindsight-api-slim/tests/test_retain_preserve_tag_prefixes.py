@@ -83,7 +83,7 @@ def test_protected_tags_is_a_literal_prefix_match():
     # `_` and `%` are not wildcards: each prefix matches only itself.
     assert protected_tags(tags, ["pi_n:"]) == ["pi_n:y"]
     assert protected_tags(tags, ["re%"]) == ["re%:w"]
-    assert protected_tags(tags, ["pin:", "tier:"]) == ["pin:x", "label:one"]
+    assert protected_tags(tags, ["pin:", "label:"]) == ["pin:x", "label:one"]
 
 
 def test_protected_tags_off_and_empty():

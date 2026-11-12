@@ -668,11 +668,17 @@ def _build_retain_params(contents_dicts, document_tags=None, doc_contents=None):
     else:
         items = contents_dicts
 
-    all_tags = set(document_tags or [])
+    # Order-preserving: the document's tags first, then any per-item tag it lacks.
+    # Collapsing through a set made the persisted order depend on hash iteration, so a
+    # caller's exact order (and the preserve union that appends after it) came back
+    # reordered -- e.g. ["topic:three", "pin:doc"] persisted as ["pin:doc", "topic:three"].
+    merged_tags = list(dict.fromkeys(document_tags or []))
+    _seen = set(merged_tags)
     for item in items:
-        item_tags = item.get("tags", []) or []
-        all_tags.update(item_tags)
-    merged_tags = list(all_tags)
+        for tag in item.get("tags", []) or []:
+            if tag not in _seen:
+                _seen.add(tag)
+                merged_tags.append(tag)
 
     retain_params = {}
     if items:
