@@ -1,17 +1,20 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { sweepLegacyState } from "./legacy-state-adoption.js";
 import { legacySessionFileName, sessionStatePath, setSessionStateDir } from "./session-state.js";
 
 let dir = "";
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), "legacy-adopt-"));
+  const parent = mkdtempSync(join(tmpdir(), "legacy-adopt-"));
+  dir = join(parent, "astinus");
   mkdirSync(dir, { recursive: true });
   setSessionStateDir(dir);
 });
 afterEach(() => setSessionStateDir(null));
+
+const legacyDir = () => join(dirname(dir), "astinus-legacy");
 
 const writeLegacy = (key: string, body: Record<string, unknown>) =>
   writeFileSync(join(dir, legacySessionFileName(key, ".json")), JSON.stringify(body), "utf8");
@@ -24,7 +27,7 @@ describe("legacy state adoption", () => {
     expect(res.counts.adopted).toBe(1);
     const written = JSON.parse(readFileSync(sessionStatePath(dir, key), "utf8"));
     expect(written.sessionKey).toBe(key);
-    expect(readdirSync(dir).some((f) => f.endsWith(".bak"))).toBe(true);
+    expect(existsSync(legacyDir()) && readdirSync(legacyDir()).some((f) => f.endsWith(".bak"))).toBe(true);
   });
 
   it("refuses when two live keys share the lossy name", () => {
@@ -67,7 +70,7 @@ describe("legacy state adoption", () => {
     sweepLegacyState({ stateDir: dir, keys: [key], apply: true });
     const second = sweepLegacyState({ stateDir: dir, keys: [key], apply: true });
     expect(second.counts.adopted ?? 0).toBe(0);
-    expect(readdirSync(dir).filter((f) => f.endsWith(".bak"))).toHaveLength(1);
+    expect(readdirSync(legacyDir()).filter((f) => f.endsWith(".bak"))).toHaveLength(1);
   });
 
   it("accepts a debt document whose entry sessionId the host records", () => {
@@ -87,3 +90,19 @@ describe("legacy state adoption", () => {
     expect(res.counts.adopted).toBe(1);
   });
 });
+
+  it("reports already-with-legacy and leaves both files untouched", () => {
+    const key = "agent:main:telegram:group:-5:topic:9";
+    writeLegacy(key, {
+      lastRetainedSeq: 2,
+      pendingRetain: [{ start: 1, end: 2, key: "k", sessionId: "s", messages: [], at: 1 }],
+    });
+    writeFileSync(sessionStatePath(dir, key), JSON.stringify({ sessionKey: key }), "utf8");
+    const res = sweepLegacyState({ stateDir: dir, keys: [key], apply: true });
+    const hit = res.outcomes.find((o) => o.status === "already-with-legacy");
+    expect(hit).toBeTruthy();
+    expect((hit as { detail: string }).detail).toContain("legacy debt=1");
+    expect(!existsSync(legacyDir()) || !readdirSync(legacyDir()).some((f) => f.endsWith(".bak"))).toBe(true);
+    expect(readdirSync(dir).some((f) => f === legacySessionFileName(key, ".json"))).toBe(true);
+  });
+
