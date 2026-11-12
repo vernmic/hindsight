@@ -258,6 +258,8 @@ The lookup stops at the repository root. Only `bank_id` is read.
 | `recall_prefetch_method` | `recall` | Auto-recall method: `recall` (raw facts) or `reflect` (LLM synthesis) |
 | `recall_max_tokens` | `4096` | Maximum tokens for recall results |
 | `recall_max_results` | `0` | Maximum total recall records after score filtering and cross-bank deduplication; `0` is uncapped. Applies to automatic recall and `hindsight_recall`, not reflect. |
+| `prefetch_excluded_banks` | *(empty)* | Banks excluded from structured prefetch candidates (comma-separated list, or `HINDSIGHT_PREFETCH_EXCLUDED_BANKS` env). Empty default = no exclusions; protected bank names belong in deployment config, not shipped defaults. |
+| `monitoring_retain_excluded_prefixes` | *(empty)* | Session-id prefixes excluded from automatic monitoring retain (comma-separated list, or `HINDSIGHT_MONITORING_RETAIN_EXCLUDED_PREFIXES` env). Empty default = no exclusions. Replaces the removed `exclude_monitoring_auto_retain` key (see migration note). |
 | `recall_max_input_chars` | `800` | Maximum input query length for auto-recall |
 | `recall_prompt_preamble` | — | Custom preamble for recalled memories in context |
 | `recall_tags` | — | Tags to filter when searching memories: a JSON list (e.g. `["project-x", "team"]`) or comma-separated text (`"project-x, team"`) |
