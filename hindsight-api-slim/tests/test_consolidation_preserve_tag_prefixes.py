@@ -32,6 +32,8 @@ from hindsight_api.engine.consolidation.consolidator import (
 from hindsight_api.engine.memories import get_memories
 from hindsight_api.engine.memory_engine import fq_table
 
+from tests.ml_independent_fixtures import cross_encoder, embeddings  # noqa: F401
+
 pytestmark = pytest.mark.memory_backend_incompatible
 
 
