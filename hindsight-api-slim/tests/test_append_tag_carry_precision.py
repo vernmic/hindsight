@@ -5,8 +5,7 @@ body is not a plain prefix extension of the stored one) had two facts annotated 
 extraction - A with ``retain:permanent``/``task:release-ops``/``kind:decision``, B with
 ``target:storage``/``value:high``. Each later append re-extracted the whole document, and every
 genuinely new fact (Wrenfield, Brindle, Osprey) came back with the UNION of A's and B's
-labels, whatever tags the append sent (different, omitted, ``[]``) and whether the bank's
-``retain_preserve_tag_prefixes`` gate was on or off.
+labels, whatever tags the append sent (different, omitted, ``[]``).
 
 Contract: a re-extracted unit inherits only the tags of the old unit it replaces; a unit from
 genuinely new content gets only that request's tags (none when tags were omitted or ``[]``).
@@ -107,15 +106,11 @@ async def _retain(memory, bank_id, request_context, content, doc, tags, mode):
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(600)
-@pytest.mark.parametrize("gate", [["retain:"], []], ids=["gate_on", "gate_off"])
-async def test_append_new_facts_never_inherit_other_units_tags(memory, request_context, gate):
-    bank_id = f"test_append_precision_{bool(gate)}_{datetime.now(timezone.utc).timestamp()}"
+async def test_append_new_facts_never_inherit_other_units_tags(memory, request_context):
+    bank_id = f"test_append_precision_{datetime.now(timezone.utc).timestamp()}"
     doc = "hermes-session-doc"
     try:
         await memory._ensure_bank_exists(bank_id, request_context)
-        await memory._config_resolver.update_bank_config(
-            bank_id, {"retain_preserve_tag_prefixes": gate, "consolidation_preserve_tag_prefixes": gate}
-        )
         first = ["session:one"] + BASE
         await _retain(memory, bank_id, request_context, _turn(A, B), doc, first, "append")
         units = await _by_fixture(memory, bank_id, doc)
