@@ -176,15 +176,27 @@ async def _preserved_fold_tags(
         absorbed_ids,
         bank_id,
     )
-    extra: set[str] = set(protected_tags(absorbed_extra_tags, prefixes))
+    # Order-preserving, the same merged-tag semantics as retain's _build_retain_params
+    # (90f44a283): the absorbed row's own tags first, then each source row's tags in the
+    # order the fold saw them. Collapsing through a set and sorting made the persisted
+    # order depend on lexical value rather than on where the tag was carried from.
+    extra: list[str] = []
+    seen: set[str] = set()
+    for tag in protected_tags(absorbed_extra_tags, prefixes):
+        if tag not in seen:
+            seen.add(tag)
+            extra.append(tag)
     for r in rows:
-        extra.update(protected_tags(list(r["tags"] or []), prefixes))
+        for tag in protected_tags(list(r["tags"] or []), prefixes):
+            if tag not in seen:
+                seen.add(tag)
+                extra.append(tag)
     if not extra:
         return None
     current = await lock_observation_tags(conn=conn, fq_table=fq_table, bank_id=bank_id, observation_id=survivor_id)
     if current is None:
         return None
-    merged = _union_tags(current, sorted(extra))
+    merged = _union_tags(current, extra)
     return None if merged == current else merged
 
 
