@@ -66,6 +66,22 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             description="Extra Hindsight banks to write to and recall from, in priority order (comma-separated). Off = single-bank behavior.",
         ),
         ProviderField(
+            key="prefetch_excluded_banks",
+            label="Prefetch-excluded banks",
+            kind=KIND_TEXT,
+            default="",
+            inline=True,
+            description="Banks excluded from structured prefetch candidates (comma-separated). Empty = no exclusions; deployment config supplies protected bank names.",
+        ),
+        ProviderField(
+            key="monitoring_retain_excluded_prefixes",
+            label="Monitoring-retain excluded prefixes",
+            kind=KIND_TEXT,
+            default="",
+            inline=True,
+            description="Session-id prefixes excluded from automatic monitoring retain (comma-separated). Empty = no exclusions; deployment config supplies cron-session prefixes.",
+        ),
+        ProviderField(
             key="recall_additional_banks",
             label="Recall-only banks",
             kind=KIND_TEXT,

@@ -869,6 +869,16 @@ class HindsightMemoryProvider(MemoryProvider):
                 "default": 0,
             },
             {
+                "key": "prefetch_excluded_banks",
+                "description": "Banks excluded from structured prefetch candidates (comma-separated); empty = no exclusions",
+                "default": "",
+            },
+            {
+                "key": "monitoring_retain_excluded_prefixes",
+                "description": "Session-id prefixes excluded from automatic monitoring retain (comma-separated); empty = no exclusions",
+                "default": "",
+            },
+            {
                 "key": "recall_max_input_chars",
                 "description": "Maximum input query length for auto-recall",
                 "default": 800,
