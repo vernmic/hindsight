@@ -124,8 +124,10 @@ async def test_create_fold_off_leaves_tags_unchanged(memory, request_context):
 @pytest.mark.asyncio
 async def test_create_fold_on_unions_only_protected_tags(memory, request_context):
     tags = await _create_fold(memory, request_context, ["pin:"], source_tags=_SOURCES)
-    # Survivor's own tags first, then the absorbed protected ones, sorted. No scope/topic leak.
-    assert tags == ["scope:mine", "pin:reference", "pin:critical"]
+    # The carried tag set, not the persisted order: 50857a1df unions absorbed tags in
+    # encounter order, and the source rows come back from the DB without an order, so
+    # the list order is not part of the contract. Membership and dedup are.
+    assert sorted(tags) == ["pin:critical", "pin:reference", "scope:mine"]
 
 
 @pytest.mark.asyncio
