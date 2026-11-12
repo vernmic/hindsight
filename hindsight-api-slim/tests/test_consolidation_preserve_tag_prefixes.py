@@ -130,7 +130,9 @@ async def test_create_fold_on_unions_only_protected_tags(memory, request_context
 
 @pytest.mark.asyncio
 async def test_create_fold_nonmatching_prefix_adds_nothing(memory, request_context):
-    assert await _create_fold(memory, request_context, ["pin:"], source_tags=_SOURCES) == ["scope:mine"]
+    # A prefix no source tag starts with: literal startswith, never a LIKE pattern. The
+    # gate must not fall back to carrying tags it does not cover.
+    assert await _create_fold(memory, request_context, ["tier:"], source_tags=_SOURCES) == ["scope:mine"]
 
 
 @pytest.mark.asyncio
