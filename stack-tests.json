@@ -893,6 +893,50 @@
    "tests": [
     "hindsight-integrations/openclaw/src/durable-turns.test.ts"
    ]
+  },
+  {
+   "key": "feat(openclaw): adopt legacy session state when one live owner exists",
+   "patch_id": "97001a578c030d74599bc42f79d2bd65bc772214",
+   "files": [
+    "hindsight-integrations/openclaw/src/legacy-state-adoption.ts",
+    "hindsight-integrations/openclaw/src/session-state.ts"
+   ],
+   "tests": [
+    "hindsight-integrations/openclaw/src/legacy-state-adoption.test.ts",
+    "hindsight-integrations/openclaw/src/session-state.test.ts"
+   ]
+  },
+  {
+   "key": "feat(openclaw): adopt legacy session state with generation or session-id evidence",
+   "patch_id": "b773923fa4f09ffcd71663db7f725fd271e30d91",
+   "files": [
+    "hindsight-integrations/openclaw/src/legacy-state-adoption.test.ts",
+    "hindsight-integrations/openclaw/src/legacy-state-adoption.ts"
+   ],
+   "tests": [
+    "hindsight-integrations/openclaw/src/legacy-state-adoption.test.ts"
+   ]
+  },
+  {
+   "key": "feat(openclaw): sweep command for legacy session state adoption",
+   "patch_id": "11919482d021cf3ad2a07c5c1c36bcbbb196dc8d",
+   "files": [
+    "hindsight-integrations/openclaw/scripts/adopt-legacy-state.mjs"
+   ],
+   "tests": [],
+   "no_test_reason": "preparatory or type-only change with no direct test"
+  },
+  {
+   "key": "feat(openclaw): guard the legacy sweep (required args, gateway lock, db abort)",
+   "patch_id": "176d619986efc8d84b1030d6ff189068c305f0b0",
+   "files": [
+    "hindsight-integrations/openclaw/scripts/adopt-legacy-state.mjs",
+    "hindsight-integrations/openclaw/src/legacy-state-cli.test.ts",
+    "hindsight-integrations/openclaw/src/legacy-state-cli.ts"
+   ],
+   "tests": [
+    "hindsight-integrations/openclaw/src/legacy-state-cli.test.ts"
+   ]
   }
  ]
 }
