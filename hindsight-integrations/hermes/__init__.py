@@ -891,6 +891,20 @@ class HindsightMemoryProvider(MemoryProvider):
 
     # -- client -------------------------------------------------------------
 
+    def _str_list_setting(self, key: str, env_var: str) -> tuple:
+        """Config list of non-empty strings (env: comma-separated); default empty tuple
+        preserves upstream behavior -- deployments add their own values explicitly."""
+        raw = (self._config or {}).get(key)
+        if raw is None:
+            env = os.environ.get(env_var, "").strip()
+            raw = [part.strip() for part in env.split(",")] if env else ()
+        if isinstance(raw, str):
+            raw = [part.strip() for part in raw.split(",")]
+        values = tuple(v for v in (str(x).strip() for x in (raw or ())) if v)
+        if raw not in (None, (), "") and not values:
+            logger.warning("Hindsight setting %s has no usable entries; ignoring", key)
+        return values
+
     def _int_setting(self, key: str, env_var: str, default: int, env_default=None) -> int:
         """Config value if set (explicit 0 preserved), else env var, else default."""
         value = self._config.get(key)
@@ -921,6 +935,7 @@ class HindsightMemoryProvider(MemoryProvider):
             _DEFAULT_IDLE_TIMEOUT,
             env_default=self._idle_timeout,
         )
+
         # Only explicitly-configured keys: an omitted one is resolved by the daemon from the
         # profile .env, then the parent environment (#3253). This mirrors HindsightEmbedded's
         # own config assembly so the daemon sees exactly what it saw before.
@@ -1695,7 +1710,8 @@ class HindsightMemoryProvider(MemoryProvider):
     def prefetch_candidates(self, feed: dict, *, session_id: str = "") -> dict:
         """Current-feed records; the old prefetch/cache/reflect paths remain available."""
         result = {"candidates": [], "error": None, "feed_hash": feed.get("feed_hash"), "query_provenance": []}
-        if self._bank_id in {"main", "openclaw"}:
+        excluded = self._str_list_setting("prefetch_excluded_banks", "HINDSIGHT_PREFETCH_EXCLUDED_BANKS")
+        if excluded and self._bank_id in excluded:
             result["error"] = "bank_excluded"
             return result
         if self._recall_disabled():
@@ -2114,11 +2130,13 @@ class HindsightMemoryProvider(MemoryProvider):
         return _job
 
     def _monitoring_retain_excluded(self, session_id: str = "") -> bool:
-        if not (self._config or {}).get("exclude_monitoring_auto_retain", True):
+        prefixes = self._str_list_setting(
+            "monitoring_retain_excluded_prefixes", "HINDSIGHT_MONITORING_RETAIN_EXCLUDED_PREFIXES"
+        )
+        if not prefixes:
             return False
-        job_ids = ("3a3da94c3a4b", "1c7606c34c24", "aab9d856059d")
         sessions = (session_id or self._session_id, self._parent_session_id)
-        return any(str(sid).startswith("cron_" + job + "_") for sid in sessions for job in job_ids)
+        return any(str(sid).startswith(tuple(prefixes)) for sid in sessions if sid)
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         """Enqueue a retain for the current turn (non-blocking; writer thread). Dropped
