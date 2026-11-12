@@ -7,7 +7,7 @@
  * figure came from so a reader never has to guess.
  *
  * Pure: events and figures come in, a record goes out. No file system, no host
- * database, no environment, no session or desk names.
+ * database, no environment, no session or deployment-specific names.
  */
 
 export type FigureSource = "provider" | "estimate" | "derived";

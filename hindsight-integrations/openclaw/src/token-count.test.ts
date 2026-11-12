@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { classifyMessage, countPromptTokens, countText } from "./token-count.js";
+import { classifyMessage, countMarkRemoval, countPromptTokens, countText } from "./token-count.js";
 
 // Deterministic stand-in for the tokenizer: 4 characters per token, rounded up.
 const enc = (s: string) => Math.ceil(s.length / 4);
@@ -48,3 +48,26 @@ describe("token-count", () => {
     expect(r.byCategory.tool_result).toBeGreaterThan(0);
   });
 });
+
+describe("countMarkRemoval", () => {
+  it("attributes the removed tokens to the mark whose range was replaced", () => {
+    const before = [
+      { role: "user", content: "question one here", seq: 3 },
+      { role: "assistant", content: [{ type: "text", text: "a long answer body" }], seq: 4 },
+    ];
+    const after = [{ role: "assistant", content: "[digest]", seq: 3 }];
+    const r = countMarkRemoval(
+      before as never,
+      after as never,
+      [{ markId: 7, seqStart: 3, seqEnd: 4 }],
+      { encoder: enc }
+    );
+    const beforeCount = countPromptTokens(before as never, { encoder: enc }).total;
+    const afterCount = countPromptTokens(after as never, { encoder: enc }).total;
+    expect(r.total).toBe(beforeCount - afterCount);
+    expect(r.byMark).toHaveLength(1);
+    expect(r.byMark[0].markId).toBe(7);
+    expect(r.byMark[0].tokens).toBe(r.total);
+  });
+});
+

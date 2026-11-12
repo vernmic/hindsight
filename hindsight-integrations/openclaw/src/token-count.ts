@@ -7,7 +7,7 @@
  *
  * This module is pure. It receives message lists and returns counts. It reads no
  * files, no host tables, no environment and no session state, and it knows no
- * desk names, session keys or private paths.
+ * deployment-specific names, session keys or private paths.
  */
 
 // Package subpath export. tsconfig maps this specifier to the shipped
