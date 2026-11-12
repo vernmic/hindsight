@@ -290,3 +290,41 @@ async def test_rescope_tracks_the_tags_units_end_with(memory, request_context):
             assert unit["consolidated_at"] != _STAMP, (uid, unit)
     finally:
         await memory.delete_bank(bank_id, request_context=request_context)
+
+# ---------------------------------------------------------------------------
+# Moved from the append branch: with the retain gate ON, append-mode
+# re-extraction must not spread other units' tags onto genuinely new facts.
+# Built against retain's own field (retain_preserve_tag_prefixes).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(600)
+async def test_append_under_retain_gate_new_facts_keep_only_request_tags(memory, request_context):
+    bank_id = await _bank(memory, request_context, "appendgate", gate=["retain:"])
+    doc = "doc"
+    try:
+        before = await _seed(memory, bank_id, doc, request_context)
+        await _retain(
+            memory,
+            bank_id,
+            request_context,
+            content=_A + (chr(10) * 2) + _C,
+            document_id=doc,
+            update_mode="append",
+            tags=["session:two"],
+        )
+        after = await _units(memory, bank_id, doc)
+        fresh = {u: v for u, v in after.items() if u not in before}
+        survivors = {u: v for u, v in after.items() if u in before}
+        assert fresh and survivors
+        for uid, unit in fresh.items():
+            # Only the append request's tags; never a sibling's pin:/label: tags.
+            assert unit["tags"] == ["session:two"], (uid, unit["tags"])
+        for uid, unit in survivors.items():
+            added = set(unit["tags"]) - set(before[uid]["tags"])
+            assert added <= {"session:two"}, (uid, before[uid]["tags"], unit["tags"])
+            own = set(before[uid]["tags"]) - {"topic:one"}
+            assert own <= set(unit["tags"]), (uid, before[uid]["tags"], unit["tags"])
+    finally:
+        await memory.delete_bank(bank_id, request_context=request_context)
