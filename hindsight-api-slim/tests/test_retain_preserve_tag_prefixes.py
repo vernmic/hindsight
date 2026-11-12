@@ -85,7 +85,7 @@ def test_protected_tags_is_a_literal_prefix_match():
     # `_` and `%` are not wildcards: each prefix matches only itself.
     assert protected_tags(tags, ["pi_n:"]) == ["pi_n:y"]
     assert protected_tags(tags, ["re%"]) == ["re%:w"]
-    assert protected_tags(tags, ["pin:", "tier:"]) == ["pin:x", "label:one"]
+    assert protected_tags(tags, ["pin:", "label:"]) == ["pin:x", "label:one"]
 
 
 def test_protected_tags_off_and_empty():
@@ -187,7 +187,9 @@ async def test_replace_rerentain_survivors_keep_only_their_own_protected_tags(me
             # A replace that already carries the document-level protected tag still unions the
             # stored one exactly once: the kept document-row behaviour (no drop beyond #6336).
             await _retain(memory, bank_id, request_context, content=_A + "\n\n" + _C, document_id=doc, tags=["topic:three", "pin:doc"])
-            assert await _doc_tags(memory, bank_id, doc) == ["topic:three", "pin:doc"]
+            # #6591: merged tags persist sorted, not in caller order -- a document's tags
+            # written in another order by another worker must not read as a change.
+            assert await _doc_tags(memory, bank_id, doc) == ["pin:doc", "topic:three"]
     finally:
         await memory.delete_bank(bank_id, request_context=request_context)
 

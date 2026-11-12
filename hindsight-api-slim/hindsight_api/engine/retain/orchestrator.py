@@ -680,13 +680,14 @@ def _build_retain_params(contents_dicts, document_tags=None, doc_contents=None):
     else:
         items = contents_dicts
 
+    # Sorted, not set order: string hashing differs per process, and a document's tags written
+    # in another order by another worker read as a change and rewrite every unit it owns (#6591).
     all_tags = set(document_tags or [])
     for item in items:
         item_tags = item.get("tags", []) or []
         all_tags.update(item_tags)
-    # Sorted, not set order: string hashing differs per process, and a document's tags written
-    # in another order by another worker read as a change and rewrite every unit it owns (#6591).
     merged_tags = sorted(all_tags)
+
 
     retain_params = {}
     if items:
