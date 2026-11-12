@@ -104,7 +104,7 @@ function defaultSessionState(): SessionState {
 const strings = (v: unknown): string[] =>
   Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
 
-function parseState(p: any): SessionState {
+export function parseState(p: any): SessionState {
   const base = defaultSessionState();
   return {
     ...base,
@@ -161,7 +161,7 @@ function parseState(p: any): SessionState {
  * a mistyped scalar, or a pending/known-id entry it would filter out. Absent fields are fine
  * (they default), as are keyless ranges and fields the plugin does not model.
  */
-function assertModeled(p: any): void {
+export function assertModeled(p: any): void {
   const parsed = parseState(p) as Record<string, unknown>;
   for (const k of [...Object.keys(defaultSessionState()), "lastAppliedRetainId"]) {
     const raw = p[k];
