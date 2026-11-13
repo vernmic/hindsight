@@ -281,6 +281,7 @@ export function marksPolicyFromConfig(config: unknown): Partial<PrunePolicy> | u
   const out: Partial<PrunePolicy> = {};
   if (typeof raw.pruneAtPressure === "number") out.pruneAtPressure = raw.pruneAtPressure;
   if (typeof raw.pruneToPressure === "number") out.pruneToPressure = raw.pruneToPressure;
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 /** Host transcript store for an agent session key (generalized from e8cb's fixed workspace path). */
