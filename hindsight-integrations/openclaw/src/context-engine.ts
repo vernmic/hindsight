@@ -24,7 +24,7 @@ import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { PassPayload, PassProvider } from "./astinus-pass.js";
-import { providerUsageAfter, type LedgerMark, type MarksAdmissionPolicy } from "./assemble-marks.js";
+import { providerUsageAfter, type LedgerMark, type PrunePolicy } from "./assemble-marks.js";
 import { buildEngineViewCapture } from "./prompt-capture-engine.js";
 import { rotateTurns } from "./prompt-capture.js";
 import { FsTurnStore } from "./prompt-capture-fs.js";
@@ -169,7 +169,6 @@ export type MarksReadSide = {
     tokensAfter: number
   ): void;
   applyMarks: typeof import("./assemble-marks.js").applyMarks;
-  runMarkRebaseCached?: typeof import("./session-ledger.js").runMarkRebaseCached;
   estimateTokensHost(list: unknown[]): number;
 };
 
@@ -226,7 +225,6 @@ async function loadMarksReadSide(): Promise<MarksReadSide> {
     readMarksCached: ledger.readMarksCached,
     readMaxTurnId: ledger.readMaxTurnId,
     markMarksApplied: ledger.markMarksApplied,
-    runMarkRebaseCached: ledger.runMarkRebaseCached,
     applyMarks: marks.applyMarks,
     estimateTokensHost: marks.estimateTokensHost,
   };
@@ -238,7 +236,7 @@ export type ContextEngineOptions = {
   hostStateRoot?: string;
   loadMarks?: () => Promise<MarksReadSide>;
   /** Admission overrides from plugin config (`astinusMarks`); DEFAULT_MARKS_POLICY otherwise. */
-  getPolicy?: () => Partial<MarksAdmissionPolicy> | undefined;
+  getPolicy?: () => Partial<PrunePolicy> | undefined;
   /** Runtime version override for the compatibility gate (tests). */
   nodeVersion?: string;
   /** node:sqlite availability probe (tests); default probes the real builtin once per process. */
@@ -277,17 +275,12 @@ export type LedgerWriter = {
 };
 
 /** Plugin config `astinusMarks` -> admission overrides (e8cb index.ts astinusMarksPolicy). */
-export function marksPolicyFromConfig(config: unknown): Partial<MarksAdmissionPolicy> | undefined {
+export function marksPolicyFromConfig(config: unknown): Partial<PrunePolicy> | undefined {
   const raw = (config as { astinusMarks?: Record<string, unknown> } | undefined)?.astinusMarks;
   if (!raw || typeof raw !== "object") return undefined;
-  const out: Partial<MarksAdmissionPolicy> = {};
-  if (typeof raw.minPressure === "number") out.minPressure = raw.minPressure;
-  if (typeof raw.admitShare === "boolean") out.admitShare = raw.admitShare;
-  if (typeof raw.debounceTurns === "number") out.debounceTurns = raw.debounceTurns;
-  if (typeof raw.criticalPressure === "number") out.criticalPressure = raw.criticalPressure;
-  if (typeof raw.hardCapPressure === "number") out.hardCapPressure = raw.hardCapPressure;
-  if (typeof raw.hardCapTarget === "number") out.hardCapTarget = raw.hardCapTarget;
-  return Object.keys(out).length > 0 ? out : undefined;
+  const out: Partial<PrunePolicy> = {};
+  if (typeof raw.pruneAtPressure === "number") out.pruneAtPressure = raw.pruneAtPressure;
+  if (typeof raw.pruneToPressure === "number") out.pruneToPressure = raw.pruneToPressure;
 }
 
 /** Host transcript store for an agent session key (generalized from e8cb's fixed workspace path). */
@@ -413,12 +406,6 @@ export function createContextEngine(log: Logger, options: ContextEngineOptions =
         try {
           const side = await loadMarks();
           // One-time rebase before any mark applies by number (guarded; never breaks assemble).
-          side.runMarkRebaseCached?.(
-            key,
-            hostDbPath,
-            params.sessionId,
-            (m) => log.warn(m)
-          );
           const read = side.readMarksCached(key, (m) => log.warn(m));
           const marksIndex = authorityFor(options.hostStateRoot).marksIndex;
           let marks: unknown[] = marksIndex.get(key) ?? [];
@@ -446,24 +433,23 @@ export function createContextEngine(log: Logger, options: ContextEngineOptions =
               tokenBudget: params.tokenBudget ?? 0,
               // Review answer 1 (e8cb): the admission knobs ride the apply context from plugin config.
               policy: options.getPolicy?.(),
-              turnMiddleAgeTurns: options.turnMiddleAgeTurns,
               pressureScale: scale,
               // e8cb M1: the debounce counts TURNS off the ledger; the durable seq counter
               // (state.lastCommittedSeq) is only the cold-handle fallback.
               turnCounter: side.readMaxTurnId(key) ?? state.lastCommittedSeq,
             });
-            if (res.readError) {
+            if (res.skipped.length > 0) {
               log.warn(
-                `[hindsight-engine] assemble: host transcript unreadable (${res.readError}); view unchanged`
+                `[hindsight-engine] assemble: ${res.skipped.length} row(s) skipped (${res.skipped.slice(0, 3).join("; ")})`
               );
             }
             outList = res.messages;
             // Captured unconditionally (e8cb Q1 2026-10-07): the held-marks case needs it most.
             windowFirstSeq = res.windowFirstSeq ?? null;
-            hardCapped = res.hardCap !== null;
-            if (res.hardCap) {
+            hardCapped = res.prune !== null;
+            if (res.prune) {
               log.warn(
-                `[hindsight-engine] hard cap: ${res.hardCap.turns} turn(s) reduced, pressure ${res.hardCap.pressureBefore.toFixed(2)} -> ${res.hardCap.pressureAfter.toFixed(2)} session=${key}`
+                `[hindsight-engine] prune: epoch ${res.prune.epoch} dropped ${res.prune.dropped} pressure ${res.prune.pressureBefore.toFixed(2)} -> ${res.prune.pressureAfter.toFixed(2)} session=${key}`
               );
             }
             viewLastSeq = res.windowLastSeq ?? null;
@@ -766,7 +752,7 @@ export function registerHindsightContextEngine(
   api: { registerContextEngine?: RegisterContextEngine },
   log: Logger,
   hostStateRoot?: string,
-  getPolicy?: () => Partial<MarksAdmissionPolicy> | undefined,
+  getPolicy?: () => Partial<PrunePolicy> | undefined,
   durableTurns = false,
   pass: Pick<
     ContextEngineOptions,
