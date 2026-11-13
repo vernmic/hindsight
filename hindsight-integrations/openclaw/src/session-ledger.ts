@@ -89,6 +89,20 @@ const PRUNES_DDL = `CREATE TABLE IF NOT EXISTS prunes (
   admitted INTEGER NOT NULL, dropped INTEGER NOT NULL, fallback_mark_id INTEGER
 );`;
 
+/** Prune epoch lives on meta and on each mark; added in place for ledgers that predate it. */
+function ensurePruneColumns(db: DatabaseSync): void {
+  for (const sql of [
+    "ALTER TABLE meta ADD COLUMN prune_epoch INTEGER",
+    "ALTER TABLE marks ADD COLUMN prune_epoch INTEGER",
+  ]) {
+    try {
+      db.exec(sql);
+    } catch {
+      // column already present
+    }
+  }
+}
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS meta (
   session_key TEXT NOT NULL, agent_id TEXT NOT NULL, host_db_path TEXT NOT NULL,
@@ -245,6 +259,7 @@ export function openSessionLedger(
     if (v === 0) {
       db.exec(SCHEMA);
       db.exec(PRUNES_DDL);
+      ensurePruneColumns(db);
       db.exec(CHECKPOINT_SCHEMA_V2_DDL);
       db.exec(`PRAGMA user_version = ${LEDGER_SCHEMA_VERSION};`);
       db.prepare(
