@@ -1,0 +1,4 @@
+name: jev_gate
+version: 0.1.0
+description: "Typed Jev judgments for turn context and unattended skill writes."
+requires_env: []
