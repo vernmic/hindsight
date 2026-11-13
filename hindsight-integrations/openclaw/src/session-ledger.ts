@@ -92,14 +92,21 @@ const PRUNES_DDL = `CREATE TABLE IF NOT EXISTS prunes (
 /** Prune epoch lives on meta and on each mark; added in place for ledgers that predate it. */
 function ensurePruneColumns(db: DatabaseSync): void {
   for (const sql of [
-    "ALTER TABLE meta ADD COLUMN prune_epoch INTEGER",
-    "ALTER TABLE marks ADD COLUMN prune_epoch INTEGER",
+    "ALTER TABLE meta ADD COLUMN prune_epoch INTEGER DEFAULT 0",
+    "ALTER TABLE marks ADD COLUMN prune_epoch INTEGER DEFAULT 0",
   ]) {
     try {
       db.exec(sql);
     } catch {
       // column already present
     }
+  }
+  // NULL means epoch 0 (the pre-prune generation); normalise so equality filters match.
+  try {
+    db.exec("UPDATE meta SET prune_epoch = 0 WHERE prune_epoch IS NULL");
+    db.exec("UPDATE marks SET prune_epoch = 0 WHERE prune_epoch IS NULL");
+  } catch {
+    // nothing to normalise
   }
 }
 
