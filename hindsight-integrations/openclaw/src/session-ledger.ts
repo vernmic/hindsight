@@ -6,7 +6,7 @@
 // result and never throws; a failure logs at warn and the caller continues.
 import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
-import { mkdirSync } from "fs";
+import { existsSync, mkdirSync, renameSync } from "fs";
 import { join } from "path";
 import {
   CHECKPOINT_SCHEMA_V2_DDL,
@@ -15,6 +15,8 @@ import {
   readContextState,
   type ContextStateRow,
 } from "./checkpoint-store.js";
+import { HostTranscript } from "./host-transcript-local.js";
+import { legacySessionFileName, sessionFileName } from "./session-state.js";
 
 // v2 adds the durable checkpoint records (context_state / context_checkpoints /
 // checkpoint_entries / ledger_bindings). Fresh ledgers are created at v2; an
@@ -42,9 +44,20 @@ export function ledgerEligible(sessionKey: string | undefined | null): boolean {
   return true;
 }
 
+/** R27.2 naming (package 32): readable prefix plus a SHA-256 of the full key. */
 export function ledgerPath(sessionKey: string): string {
-  const safe = String(sessionKey).replace(/[^a-zA-Z0-9_.-]/g, "_").slice(0, 120);
-  return join(ledgerRoot, "workspace", "state", "astinus", `${safe}.sqlite`);
+  return join(ledgerRoot, "workspace", "state", "astinus", sessionFileName(sessionKey, ".sqlite"));
+}
+
+/** The maintained plugin's lossy name; several keys can share it, so it is never adopted. */
+export function legacyLedgerPath(sessionKey: string): string {
+  return join(
+    ledgerRoot,
+    "workspace",
+    "state",
+    "astinus",
+    legacySessionFileName(sessionKey, ".sqlite")
+  );
 }
 
 /**
@@ -70,8 +83,6 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 `;
 
-// One row per committed prune (2026-11-03). An earlier epoch's drop removes tokens without any
-// mark row being stamped, so the report reads the prune's own before/after from here (Astinus #6340).
 const PRUNES_DDL = `CREATE TABLE IF NOT EXISTS prunes (
   epoch INTEGER PRIMARY KEY, at INTEGER NOT NULL,
   tokens_before INTEGER, tokens_after INTEGER,
@@ -120,8 +131,7 @@ CREATE TABLE IF NOT EXISTS marks (
   stmt_age_s  INTEGER, topic_dormancy_s INTEGER, pressure REAL,
   proposed_at INTEGER NOT NULL, applied_gen TEXT, applied_at INTEGER,
   view_tokens_before INTEGER, view_tokens_after INTEGER,
-  anchor_first_event TEXT, anchor_last_event TEXT,
-  retired_at INTEGER
+  anchor_first_event TEXT, anchor_last_event TEXT, retired_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS ix_marks_seq ON marks(session_id, seq_start);
 CREATE TABLE IF NOT EXISTS supersessions (
@@ -142,7 +152,6 @@ CREATE TABLE IF NOT EXISTS rebases (
   rebase_id INTEGER PRIMARY KEY, session_id TEXT NOT NULL,
   old_gen TEXT, new_gen TEXT, at INTEGER NOT NULL, note TEXT
 );
-${PRUNES_DDL}
 `;
 
 const cache = new Map<string, DatabaseSync>();
@@ -158,9 +167,36 @@ let lastIdleSweepAt = 0;
 const disabled = new Map<string, { reason: string; until: number }>();
 const OPEN_FAILED_COOLDOWN_MS = 5 * 60 * 1000;
 
-export type LedgerOpen =
-  | { ok: true; db: DatabaseSync }
-  | { ok: false; reason: string };
+export type LedgerOpen = { ok: true; db: DatabaseSync } | { ok: false; reason: string };
+
+/** Rename a legacy ledger to its digest name when its meta.session_key is this key. */
+function adoptLegacyLedger(from: string, to: string, sessionKey: string): boolean {
+  let stored: string | undefined;
+  try {
+    const ro = new DatabaseSync(from, { readOnly: true });
+    try {
+      stored = (
+        ro.prepare("SELECT session_key FROM meta LIMIT 1").get() as
+          | { session_key?: string }
+          | undefined
+      )?.session_key;
+    } finally {
+      ro.close();
+    }
+  } catch {
+    return false;
+  }
+  if (stored !== sessionKey) return false;
+  const rw = new DatabaseSync(from);
+  try {
+    rw.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+  } finally {
+    rw.close();
+  }
+  renameSync(from, to);
+  for (const ext of ["-wal", "-shm"]) if (existsSync(from + ext)) renameSync(from + ext, to + ext);
+  return true;
+}
 
 /** Open (or create) a session's ledger. Cached; never throws. */
 export function openSessionLedger(
@@ -184,6 +220,20 @@ export function openSessionLedger(
   const path = ledgerPath(sessionKey);
   let db: DatabaseSync;
   try {
+    // A lossy-named ledger is adopted only when its stored key is this key; otherwise it may
+    // belong to another key, so it fails closed (as R27.2).
+    const legacy = legacyLedgerPath(sessionKey);
+    if (!existsSync(path) && existsSync(legacy)) {
+      if (adoptLegacyLedger(legacy, path, sessionKey)) {
+        warn(`[astinus-ledger] ${sessionKey}: adopted legacy ledger ${legacy} -> ${path}`);
+      }
+    }
+    if (!existsSync(path) && existsSync(legacy)) {
+      const reason = "legacy-ledger-unreconciled";
+      disabled.set(sessionKey, { reason, until: Number.POSITIVE_INFINITY });
+      warn(`[astinus-ledger] ${sessionKey}: ${reason}; ledger disabled for this session`);
+      return { ok: false, reason };
+    }
     mkdirSync(join(ledgerRoot, "workspace", "state", "astinus"), { recursive: true });
     db = new DatabaseSync(path);
     db.exec(`PRAGMA journal_mode = WAL;`);
@@ -194,6 +244,7 @@ export function openSessionLedger(
     const v = Number(row?.user_version ?? 0);
     if (v === 0) {
       db.exec(SCHEMA);
+      db.exec(PRUNES_DDL);
       db.exec(CHECKPOINT_SCHEMA_V2_DDL);
       db.exec(`PRAGMA user_version = ${LEDGER_SCHEMA_VERSION};`);
       db.prepare(
@@ -234,38 +285,6 @@ export function openSessionLedger(
     }
     cache.set(sessionKey, db);
     lastUsedAt.set(sessionKey, Date.now());
-    // Anchor columns (2026-11-02): a mark resolves by the host event id at its two
-    // boundaries, because seq coordinates move on a trim or a header repair. Added in
-    // place so an existing ledger keeps its rows; a failure leaves the ledger usable.
-    try {
-      const markCols = db.prepare("PRAGMA table_info(marks)").all() as Array<{ name?: string }>;
-      const names = new Set(markCols.map((c) => c.name));
-      if (!names.has("anchor_first_event")) {
-        db.exec("ALTER TABLE marks ADD COLUMN anchor_first_event TEXT");
-      }
-      if (!names.has("anchor_last_event")) {
-        db.exec("ALTER TABLE marks ADD COLUMN anchor_last_event TEXT");
-      }
-      if (!names.has("retired_at")) {
-        db.exec("ALTER TABLE marks ADD COLUMN retired_at INTEGER");
-      }
-      // Prune cycle (2026-11-03): the epoch a mark was admitted in, and the session's current one.
-      // NULL reads as 0, so marks applied before the cycle form epoch 0.
-      if (!names.has("prune_epoch")) {
-        db.exec("ALTER TABLE marks ADD COLUMN prune_epoch INTEGER");
-      }
-      const metaCols = db.prepare("PRAGMA table_info(meta)").all() as Array<{ name?: string }>;
-      const metaNames = new Set(metaCols.map((c) => c.name));
-      if (!metaNames.has("mark_rebase_done")) {
-        db.exec("ALTER TABLE meta ADD COLUMN mark_rebase_done INTEGER");
-      }
-      if (!metaNames.has("prune_epoch")) {
-        db.exec("ALTER TABLE meta ADD COLUMN prune_epoch INTEGER");
-      }
-      db.exec(PRUNES_DDL);
-    } catch {
-      /* a locked or read-only ledger keeps working without anchors */
-    }
     // Item 6: hourly idle-close sweep, piggybacked on the per-turn open path.
     if (Date.now() - lastIdleSweepAt > IDLE_SWEEP_INTERVAL_MS) {
       lastIdleSweepAt = Date.now();
@@ -441,80 +460,6 @@ export function markMarksApplied(
   }
 }
 
-/** The session's current prune epoch from an already-open ledger; 0 when never pruned or unreadable. */
-export function readPruneEpochCached(sessionKey: string): number {
-  const db = cache.get(sessionKey);
-  if (!db) return 0;
-  try {
-    const row = db.prepare("SELECT prune_epoch AS e FROM meta LIMIT 1").get() as { e?: number | null } | undefined;
-    return typeof row?.e === "number" && row.e > 0 ? row.e : 0;
-  } catch {
-    return 0;
-  }
-}
-
-/** Commit one prune in a single transaction: the new epoch, the admitted marks stamped with it,
- *  and the oldest-turns fallback (if any) inserted as an applied mark of that epoch. All or
- *  nothing: a failed commit leaves the old epoch, and the next view recomputes the same prune.
- *  Returns false on failure; never throws. */
-export function commitPrune(
-  sessionKey: string,
-  epoch: number,
-  admittedIds: Array<number | unknown>,
-  fallback: { session_id?: string; seq_start: number; seq_end: number; kind?: string; action: string; digest?: string | null; reason?: string } | null,
-  gen: string,
-  tokensBefore: number,
-  tokensAfter: number,
-  dropped = 0
-): boolean {
-  const db = cache.get(sessionKey);
-  if (!db) return false;
-  const now = Date.now();
-  try {
-    db.exec("BEGIN IMMEDIATE");
-    try {
-      db.prepare("UPDATE meta SET prune_epoch = ?").run(epoch);
-      const st = db.prepare(
-        "UPDATE marks SET applied_gen = ?, applied_at = ?, view_tokens_before = ?, view_tokens_after = ?, prune_epoch = ? WHERE mark_id = ?"
-      );
-      for (const id of admittedIds) st.run(gen, now, tokensBefore, tokensAfter, epoch, id as number);
-      let fallbackId: number | null = null;
-      if (fallback) {
-        const ins = db.prepare(
-          `INSERT INTO marks (session_id, seq_start, seq_end, kind, action, digest, reason, proposed_at,
-                              applied_gen, applied_at, view_tokens_before, view_tokens_after, prune_epoch)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`
-        ).run(
-          fallback.session_id ?? "",
-          fallback.seq_start,
-          fallback.seq_end,
-          fallback.kind ?? "turn",
-          fallback.action,
-          fallback.digest ?? null,
-          fallback.reason ?? "prune_fallback",
-          now,
-          gen,
-          now,
-          tokensBefore,
-          tokensAfter,
-          epoch
-        );
-        fallbackId = Number(ins.lastInsertRowid);
-      }
-      db.prepare(
-        "INSERT INTO prunes (epoch, at, tokens_before, tokens_after, admitted, dropped, fallback_mark_id) VALUES (?,?,?,?,?,?,?)"
-      ).run(epoch, now, tokensBefore, tokensAfter, admittedIds.length, dropped, fallbackId);
-      db.exec("COMMIT");
-      return true;
-    } catch {
-      db.exec("ROLLBACK");
-      return false;
-    }
-  } catch {
-    return false;
-  }
-}
-
 /** Union of ledger topic slugs over the given seq ranges, plus which ranges had no
  *  turn_topics rows (plan SS9.3: the retain path tags from the LEDGER, not
  *  classifyTurn(prompt)). Read-only from the in-process handle - after a gateway
@@ -674,9 +619,7 @@ export function readLiveTopics(sessionKey: string, limit: number): string[] {
          ORDER BY last_seen_seq DESC LIMIT ?`
       )
       .all(Math.floor(limit)) as Array<{ slug: string }>;
-    return rows
-      .map((r) => (typeof r.slug === "string" ? r.slug : ""))
-      .filter((s) => s.length > 0);
+    return rows.map((r) => (typeof r.slug === "string" ? r.slug : "")).filter((s) => s.length > 0);
   } catch {
     return [];
   }
@@ -713,7 +656,7 @@ export function readTopicDelta(
         .map((r) => (typeof r.slug === "string" ? r.slug : ""))
         .filter((s) => s.length > 0);
     const newest = slugList(Number(turnRows[0].turn_id));
-    const prevTop = turnRows.length > 1 ? slugList(Number(turnRows[1].turn_id))[0] ?? null : null;
+    const prevTop = turnRows.length > 1 ? (slugList(Number(turnRows[1].turn_id))[0] ?? null) : null;
     const recentSet = new Set<string>();
     for (let i = 1; i < turnRows.length; i++) {
       for (const s of slugList(Number(turnRows[i].turn_id))) recentSet.add(s);
@@ -841,6 +784,7 @@ export function insertCommittedTurn(
   }
 }
 
+/** Read the session's marks; on failure the caller falls back to its cached index (R2). */
 export function readMarks(
   sessionKey: string,
   agentId: string,
@@ -853,8 +797,13 @@ export function readMarks(
     const marks = opened.db
       .prepare(
         `SELECT mark_id, session_id, seq_start, seq_end, kind, action, digest, reason,
-                applied_gen, applied_at, anchor_first_event, anchor_last_event, retired_at, prune_epoch
-           FROM marks ORDER BY seq_start`
+                applied_gen, applied_at, anchor_first_event, anchor_last_event, retired_at
+           FROM marks
+          -- R36.1: an unanchored (legacy numeric) mark applies only once the one-time rebase
+          -- has committed; a failed/deferred rebase leaves the prompt unchanged by it until a retry.
+          WHERE anchor_first_event IS NOT NULL
+             OR (SELECT mark_rebase_done FROM meta LIMIT 1) IS NOT NULL
+          ORDER BY seq_start`
       )
       .all();
     return { ok: true, marks };
@@ -887,8 +836,13 @@ export function readMarksCached(
     const marks = db
       .prepare(
         `SELECT mark_id, session_id, seq_start, seq_end, kind, action, digest, reason,
-                applied_gen, applied_at, anchor_first_event, anchor_last_event, retired_at, prune_epoch
-           FROM marks ORDER BY seq_start`
+                applied_gen, applied_at, anchor_first_event, anchor_last_event, retired_at
+           FROM marks
+          -- R36.1: an unanchored (legacy numeric) mark applies only once the one-time rebase
+          -- has committed; a failed/deferred rebase leaves the prompt unchanged by it until a retry.
+          WHERE anchor_first_event IS NOT NULL
+             OR (SELECT mark_rebase_done FROM meta LIMIT 1) IS NOT NULL
+          ORDER BY seq_start`
       )
       .all();
     return { ok: true, marks };
@@ -955,3 +909,109 @@ export function readActiveCheckpointEntryIdsCached(sessionKey: string): string[]
     .filter((s) => s.length > 0);
 }
 
+/**
+ * One-time mark rebase plan. Marks admitted before anchors existed carry only seq numbers:
+ * - applied under the current generation: numbers still exact, so backfill anchors;
+ * - applied under an older generation: a rewrite and a reindex cannot be told apart, retire;
+ * - pending and unanchored: proposed before the columns existed, remove (the pass re-proposes).
+ */
+export function planMarkRebase(
+  marks: ReadonlyArray<{
+    mark_id: number;
+    applied_gen?: string | null;
+    applied_at?: number | null;
+    anchor_first_event?: string | null;
+    anchor_last_event?: string | null;
+  }>,
+  currentGen: string
+): { backfill: number[]; retire: number[]; remove: number[] } {
+  const plan = { backfill: [] as number[], retire: [] as number[], remove: [] as number[] };
+  for (const m of marks) {
+    if (m.anchor_first_event && m.anchor_last_event) continue;
+    if (m.applied_at == null) plan.remove.push(m.mark_id);
+    else if (currentGen && m.applied_gen === currentGen) plan.backfill.push(m.mark_id);
+    else plan.retire.push(m.mark_id);
+  }
+  return plan;
+}
+
+export function readPruneEpochCached(sessionKey: string): number {
+  const db = cache.get(sessionKey);
+  if (!db) return 0;
+  try {
+    const row = db.prepare("SELECT prune_epoch AS e FROM meta LIMIT 1").get() as { e?: number | null } | undefined;
+    return typeof row?.e === "number" && row.e > 0 ? row.e : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** Commit one prune in a single transaction: the new epoch, the admitted marks stamped with it,
+ *  and the oldest-turns fallback (if any) inserted as an applied mark of that epoch. All or
+ *  nothing: a failed commit leaves the old epoch, and the next view recomputes the same prune.
+ *  Returns false on failure; never throws. */
+
+export function commitPrune(
+  sessionKey: string,
+  epoch: number,
+  admittedIds: Array<number | unknown>,
+  fallback: { session_id?: string; seq_start: number; seq_end: number; kind?: string; action: string; digest?: string | null; reason?: string } | null,
+  gen: string,
+  tokensBefore: number,
+  tokensAfter: number,
+  dropped = 0
+): boolean {
+  const db = cache.get(sessionKey);
+  if (!db) return false;
+  const now = Date.now();
+  try {
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      db.prepare("UPDATE meta SET prune_epoch = ?").run(epoch);
+      const st = db.prepare(
+        "UPDATE marks SET applied_gen = ?, applied_at = ?, view_tokens_before = ?, view_tokens_after = ?, prune_epoch = ? WHERE mark_id = ?"
+      );
+      for (const id of admittedIds) st.run(gen, now, tokensBefore, tokensAfter, epoch, id as number);
+      let fallbackId: number | null = null;
+      if (fallback) {
+        const ins = db.prepare(
+          `INSERT INTO marks (session_id, seq_start, seq_end, kind, action, digest, reason, proposed_at,
+                              applied_gen, applied_at, view_tokens_before, view_tokens_after, prune_epoch)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`
+        ).run(
+          fallback.session_id ?? "",
+          fallback.seq_start,
+          fallback.seq_end,
+          fallback.kind ?? "turn",
+          fallback.action,
+          fallback.digest ?? null,
+          fallback.reason ?? "prune_fallback",
+          now,
+          gen,
+          now,
+          tokensBefore,
+          tokensAfter,
+          epoch
+        );
+        fallbackId = Number(ins.lastInsertRowid);
+      }
+      db.prepare(
+        "INSERT INTO prunes (epoch, at, tokens_before, tokens_after, admitted, dropped, fallback_mark_id) VALUES (?,?,?,?,?,?,?)"
+      ).run(epoch, now, tokensBefore, tokensAfter, admittedIds.length, dropped, fallbackId);
+      db.exec("COMMIT");
+      return true;
+    } catch {
+      db.exec("ROLLBACK");
+      return false;
+    }
+  } catch {
+    return false;
+  }
+}
+
+/** Union of ledger topic slugs over the given seq ranges, plus which ranges had no
+ *  turn_topics rows (plan SS9.3: the retain path tags from the LEDGER, not
+ *  classifyTurn(prompt)). Read-only from the in-process handle - after a gateway
+ *  restart the first drain may read nothing until the session commits again (the
+ *  commit path re-opens the handle); that drain falls back to the regex tags.
+ *  Any failure reads as "all uncovered", which degrades to today's behaviour. */
