@@ -540,10 +540,8 @@ function loadConfig(raw: Record<string, unknown>) {
 describe("astinusMarks through the real getPluginConfig (R9.1)", () => {
   it("preserves all supported overrides", () => {
     const requested = {
-      minPressure: 0.99,
-      admitShare: false,
-      debounceTurns: 3,
-      criticalPressure: 0.8,
+      pruneAtPressure: 0.99,
+      pruneToPressure: 0.25,
     };
     const parsed = loadConfig({ astinusMarks: requested });
     expect(parsed.astinusMarks).toEqual(requested);
@@ -551,8 +549,8 @@ describe("astinusMarks through the real getPluginConfig (R9.1)", () => {
   });
 
   it("keeps a partial override partial and drops mistyped fields", () => {
-    const parsed = loadConfig({ astinusMarks: { minPressure: 0.5, debounceTurns: "x" } });
-    expect(marksPolicyFromConfig(parsed)).toEqual({ minPressure: 0.5 });
+    const parsed = loadConfig({ astinusMarks: { pruneAtPressure: 0.5, pruneToPressure: "x" } });
+    expect(marksPolicyFromConfig(parsed)).toEqual({ pruneAtPressure: 0.5 });
   });
 
   it("leaves the policy undefined (defaults) when absent", () => {
@@ -566,21 +564,20 @@ describe("astinusMarks policy wiring", () => {
   it("parses only typed overrides", () => {
     expect(marksPolicyFromConfig(undefined)).toBeUndefined();
     expect(marksPolicyFromConfig({})).toBeUndefined();
-    expect(marksPolicyFromConfig({ astinusMarks: { minPressure: "x" } })).toBeUndefined();
+    expect(marksPolicyFromConfig({ astinusMarks: { pruneAtPressure: "x" } })).toBeUndefined();
     expect(
       marksPolicyFromConfig({
         astinusMarks: {
-          minPressure: 0.4,
+          pruneAtPressure: 0.6,
+          pruneToPressure: 0.25,
           admitShare: false,
-          debounceTurns: 3,
-          criticalPressure: 0.8,
         },
       })
-    ).toEqual({ minPressure: 0.4, admitShare: false, debounceTurns: 3, criticalPressure: 0.8 });
+    ).toEqual({ pruneAtPressure: 0.6, pruneToPressure: 0.25 });
   });
 
   it("re-reads the policy on every assemble and passes it to applyMarks", async () => {
-    let cfg: unknown = { astinusMarks: { minPressure: 0.5 } };
+    let cfg: unknown = { astinusMarks: { pruneAtPressure: 0.5 } };
     const registerContextEngine = vi.fn();
     registerHindsightContextEngine({ registerContextEngine }, log(), "/root", () =>
       marksPolicyFromConfig(cfg)
