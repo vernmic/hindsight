@@ -4,9 +4,18 @@ import importlib.util
 from pathlib import Path
 import yaml
 
+def _pin_runtime_dir(monkeypatch):
+    """Pin the control scripts' runtime-path insert to the SAME core this
+    suite runs against; without it the script inserts the operator's real
+    <home>/hermes-agent into the shared test process and later lazy imports
+    (pm.*) resolve to the live install instead of the pinned core."""
+    import hermes_cli
+    monkeypatch.setenv("HERMES_RUNTIME_DIR", str(Path(hermes_cli.__file__).resolve().parents[1]))
 
-def _load():
+
+def _load(monkeypatch):
     path = Path(__file__).parents[2] / "scripts/jev-write-control.py"
+    _pin_runtime_dir(monkeypatch)
     spec = importlib.util.spec_from_file_location("jev_write_control_test", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -36,8 +45,8 @@ def _write(tmp_path):
     return config_path
 
 
-def test_write_off_changes_only_write_gate(tmp_path):
-    module = _load()
+def test_write_off_changes_only_write_gate(tmp_path, monkeypatch):
+    module = _load(monkeypatch)
     config_path = _write(tmp_path)
     original = yaml.safe_load(CONFIG)
     result = module.control("write", "off", tmp_path)
@@ -53,8 +62,8 @@ def test_write_off_changes_only_write_gate(tmp_path):
     assert yaml.safe_load(config_path.read_text()) == original
 
 
-def test_review_off_changes_only_fallback_review(tmp_path):
-    module = _load()
+def test_review_off_changes_only_fallback_review(tmp_path, monkeypatch):
+    module = _load(monkeypatch)
     config_path = _write(tmp_path)
     module.control("review", "off", tmp_path)
     after = yaml.safe_load(config_path.read_text())
@@ -66,8 +75,8 @@ def test_review_off_changes_only_fallback_review(tmp_path):
     assert yaml.safe_load(config_path.read_text()) == yaml.safe_load(CONFIG)
 
 
-def test_review_off_creates_block_when_absent(tmp_path):
-    module = _load()
+def test_review_off_creates_block_when_absent(tmp_path, monkeypatch):
+    module = _load(monkeypatch)
     config_path = tmp_path
     config_path.mkdir(exist_ok=True)
     (config_path / "config.yaml").write_text("jev_gate:\n  mode: enforced\n  write_gate:\n    mode: enforced\n")
@@ -82,8 +91,8 @@ def test_review_off_creates_block_when_absent(tmp_path):
     assert after["fallback_review"] == {"enabled": False}
 
 
-def test_status_reports_both_and_writes_nothing(tmp_path):
-    module = _load()
+def test_status_reports_both_and_writes_nothing(tmp_path, monkeypatch):
+    module = _load(monkeypatch)
     config_path = _write(tmp_path)
     before = config_path.read_text()
     result = module.control("status", "status", tmp_path)
@@ -94,13 +103,14 @@ def test_status_reports_both_and_writes_nothing(tmp_path):
     assert config_path.read_text() == before
 
 
-def test_read_switch_leaves_write_controls_alone(tmp_path):
+def test_read_switch_leaves_write_controls_alone(tmp_path, monkeypatch):
     # the selection-only switch must preserve both write controls
     control_path = Path(__file__).parents[2] / "scripts/jev-control.py"
+    _pin_runtime_dir(monkeypatch)
     spec = importlib.util.spec_from_file_location("jev_control_test", control_path)
     control = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(control)
-    module = _load()
+    module = _load(monkeypatch)
     _write(tmp_path)
     control.control("off", tmp_path)
     result = module.control("status", "status", tmp_path)
