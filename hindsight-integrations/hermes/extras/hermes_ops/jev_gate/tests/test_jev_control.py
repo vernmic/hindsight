@@ -4,9 +4,18 @@ import importlib.util
 from pathlib import Path
 import yaml
 
+def _pin_runtime_dir(monkeypatch):
+    """Pin the control scripts' runtime-path insert to the SAME core this
+    suite runs against; without it the script inserts the operator's real
+    <home>/hermes-agent into the shared test process and later lazy imports
+    (pm.*) resolve to the live install instead of the pinned core."""
+    import hermes_cli
+    monkeypatch.setenv("HERMES_RUNTIME_DIR", str(Path(hermes_cli.__file__).resolve().parents[1]))
 
-def test_off_on_preserves_other_settings_and_comments(tmp_path):
+
+def test_off_on_preserves_other_settings_and_comments(tmp_path, monkeypatch):
     path = Path(__file__).parents[2] / "scripts/jev-control.py"
+    _pin_runtime_dir(monkeypatch)
     spec = importlib.util.spec_from_file_location("jev_control_test", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
