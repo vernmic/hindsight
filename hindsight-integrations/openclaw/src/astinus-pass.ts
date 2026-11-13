@@ -11,11 +11,7 @@ import { DatabaseSync } from "node:sqlite";
 import { appendFileSync, existsSync, mkdirSync, realpathSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import {
-  DEFAULT_TURN_MIDDLE_AGE_TURNS,
-  ensureMarkAnchorColumns,
-  HostTranscript,
-} from "./assemble-marks.js";
+import { HostTranscript } from "./host-transcript-local.js";
 import { configureSessionLedger, ledgerPath } from "./session-ledger.js";
 import { callLlm, type PassProvider, type ProviderDeps } from "./pass-provider.js";
 
@@ -40,6 +36,9 @@ export type PassDeps = ProviderDeps & { now?: () => number };
 
 const PASS_BUSY_TIMEOUT_MS = 5000;
 const PRESERVE_USER_TURNS = 8;
+/** F2 (design A.14): turn_middle marks become proposable once this many newer turns exist.
+ *  The payload may override it; the ledger schema owns the mark columns. */
+const DEFAULT_TURN_MIDDLE_AGE_TURNS = 6;
 const TURN_MIDDLE_REASON = "turn_middle: interior redactable; boundaries and steers preserved";
 
 export const SYSTEM_PROMPT = `You are Astinus, the session-ledger keeper for an AI assistant.
@@ -346,7 +345,6 @@ export async function runPass(payload: PassPayload, deps: PassDeps = {}): Promis
   let passId: number | null = null;
   try {
     db.exec(`PRAGMA busy_timeout = ${PASS_BUSY_TIMEOUT_MS}; PRAGMA journal_mode = WAL;`);
-    ensureMarkAnchorColumns(db);
     const meta = db
       .prepare("SELECT host_db_path, agent_id, session_key FROM meta LIMIT 1")
       .get() as Json | undefined;
