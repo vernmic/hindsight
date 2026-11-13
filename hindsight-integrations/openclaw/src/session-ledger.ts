@@ -15,7 +15,6 @@ import {
   readContextState,
   type ContextStateRow,
 } from "./checkpoint-store.js";
-import { planRebase, type RebaseMark } from "./mark-rebase.js";
 
 // v2 adds the durable checkpoint records (context_state / context_checkpoints /
 // checkpoint_entries / ledger_bindings). Fresh ledgers are created at v2; an
@@ -842,127 +841,6 @@ export function insertCommittedTurn(
   }
 }
 
-/**
- * One-time mark rebase (2026-11-02).
- *
- * Marks admitted before anchors existed carry only numbers, and those numbers may
- * already point at different content. Run once per session: backfill anchors for
- * marks applied under the current generation, retire the ones applied under an
- * older generation (their transcript may have been rewritten in place or
- * reindexed, and the two cannot be told apart), and delete pending marks that
- * never got anchors so the pass proposes them again. One transaction, three
- * logged counts, and a meta flag so it never repeats.
- */
-export function runMarkRebase(
-  sessionKey: string,
-  agentId: string,
-  hostDbPath: string,
-  currentGen: string,
-  warn: (msg: string) => void
-): { backfill: number; retire: number; remove: number } | null {
-  const opened = openSessionLedger(sessionKey, agentId, hostDbPath, warn);
-  if (!opened.ok) return null;
-  const db = opened.db;
-  try {
-    const done = db
-      .prepare("SELECT mark_rebase_done FROM meta LIMIT 1")
-      .get() as { mark_rebase_done?: number | null } | undefined;
-    if (done?.mark_rebase_done != null) return null;
-    const marks = db
-      .prepare(
-        `SELECT mark_id, seq_start, seq_end, applied_gen, applied_at,
-                anchor_first_event, anchor_last_event, session_id FROM marks`
-      )
-      .all() as unknown as Array<RebaseMark & { session_id: string }>;
-    const sessionId = marks[0]?.session_id ?? "";
-    // A2 (Codex 11-03): a saved prior observation is not proof of the CURRENT host
-    // generation. Read the rewrite watermark for this session and treat anything we
-    // cannot prove as unbackfillable, so old coordinates are retired, never blessed.
-    let hostGen: string | null = null;
-    try {
-      const host = new DatabaseSync(hostDbPath, { readOnly: true });
-      try {
-        const row = host
-          .prepare(
-            "SELECT generation FROM transcript_rewrite_watermarks WHERE session_id = ?"
-          )
-          .get(sessionId) as { generation?: string | null } | undefined;
-        hostGen = typeof row?.generation === "string" && row.generation ? row.generation : null;
-      } finally {
-        host.close();
-      }
-    } catch {
-      hostGen = null;
-    }
-    const plan = planRebase(marks, hostGen ?? "\u0000unknown");
-    let hostSeqs: Map<number, string> | null = null;
-    const seqToEvent = (seq: number): string | null => {
-      if (!hostSeqs) {
-        hostSeqs = new Map();
-        try {
-          const host = new DatabaseSync(hostDbPath, { readOnly: true });
-          try {
-            const rows = host
-              .prepare(
-                "SELECT seq, event_id FROM transcript_event_identities WHERE session_id = ?"
-              )
-              .all(sessionId) as Array<{ seq: number; event_id: string }>;
-            for (const row of rows) hostSeqs.set(Number(row.seq), String(row.event_id));
-          } finally {
-            host.close();
-          }
-        } catch {
-          /* no identity table: nothing to backfill from */
-        }
-      }
-      return hostSeqs.get(seq) ?? null;
-    };
-    db.exec("BEGIN IMMEDIATE");
-    try {
-      let backfilled = 0;
-      for (const markId of plan.backfill) {
-        const mark = marks.find((m) => m.mark_id === markId);
-        if (!mark) continue;
-        const first = seqToEvent(mark.seq_start);
-        const last = seqToEvent(mark.seq_end);
-        if (!first || !last) continue;
-        db.prepare(
-          "UPDATE marks SET anchor_first_event = ?, anchor_last_event = ? WHERE mark_id = ?"
-        ).run(first, last, markId);
-        backfilled += 1;
-      }
-      const retired = db
-        .prepare("UPDATE marks SET retired_at = ? WHERE mark_id = ?");
-      for (const markId of plan.retire) retired.run(Date.now(), markId);
-      const remove = db.prepare("DELETE FROM marks WHERE mark_id = ?");
-      for (const markId of plan.remove) remove.run(markId);
-      db.prepare("UPDATE meta SET mark_rebase_done = ?").run(Date.now());
-      db.exec("COMMIT");
-      const counts = {
-        backfill: backfilled,
-        retire: plan.retire.length,
-        remove: plan.remove.length,
-      };
-      warn(
-        `[astinus-ledger] ${sessionKey}: mark rebase backfill=${counts.backfill} ` +
-          `retire=${counts.retire} remove=${counts.remove}`
-      );
-      return counts;
-    } catch (e) {
-      try {
-        db.exec("ROLLBACK");
-      } catch {
-        /* nothing to roll back */
-      }
-      throw e;
-    }
-  } catch (e) {
-    warn(`[astinus-ledger] ${sessionKey}: mark rebase failed: ${(e as Error)?.message ?? e}`);
-    return null;
-  }
-}
-
-/** Read the session's marks; on failure the caller falls back to its cached index (R2). */
 export function readMarks(
   sessionKey: string,
   agentId: string,
