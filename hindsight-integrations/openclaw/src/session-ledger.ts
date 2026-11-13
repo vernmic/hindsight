@@ -269,7 +269,6 @@ export function openSessionLedger(
     if (v === 0) {
       db.exec(SCHEMA);
       db.exec(PRUNES_DDL);
-      ensurePruneColumns(db);
       db.exec(CHECKPOINT_SCHEMA_V2_DDL);
       db.exec(`PRAGMA user_version = ${LEDGER_SCHEMA_VERSION};`);
       db.prepare(
@@ -296,6 +295,8 @@ export function openSessionLedger(
         return { ok: false, reason };
       }
     }
+    // Idempotent, and it also upgrades a ledger written before the prune era (columns + retirement).
+    ensurePruneColumns(db);
     if (cache.size >= MAX_CACHED_LEDGERS) {
       const oldest = cache.keys().next().value;
       if (oldest !== undefined) {
