@@ -2,3 +2,9 @@ name: jev_gate
 version: 0.1.0
 description: "Typed Jev judgments for turn context and unattended skill writes."
 requires_env: []
+# Declared registration surface (validator: undeclared hooks are rejected).
+provides_hooks:
+  - pre_memory_recall
+  - pre_skill_write
+  - on_session_start
+  - pre_api_request
