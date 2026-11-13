@@ -92,8 +92,8 @@ const PRUNES_DDL = `CREATE TABLE IF NOT EXISTS prunes (
 /** Prune epoch lives on meta and on each mark; added in place for ledgers that predate it. */
 function ensurePruneColumns(db: DatabaseSync): void {
   for (const sql of [
-    "ALTER TABLE meta ADD COLUMN prune_epoch INTEGER DEFAULT 0",
-    "ALTER TABLE marks ADD COLUMN prune_epoch INTEGER DEFAULT 0",
+    "ALTER TABLE meta ADD COLUMN prune_epoch INTEGER",
+    "ALTER TABLE marks ADD COLUMN prune_epoch INTEGER",
   ]) {
     try {
       db.exec(sql);
@@ -101,12 +101,15 @@ function ensurePruneColumns(db: DatabaseSync): void {
       // column already present
     }
   }
-  // NULL means epoch 0 (the pre-prune generation); normalise so equality filters match.
+  // The R36.1 gate is gone, so a migrated ledger's legacy unanchored numeric marks would otherwise
+  // apply again at stale sequence numbers. Retire them once, in place.
   try {
-    db.exec("UPDATE meta SET prune_epoch = 0 WHERE prune_epoch IS NULL");
-    db.exec("UPDATE marks SET prune_epoch = 0 WHERE prune_epoch IS NULL");
+    db.exec(
+      "UPDATE marks SET retired_at = COALESCE(retired_at, strftime('%s','now') * 1000) " +
+        "WHERE anchor_first_event IS NULL AND prune_epoch IS NULL AND applied_at IS NOT NULL"
+    );
   } catch {
-    // nothing to normalise
+    // marks table lacks the anchor or applied columns; nothing to retire
   }
 }
 
@@ -819,7 +822,7 @@ export function readMarks(
     const marks = opened.db
       .prepare(
         `SELECT mark_id, session_id, seq_start, seq_end, kind, action, digest, reason,
-                applied_gen, applied_at, anchor_first_event, anchor_last_event, retired_at
+                applied_gen, applied_at, anchor_first_event, anchor_last_event, retired_at, prune_epoch
            FROM marks
           -- The prune epoch replaces the one-time rebase: unanchored (legacy numeric) marks are
           -- admissible again, and supersession is decided by prune_epoch rather than by mark_rebase_done.
@@ -856,7 +859,7 @@ export function readMarksCached(
     const marks = db
       .prepare(
         `SELECT mark_id, session_id, seq_start, seq_end, kind, action, digest, reason,
-                applied_gen, applied_at, anchor_first_event, anchor_last_event, retired_at
+                applied_gen, applied_at, anchor_first_event, anchor_last_event, retired_at, prune_epoch
            FROM marks
           -- The prune epoch replaces the one-time rebase: unanchored (legacy numeric) marks are
           -- admissible again, and supersession is decided by prune_epoch rather than by mark_rebase_done.
