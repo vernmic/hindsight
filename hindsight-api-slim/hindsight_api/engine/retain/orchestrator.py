@@ -679,6 +679,14 @@ def _build_retain_params(contents_dicts, document_tags=None, doc_contents=None):
             if tag not in _seen:
                 _seen.add(tag)
                 merged_tags.append(tag)
+    # A tagless append carries the document's existing tags on a private item key.
+    # They are this write's document tags: the document row and unchanged survivors
+    # keep them, while the item's own (empty) tag set still governs inserted facts.
+    for item in items:
+        for tag in item.get("_append_carried_tags") or []:
+            if tag not in _seen:
+                _seen.add(tag)
+                merged_tags.append(tag)
 
     retain_params = {}
     if items:
