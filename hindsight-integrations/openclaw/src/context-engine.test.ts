@@ -513,7 +513,7 @@ describe("composed assembly over a real ledger and compressed host store", () =>
     const engine = createContextEngine(log(), {
       hostStateRoot: root,
       // Through the real loader (R9.1): the override must survive getPluginConfig.
-      getPolicy: () => marksPolicyFromConfig(loadConfig({ astinusMarks: { minPressure: 0.99 } })),
+      getPolicy: () => marksPolicyFromConfig(loadConfig({ astinusMarks: { pruneAtPressure: 0.99 } })),
     });
     const out = await engine.assemble({
       messages,
@@ -623,7 +623,7 @@ describe("astinusMarks policy wiring", () => {
     const policies = applyMarks.mock.calls.map(
       (call) => (call as unknown[])[2] as { policy?: unknown }
     );
-    expect(policies[0].policy).toEqual({ minPressure: 0.5 });
+    expect(policies[0].policy).toEqual({ pruneAtPressure: 0.5 });
     expect(policies[1].policy).toEqual({ debounceTurns: 2 });
   });
 });
