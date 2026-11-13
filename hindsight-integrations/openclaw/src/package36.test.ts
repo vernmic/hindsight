@@ -4,11 +4,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { zstdCompressSync } from "node:zlib";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import {applyMarks,
-  ensureMarkAnchorColumns,
-  ,
-  SeqIndex,
-  type LedgerMark} from "./assemble-marks.js";
+import { applyMarks, SeqIndex, type LedgerMark } from "./assemble-marks.js";
 import { HostTranscript } from "./host-transcript-local.js";
 import { createContextEngine, estimateTokens } from "./context-engine.js";
 import {
