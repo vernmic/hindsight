@@ -821,10 +821,8 @@ export function readMarks(
         `SELECT mark_id, session_id, seq_start, seq_end, kind, action, digest, reason,
                 applied_gen, applied_at, anchor_first_event, anchor_last_event, retired_at
            FROM marks
-          -- R36.1: an unanchored (legacy numeric) mark applies only once the one-time rebase
-          -- has committed; a failed/deferred rebase leaves the prompt unchanged by it until a retry.
-          WHERE anchor_first_event IS NOT NULL
-             OR (SELECT mark_rebase_done FROM meta LIMIT 1) IS NOT NULL
+          -- The prune epoch replaces the one-time rebase: unanchored (legacy numeric) marks are
+          -- admissible again, and supersession is decided by prune_epoch rather than by mark_rebase_done.
           ORDER BY seq_start`
       )
       .all();
@@ -860,10 +858,8 @@ export function readMarksCached(
         `SELECT mark_id, session_id, seq_start, seq_end, kind, action, digest, reason,
                 applied_gen, applied_at, anchor_first_event, anchor_last_event, retired_at
            FROM marks
-          -- R36.1: an unanchored (legacy numeric) mark applies only once the one-time rebase
-          -- has committed; a failed/deferred rebase leaves the prompt unchanged by it until a retry.
-          WHERE anchor_first_event IS NOT NULL
-             OR (SELECT mark_rebase_done FROM meta LIMIT 1) IS NOT NULL
+          -- The prune epoch replaces the one-time rebase: unanchored (legacy numeric) marks are
+          -- admissible again, and supersession is decided by prune_epoch rather than by mark_rebase_done.
           ORDER BY seq_start`
       )
       .all();
