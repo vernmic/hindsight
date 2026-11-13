@@ -3,7 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { HostTranscript } from "./assemble-marks.js";
+import {} from "./assemble-marks.js";
+import { HostTranscript } from "./host-transcript-local.js";
 import { callLlm } from "./pass-provider.js";
 
 // Package 28a: the pass's host reads (one reader) and its provider calls (configured order,
