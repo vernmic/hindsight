@@ -1,0 +1,902 @@
+
+[1m[30m[46m RUN [49m[39m[22m [36mv4.1.12 [39m[90mI:/OpenClaw-maintenance/weekly/hs-prune-replay/hindsight-integrations/openclaw[39m
+
+ [31m❯[39m src/session-ledger.harness.test.ts [2m([22m[2m13 tests[22m[2m | [22m[31m5 failed[39m[2m)[22m[33m 5814[2mms[22m[39m
+     [33m[2m✓[22m[39m (a) a locked ledger degrades: returns ok:false and throws nothing [33m 887[2mms[22m[39m
+     [33m[2m✓[22m[39m (b) a missing file is created and the turn lands [33m 516[2mms[22m[39m
+     [32m✓[39m (c) a user_version mismatch disables the ledger for that session, no throw[32m 102[2mms[22m[39m
+     [33m[2m✓[22m[39m (d) a host retry of the same advancementKey yields exactly one row [33m 546[2mms[22m[39m
+     [33m[2m✓[22m[39m (e) assemble's hot path never creates a file and never throws [33m 509[2mms[22m[39m
+     [32m✓[39m (f) an unwritable location degrades: ok:false, no throw[32m 2[2mms[22m[39m
+     [33m[2m✓[22m[39m (g) a transient open failure is per-session and cooling down, not sticky forever [33m 390[2mms[22m[39m
+[31m     [31m×[31m keys that share a lossy name get separate ledgers, each recording its own key[39m[33m 482[2mms[22m[39m
+     [33m[2m✓[22m[39m a ledger whose stored key differs from the opening key refuses [33m 494[2mms[22m[39m
+[31m     [31m×[31m an old lossy-named ledger fails closed and is never adopted[39m[33m 398[2mms[22m[39m
+[31m     [31m×[31m adopts a matching-key legacy ledger on first open: same rows, old name gone[39m[33m 482[2mms[22m[39m
+[31m     [31m×[31m refuses a foreign-key legacy ledger and leaves it byte-unchanged[39m[33m 513[2mms[22m[39m
+[31m     [31m×[31m adopts a legacy ledger with WAL sidecars and loses no rows[39m[33m 489[2mms[22m[39m
+ [31m❯[39m src/astinus-pass.test.ts [2m([22m[2m10 tests[22m[2m | [22m[31m1 failed[39m[2m)[22m[33m 13039[2mms[22m[39m
+     [33m[2m✓[22m[39m the pass proposes a turn with 6 newer turns and not one with 5 [33m 825[2mms[22m[39m
+[31m     [31m×[31m applyMarks redacts a turn with 6 newer turns and not one with 5[39m[33m 1372[2mms[22m[39m
+     [33m[2m✓[22m[39m writes the model's classification, filters marks, and never writes the host store [33m 2402[2mms[22m[39m
+     [33m[2m✓[22m[39m falls back in order, each provider with its own key, and records why [33m 1064[2mms[22m[39m
+     [33m[2m✓[22m[39m refuses a ledger bound to another host store [33m 444[2mms[22m[39m
+     [33m[2m✓[22m[39m R28b.1: reused coordinates classify the payload's own incarnation only [33m 791[2mms[22m[39m
+     [33m[2m✓[22m[39m R28b.1: a missing owned turn never attributes to another incarnation [33m 1160[2mms[22m[39m
+     [33m[2m✓[22m[39m R28b.2: non-array marks fall back, finish the pass, and do not block the next [33m 1397[2mms[22m[39m
+     [33m[2m✓[22m[39m R28b.2: an error after the reservation still records a terminal outcome [33m 1049[2mms[22m[39m
+     [33m[2m✓[22m[39m gate: proposals below 0.40, and with unknown pressure, are discarded by code [33m 2534[2mms[22m[39m
+ [31m❯[39m src/context-engine.test.ts [2m([22m[2m26 tests[22m[2m | [22m[31m5 failed[39m[2m)[22m[33m 6266[2mms[22m[39m
+     [32m✓[39m registers under the plugin id[32m 3[2mms[22m[39m
+     [32m✓[39m is a no-op on hosts without registerContextEngine[32m 0[2mms[22m[39m
+     [32m✓[39m swallows a host registration failure[32m 1[2mms[22m[39m
+     [32m✓[39m never claims durable turns or compaction ownership[32m 1[2mms[22m[39m
+     [32m✓[39m passes messages through with a char/4 estimate[32m 1[2mms[22m[39m
+     [32m✓[39m delegates to the runtime[32m 1[2mms[22m[39m
+     [32m✓[39m returns compacted=false when delegation is unavailable[32m 1[2mms[22m[39m
+     [32m✓[39m resolves the host store under the instance root[32m 0[2mms[22m[39m
+     [32m✓[39m does not load the sqlite read side without a host root[32m 1[2mms[22m[39m
+     [32m✓[39m stays pass-through while the ledger is not open[32m 1[2mms[22m[39m
+     [32m✓[39m applies marks, stamps admitted ones and claims assembled authority[32m 6[2mms[22m[39m
+     [32m✓[39m degrades to pass-through when the read side fails to load[32m 1[2mms[22m[39m
+     [32m✓[39m records a plugin-estimated fact for a pass-through assemble[32m 1[2mms[22m[39m
+     [32m✓[39m records host estimator, view tokens and windowFirstSeq when marks apply[32m 1[2mms[22m[39m
+     [32m✓[39m falls back to the cached marks index when a later ledger read fails[32m 3[2mms[22m[39m
+     [33m[2m✓[22m[39m never applies one host root's cached marks to another root (R11.1) [33m 2707[2mms[22m[39m
+     [32m✓[39m stamps the state generation and falls back to lastCommittedSeq on a cold ledger[32m 13[2mms[22m[39m
+     [32m✓[39m shares the fact map across engine instances of one state root[32m 0[2mms[22m[39m
+     [32m✓[39m warns when an assemble is slow[32m 1[2mms[22m[39m
+[31m     [31m×[31m prunes the view and stamps only admitted marks[39m[33m 1590[2mms[22m[39m
+     [33m[2m✓[22m[39m honours the configured astinusMarks policy (minPressure above current pressure) [33m 1920[2mms[22m[39m
+[31m     [31m×[31m preserves all supported overrides[39m[32m 4[2mms[22m[39m
+[31m     [31m×[31m keeps a partial override partial and drops mistyped fields[39m[32m 1[2mms[22m[39m
+     [32m✓[39m leaves the policy undefined (defaults) when absent[32m 0[2mms[22m[39m
+[31m     [31m×[31m parses only typed overrides[39m[32m 1[2mms[22m[39m
+[31m     [31m×[31m re-reads the policy on every assemble and passes it to applyMarks[39m[32m 2[2mms[22m[39m
+[90mstdout[2m | src/retain-capture.test.ts[2m > [22m[2magent_end returns with the retain durably queued before a slow delivery pass finishes (retainNonBlocking unset)
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/retain-capture.test.ts[2m > [22m[2magent_end returns with the retain durably queued before a slow delivery pass finishes (retainNonBlocking false)
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/retain-capture.test.ts[2m > [22m[2magent_end returns with the retain durably queued before a slow delivery pass finishes (retainNonBlocking true)
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+ [31m❯[39m src/retain-capture.test.ts [2m([22m[2m4 tests[22m[2m | [22m[31m1 failed[39m[2m)[22m[33m 385[2mms[22m[39m
+   [33m[2m✓[22m[39m agent_end returns with the retain durably queued before a slow delivery pass finishes (retainNonBlocking unset) [33m 302[2mms[22m[39m
+   [32m✓[39m agent_end returns with the retain durably queued before a slow delivery pass finishes (retainNonBlocking false)[32m 33[2mms[22m[39m
+   [32m✓[39m agent_end returns with the retain durably queued before a slow delivery pass finishes (retainNonBlocking true)[32m 36[2mms[22m[39m
+[31m   [31m×[31m keeps retainNonBlocking accepted by the strict config schema as a deprecated key[39m[32m 12[2mms[22m[39m
+ [31m❯[39m src/pass-provider.test.ts [2m([22m[2m4 tests[22m[2m | [22m[31m1 failed[39m[2m)[22m[33m 460[2mms[22m[39m
+[31m     [31m×[31m reads bounds, created_at and ranges, read-only[39m[33m 416[2mms[22m[39m
+     [32m✓[39m tries providers in order with each one's own key and records the fallback[32m 40[2mms[22m[39m
+     [32m✓[39m applies an effort override only where a provider sets reasoning_effort[32m 2[2mms[22m[39m
+     [32m✓[39m reports no provider configured[32m 1[2mms[22m[39m
+ [31m❯[39m src/pair-closure.test.ts [2m([22m[2m3 tests[22m[2m | [22m[31m3 failed[39m[2m)[22m[33m 1808[2mms[22m[39m
+[31m     [31m×[31m a drop on a lone result also takes the call of the result it absorbs[39m[33m 587[2mms[22m[39m
+[31m     [31m×[31m turn_middle starting on a call does not keep that call without its result[39m[33m 704[2mms[22m[39m
+[31m     [31m×[31m turn_middle ending on a result does not keep that result without its call[39m[33m 515[2mms[22m[39m
+[90mstdout[2m | src/package36.test.ts[2m > [22m[2mR36.3 subagent retention through the real session_end hook[2m > [22m[2mdefaults retain subagent work; ignoreSessionPatterns excludes it (exclude=false)
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+ [31m❯[39m src/package36.test.ts [2m([22m[2m14 tests[22m[2m | [22m[31m8 failed[39m[2m)[22m[33m 14564[2mms[22m[39m
+     [33m[2m✓[22m[39m reloads when a trim renumbers the tail, so survivors and new rows map [33m 2801[2mms[22m[39m
+[31m     [31m×[31m an anchored mark follows its content across a renumber; unanchored keeps old numbers[39m[33m 2676[2mms[22m[39m
+[31m     [31m×[31m skips a mark whose anchor is gone instead of re-aiming it, and never applies retired marks[39m[33m 651[2mms[22m[39m
+[31m     [31m×[31m migrates an old ledger in place and runs the one-time rebase once[39m[33m 1881[2mms[22m[39m
+[31m     [31m×[31m plans: anchored marks untouched; no current generation retires every applied mark[39m[32m 1[2mms[22m[39m
+[31m     [31m×[31m rebase never pins old numbers to new content (host generation g-new)[39m[33m 3359[2mms[22m[39m
+[31m     [31m×[31m rebase never pins old numbers to new content (host generation unreadable)[39m[33m 1414[2mms[22m[39m
+[31m     [31m×[31m R36.1: a rebase that cannot take the write lock leaves legacy numeric marks unapplied, then retries[39m[33m 1555[2mms[22m[39m
+[31m     [31m×[31m A3: anchors come from compressed (event_zstd) rows[39m[32m 107[2mms[22m[39m
+     [32m✓[39m A4: with no marks the view count is the final view's count[32m 3[2mms[22m[39m
+     [32m✓[39m default skips only heartbeat/cron/poll/status sessions, in both key forms[32m 1[2mms[22m[39m
+     [32m✓[39m config skip patterns replace the default; a non-empty allowlist overrides[32m 1[2mms[22m[39m
+     [32m✓[39m defaults retain subagent work; ignoreSessionPatterns excludes it (exclude=false)[32m 94[2mms[22m[39m
+     [32m✓[39m defaults retain subagent work; ignoreSessionPatterns excludes it (exclude=true)[32m 19[2mms[22m[39m
+[90mstdout[2m | src/log-level.test.ts[2m > [22m[2mlogLevel "debug" turns on debug lines without also setting debug: true
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+ [31m❯[39m src/log-level.test.ts [2m([22m[2m3 tests[22m[2m | [22m[31m2 failed[39m[2m)[22m[32m 22[2mms[22m[39m
+   [32m✓[39m logLevel "debug" turns on debug lines without also setting debug: true[32m 5[2mms[22m[39m
+[31m   [31m×[31m keeps every manifest default through getPluginConfig[39m[32m 12[2mms[22m[39m
+[31m   [31m×[31m keeps object fields without a top-level default through getPluginConfig[39m[32m 2[2mms[22m[39m
+ [31m❯[39m src/manifest.test.ts [2m([22m[2m4 tests[22m[2m | [22m[31m1 failed[39m[2m)[22m[32m 19[2mms[22m[39m
+     [32m✓[39m is valid JSON[32m 3[2mms[22m[39m
+     [32m✓[39m has required top-level fields[32m 1[2mms[22m[39m
+     [32m✓[39m defaults recalled memories to user context[32m 1[2mms[22m[39m
+[31m     [31m×[31m declares every PluginConfig field in configSchema and uiHints[39m[32m 12[2mms[22m[39m
+[90mstdout[2m | src/lifecycle-cross-copy.test.ts[2m > [22m[2mrecalls through root A when separate module copies = false
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/lifecycle-cross-copy.test.ts[2m > [22m[2mrecalls through root A when separate module copies = false
+[22m[39m{"separateCopies":false,"recalls":["http://synthetic-a.invalid:8888/v1/default/banks/bank-a/memories/recall"],"injected":{"prependContext":"<hindsight_memories>\nRelevant memories from past conversations (prioritize recent when conflicting). Only use memories that are directly useful to continue this conversation; ignore the rest:\nCurrent time - 2026-11-13 02:19 UTC\n\n- A private kumquat decision [world]\n</hindsight_memories>"}}
+
+[90mstdout[2m | src/lifecycle-cross-copy.test.ts[2m > [22m[2mrecalls through root A when separate module copies = true
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/lifecycle-cross-copy.test.ts[2m > [22m[2mrecalls through root A when separate module copies = true
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/lifecycle-cross-copy.test.ts[2m > [22m[2mrecalls through root A when separate module copies = true
+[22m[39m{"separateCopies":true,"recalls":["http://synthetic-a.invalid:8888/v1/default/banks/bank-a/memories/recall"],"injected":{"prependContext":"<hindsight_memories>\nRelevant memories from past conversations (prioritize recent when conflicting). Only use memories that are directly useful to continue this conversation; ignore the rest:\nCurrent time - 2026-11-13 02:19 UTC\n\n- A private kumquat decision [world]\n</hindsight_memories>"}}
+
+[90mstdout[2m | src/lifecycle-cross-copy.test.ts[2m > [22m[2mdoes not reset a newer owner when an older post-init health check fails
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/lifecycle-cross-copy.test.ts[2m > [22m[2mdoes not reset a newer owner when an older post-init health check fails
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/retain-wiring.test.ts[2m > [22m[2mR19.1 positive control: retires a completed ordinary row without a completion action
+[22m[39m[38;5;103mhindsight:[0m queue flush: 1 retains completed; 0 still pending
+
+[90mstderr[2m | src/retain-wiring.test.ts[2m > [22m[2mR19.1: the real flush wrapper keeps a completion-bearing receipt it cannot apply (no state root)
+[22m[39m[38;5;103mhindsight:[0m retain 1794536357504-f7bb6659: reconciliation unavailable; payload and completion debt retained
+
+[90mstdout[2m | src/retain-wiring.test.ts[2m > [22m[2mR19.2: default-cadence session_end finishes a pending operation without a second submit
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/retain-wiring.test.ts[2m > [22m[2mR21.1: a cadence-2 session close makes one awaited pass and submits once
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+ [32m✓[39m src/retain-wiring.test.ts [2m([22m[2m4 tests[22m[2m)[22m[33m 3627[2mms[22m[39m
+   [33m[2m✓[22m[39m R19.1 positive control: retires a completed ordinary row without a completion action [33m 344[2mms[22m[39m
+   [33m[2m✓[22m[39m R21.1: a cadence-2 session close makes one awaited pass and submits once [33m 3066[2mms[22m[39m
+[90mstdout[2m | src/lifecycle-cross-copy.test.ts[2m > [22m[2mdoes not reset a newer owner when an older post-init health check fails
+[22m[39m{"ownerPreserved":true,"clientPreserved":true,"clientIsNull":false,"initialized":true,"configuredEndpoint":"http://synthetic-owner.invalid:8889"}
+
+ [32m✓[39m src/lifecycle-cross-copy.test.ts [2m([22m[2m3 tests[22m[2m)[22m[33m 4485[2mms[22m[39m
+   [33m[2m✓[22m[39m recalls through root A when separate module copies = false [33m 377[2mms[22m[39m
+   [33m[2m✓[22m[39m does not reset a newer owner when an older post-init health check fails [33m 4055[2mms[22m[39m
+[90mstdout[2m | src/retain-queue.integration.test.ts[2m > [22m[2mretain queue idempotent replay[2m > [22m[2mreplays a lost acknowledgement under the id the first attempt already carried
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+ [32m✓[39m src/checkpoint-store.bindings.test.ts [2m([22m[2m10 tests[22m[2m)[22m[33m 1281[2mms[22m[39m
+ [32m✓[39m src/prune-cycle.test.ts [2m([22m[2m9 tests[22m[2m)[22m[33m 6938[2mms[22m[39m
+     [33m[2m✓[22m[39m holds pending marks below pruneAt and leaves the view untouched [33m 830[2mms[22m[39m
+     [33m[2m✓[22m[39m at pruneAt admits every pending mark at once and reaches pruneTo [33m 590[2mms[22m[39m
+     [33m[2m✓[22m[39m between prunes the view is byte-identical, rebuilt or carried forward [33m 648[2mms[22m[39m
+     [33m[2m✓[22m[39m a legacy APPLIED empty digest is inert before the prune and dropped by it (Codex N3) [33m 749[2mms[22m[39m
+     [33m[2m✓[22m[39m marks applied before the first prune (epoch 0) are dropped, and stay dropped on a rebuilt view [33m 549[2mms[22m[39m
+     [33m[2m✓[22m[39m the next prune removes everything the previous one left [33m 761[2mms[22m[39m
+     [33m[2m✓[22m[39m cuts the oldest whole turns only when the marks are not enough [33m 889[2mms[22m[39m
+     [33m[2m✓[22m[39m does not commit a prune that would remove under 5% [33m 1135[2mms[22m[39m
+     [33m[2m✓[22m[39m never touches the preserved tail [33m 784[2mms[22m[39m
+ [32m✓[39m src/retain-queue.integration.test.ts [2m([22m[2m8 tests[22m[2m)[22m[33m 2714[2mms[22m[39m
+     [33m[2m✓[22m[39m sends mapped agents to one shared bank and leaves an unmapped one derived [33m 1110[2mms[22m[39m
+     [33m[2m✓[22m[39m overrides a static bank for mapped agents only [33m 1067[2mms[22m[39m
+[90mstdout[2m | src/durable-turns.test.ts[2m > [22m[2mfaked host: owned-work retain[2m > [22m[2mdurable OFF (default): the engine commits nothing and agent_end rows carry no completion
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/durable-turns.test.ts[2m > [22m[2mfaked host: owned-work retain[2m > [22m[2mdurable ON: a committed engine turn is delivered once and cleared on server completion
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/recall-deadline-http.test.ts[2m > [22m[2mdisconnects an unanswered HTTP recall when its deadline expires
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/durable-turns.test.ts[2m > [22m[2mfaked host: owned-work retain[2m > [22m[2mdurable ON: an unowned turn is captured by run id and a replayed agent_end is a no-op
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/durable-turns.test.ts[2m > [22m[2mfaked host: owned-work retain[2m > [22m[2mR27.3: a corrupt document stops capture and drain in the actual hooks, bytes preserved
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/durable-turns.test.ts[2m > [22m[2mfaked host: owned-work retain[2m > [22m[2mR29.1: a malformed pending entry in valid JSON stops the actual hooks, bytes preserved
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+ [32m✓[39m src/durable-turns.test.ts [2m([22m[2m20 tests[22m[2m)[22m[33m 1297[2mms[22m[39m
+     [33m[2m✓[22m[39m durable ON: a committed engine turn is delivered once and cleared on server completion [33m 488[2mms[22m[39m
+ [32m✓[39m src/reach-cap.test.ts [2m([22m[2m4 tests[22m[2m)[22m[33m 2493[2mms[22m[39m
+     [33m[2m✓[22m[39m drops reasoning and stubs large arguments on the call side, keeping the pair [33m 611[2mms[22m[39m
+     [33m[2m✓[22m[39m keeps small arguments verbatim [33m 607[2mms[22m[39m
+     [33m[2m✓[22m[39m a placeholder already in place is left as it is [33m 838[2mms[22m[39m
+     [33m[2m✓[22m[39m a turn_middle redaction already in place is left as it is [33m 433[2mms[22m[39m
+ [32m✓[39m src/recall-deadline-http.test.ts [2m([22m[2m1 test[22m[2m)[22m[33m 1167[2mms[22m[39m
+   [33m[2m✓[22m[39m disconnects an unanswered HTTP recall when its deadline expires [33m 1165[2mms[22m[39m
+[90mstdout[2m | src/lifecycle-authority.test.ts[2m > [22m[2mretains through an older never-started copy while a newer copy owns the global
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/lifecycle-authority.test.ts[2m > [22m[2mretains through an older never-started copy while a newer copy owns the global
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/lifecycle-authority.test.ts[2m > [22m[2mretains through a newer never-started copy using the started copy's client
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/lifecycle-authority.test.ts[2m > [22m[2mretains through a newer never-started copy using the started copy's client
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/lifecycle-authority.test.ts[2m > [22m[2mignores stop() from a registration that does not own the lifecycle
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/lifecycle-authority.test.ts[2m > [22m[2mignores stop() from a registration that does not own the lifecycle
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/lifecycle-authority.test.ts[2m > [22m[2mdoes not share a lifecycle across host roots
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/lifecycle-authority.test.ts[2m > [22m[2mdoes not share a lifecycle across host roots
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/registration-isolation.test.ts[2m > [22m[2mR14.1: one module, two roots[2m > [22m[2mbinds each registration's service and hooks to its own root
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/lifecycle-authority.test.ts[2m > [22m[2mshares the context engine's assemble facts and marks index across module copies
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/lifecycle-authority.test.ts[2m > [22m[2mshares the context engine's assemble facts and marks index across module copies
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+ [32m✓[39m src/lifecycle-authority.test.ts [2m([22m[2m5 tests[22m[2m)[22m[33m 781[2mms[22m[39m
+   [33m[2m✓[22m[39m retains through an older never-started copy while a newer copy owns the global [33m 341[2mms[22m[39m
+[90mstdout[2m | src/registration-isolation.test.ts[2m > [22m[2mR14.1: one module, two roots[2m > [22m[2mdoes not let a root-less registration inherit a rooted registration's authority
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/registration-isolation.test.ts[2m > [22m[2mR14.2: a superseded lazy initialization does not publish[2m > [22m[2mkeeps the newer owner's client when an older lazy init resumes
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/registration-isolation.test.ts[2m > [22m[2mR14.2: a superseded lazy initialization does not publish[2m > [22m[2mkeeps the newer owner's client when an older lazy init resumes
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+ [32m✓[39m src/registration-isolation.test.ts [2m([22m[2m3 tests[22m[2m)[22m[33m 593[2mms[22m[39m
+     [33m[2m✓[22m[39m binds each registration's service and hooks to its own root [33m 538[2mms[22m[39m
+ [32m✓[39m src/retain-delivery.test.ts [2m([22m[2m18 tests[22m[2m)[22m[33m 1626[2mms[22m[39m
+     [33m[2m✓[22m[39m does not let one blocked session consume the entire scan budget [33m 327[2mms[22m[39m
+[90mstdout[2m | src/p3-transitions.test.ts[2m > [22m[2mR17.1: capability probes follow the root's active client[2m > [22m[2man older copy's flush probes the active endpoint and keeps the operation id
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/p3-transitions.test.ts[2m > [22m[2mR17.1: capability probes follow the root's active client[2m > [22m[2man older copy's flush probes the active endpoint and keeps the operation id
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+ [32m✓[39m src/checkpoint-store.harness.test.ts [2m([22m[2m8 tests[22m[2m)[22m[33m 747[2mms[22m[39m
+[90mstdout[2m | src/p3-transitions.test.ts[2m > [22m[2mR17.2: embedded-to-external handoff disposes the earlier daemon manager[2m > [22m[2mstops the recorded daemon exactly once across the new owner and both stops
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/p3-transitions.test.ts[2m > [22m[2mR17.2: embedded-to-external handoff disposes the earlier daemon manager[2m > [22m[2mstops the recorded daemon exactly once across the new owner and both stops
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/p3-transitions.test.ts[2m > [22m[2mR20.3: an older stop does not tear down a newer owner[2m > [22m[2mkeeps the new owner's client and queue when the old daemon stop resolves late
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/p3-transitions.test.ts[2m > [22m[2mR20.3: an older stop does not tear down a newer owner[2m > [22m[2mkeeps the new owner's client and queue when the old daemon stop resolves late
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+ [32m✓[39m src/p3-transitions.test.ts [2m([22m[2m3 tests[22m[2m)[22m[33m 382[2mms[22m[39m
+     [33m[2m✓[22m[39m an older copy's flush probes the active endpoint and keeps the operation id [33m 318[2mms[22m[39m
+ [32m✓[39m src/followup-admission-reach.test.ts [2m([22m[2m1 test[22m[2m)[22m[33m 1225[2mms[22m[39m
+     [33m[2m✓[22m[39m trims reasoning and call arguments on the boundaries it keeps [33m 1223[2mms[22m[39m
+[90mstdout[2m | src/run-start-retain.test.ts[2m > [22m[2mretain saves the whole run (#5569)[2m > [22m[2mkeeps the first request when the user writes again mid-run
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/recall-lazy-cancellation.test.ts[2m > [22m[2mpreserves external-API lazy recall before service.start
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/recall-lazy-cancellation.test.ts[2m > [22m[2mfirst service.start cancels a lazy recall
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/recall-lazy-cancellation.test.ts[2m > [22m[2mfirst service.stop cancels a lazy recall
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+ [32m✓[39m src/recall-lazy-cancellation.test.ts [2m([22m[2m3 tests[22m[2m)[22m[33m 563[2mms[22m[39m
+   [33m[2m✓[22m[39m preserves external-API lazy recall before service.start [33m 367[2mms[22m[39m
+ [32m✓[39m src/run-start-retain.test.ts [2m([22m[2m8 tests[22m[2m)[22m[33m 491[2mms[22m[39m
+[90mstdout[2m | src/retain-registry-reload.test.ts[2m > [22m[2mretains through a reloaded copy that was never started
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/retain-registry-reload.test.ts[2m > [22m[2mretains through a reloaded copy that was never started
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/retain-registry-reload.test.ts[2m > [22m[2mqueues a failed retain from a never-started copy instead of dropping it
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/retain-registry-reload.test.ts[2m > [22m[2mdoes not retain after the copy is explicitly stopped
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+ [32m✓[39m src/retain-registry-reload.test.ts [2m([22m[2m3 tests[22m[2m)[22m[33m 602[2mms[22m[39m
+   [33m[2m✓[22m[39m retains through a reloaded copy that was never started [33m 409[2mms[22m[39m
+[90mstdout[2m | src/p3-identity.test.ts[2m > [22m[2mshares the started copy's endpoint capability probe with every copy for the root
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/p3-identity.test.ts[2m > [22m[2mshares the started copy's endpoint capability probe with every copy for the root
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/p3-identity.test.ts[2m > [22m[2mdoes not share endpoint capability state across host roots
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/p3-identity.test.ts[2m > [22m[2mdoes not share endpoint capability state across host roots
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/p3-identity.test.ts[2m > [22m[2mplaces the default retain queue under the host instance root, not the home directory
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/p3-identity.test.ts[2m > [22m[2mplaces the default retain queue under the host instance root, not the home directory
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+ [32m✓[39m src/p3-identity.test.ts [2m([22m[2m3 tests[22m[2m)[22m[33m 499[2mms[22m[39m
+   [33m[2m✓[22m[39m shares the started copy's endpoint capability probe with every copy for the root [33m 363[2mms[22m[39m
+[90mstdout[2m | src/bank-defaults-lifetime.test.ts[2m > [22m[2mapplies defaults on the new server when old defaults finish late = false
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/bank-defaults-lifetime.test.ts[2m > [22m[2mapplies defaults on the new server when old defaults finish late = false
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/bank-defaults-lifetime.test.ts[2m > [22m[2mapplies defaults on the new server when old defaults finish late = true
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/bank-defaults-lifetime.test.ts[2m > [22m[2mapplies defaults on the new server when old defaults finish late = true
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+ [32m✓[39m src/bank-defaults-lifetime.test.ts [2m([22m[2m2 tests[22m[2m)[22m[33m 642[2mms[22m[39m
+   [33m[2m✓[22m[39m applies defaults on the new server when old defaults finish late = false [33m 613[2mms[22m[39m
+[90mstdout[2m | src/retain-queue.test.ts[2m > [22m[2mRetainQueue operation id persistence[2m > [22m[2mreuses the initial operation id after a lost acknowledgement and restart
+[22m[39m[38;5;103mhindsight:[0m queue flush: 1 retains completed; 0 still pending
+
+[90mstderr[2m | src/retain-queue.test.ts[2m > [22m[2mRetainQueue operation id persistence[2m > [22m[2mpersists an id before the first supported replay of a legacy row
+[22m[39m[38;5;103mhindsight:[0m retain 1794536371842-f22aea59: reconciliation unavailable; payload and completion debt retained
+
+[90mstdout[2m | src/retain-queue.test.ts[2m > [22m[2mRetainQueue operation id persistence[2m > [22m[2mpersists an id before the first supported replay of a legacy row
+[22m[39m[38;5;103mhindsight:[0m queue flush: 1 retains completed; 0 still pending
+
+[90mstderr[2m | src/retain-queue.test.ts[2m > [22m[2mRetainQueue operation id persistence[2m > [22m[2mholds an ambiguous unsupported send even after idempotency support returns
+[22m[39m[38;5;103mhindsight:[0m retain 1794536372025-83890274: submission acknowledgement is unknown and cannot be safely replayed; payload and completion debt retained
+
+[90mstderr[2m | src/retain-queue.test.ts[2m > [22m[2mRetainQueue operation id persistence[2m > [22m[2mdefers replay while the live capability probe is unknown
+[22m[39m[38;5;103mhindsight:[0m retain operation-id capability is unknown; new submissions remain durably queued while accepted operations reconcile
+
+ [32m✓[39m src/retain-queue.test.ts [2m([22m[2m11 tests[22m[2m)[22m[33m 499[2mms[22m[39m
+ [32m✓[39m src/prune-commit.harness.test.ts [2m([22m[2m2 tests[22m[2m)[22m[33m 347[2mms[22m[39m
+ [32m✓[39m src/backfill.test.ts [2m([22m[2m5 tests[22m[2m)[22m[33m 416[2mms[22m[39m
+     [33m[2m✓[22m[39m resume skips only completed entries [33m 396[2mms[22m[39m
+[90mstdout[2m | src/bank-defaults-concurrent.test.ts[2m > [22m[2mkeeps both banks cached with concurrent first use = false
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+[90mstdout[2m | src/bank-defaults-concurrent.test.ts[2m > [22m[2mkeeps both banks cached with concurrent first use = true
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+ [32m✓[39m src/bank-defaults-concurrent.test.ts [2m([22m[2m2 tests[22m[2m)[22m[33m 350[2mms[22m[39m
+   [33m[2m✓[22m[39m keeps both banks cached with concurrent first use = false [33m 332[2mms[22m[39m
+ [32m✓[39m src/runtime-gate.test.ts [2m([22m[2m7 tests[22m[2m)[22m[33m 327[2mms[22m[39m
+[90mstderr[2m | src/index.test.ts[2m > [22m[2mwaitForReady (CLI mode)[2m > [22m[2mreturns without error when initPromise is null (service.start not called)
+[22m[39m[38;5;103mhindsight:[0m waitForReady called before service.start() — hooks will no-op (expected in CLI mode)
+
+[90mstderr[2m | src/index.test.ts[2m > [22m[2mnormalizeAgentBankMap[2m > [22m[2mdrops entries whose bank is blank or not a string
+[22m[39m[38;5;103mhindsight:[0m agentBankMap: ignoring 3 entries with a missing or blank bank id (b, c, d)
+
+[90mstderr[2m | src/index.test.ts[2m > [22m[2mnormalizeAgentBankMap[2m > [22m[2mtreats a map with no usable entry as unset
+[22m[39m[38;5;103mhindsight:[0m agentBankMap: ignoring 2 entries with a missing or blank bank id (a, b)
+
+[90mstderr[2m | src/index.test.ts[2m > [22m[2msenderPrefixPattern display-name stripping (#3070)[2m > [22m[2mfails closed on an invalid regex
+[22m[39m[38;5;103mhindsight:[0m ignoring invalid senderPrefixPattern "([": SyntaxError: Invalid regular expression: /^\s*(?:([)\s*:\s*/: Unterminated character class
+
+[90mstderr[2m | src/index.test.ts[2m > [22m[2msenderPrefixPattern display-name stripping (#3070)[2m > [22m[2mis armed by getPluginConfig and ignores blank or invalid values
+[22m[39m[38;5;103mhindsight:[0m ignoring invalid senderPrefixPattern "([": SyntaxError: Invalid regular expression: /^\s*(?:([)\s*:\s*/: Unterminated character class
+
+[90mstderr[2m | src/index.test.ts[2m > [22m[2msessionEndMessages — OpenClaw's ended-transcript reader (#4594)[2m > [22m[2mreturns nothing when the reader fails or is empty
+[22m[39m[38;5;103mhindsight:[0m session_end: could not read the ended transcript: Error: handler settled
+
+ [32m✓[39m src/index.test.ts [2m([22m[2m220 tests[22m[2m)[22m[33m 321[2mms[22m[39m
+ [32m✓[39m src/legacy-state-adoption.test.ts [2m([22m[2m6 tests[22m[2m)[22m[32m 163[2mms[22m[39m
+ [32m✓[39m src/setup.test.ts [2m([22m[2m29 tests[22m[2m)[22m[32m 187[2mms[22m[39m
+ [32m✓[39m src/backfill-lib.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 72[2mms[22m[39m
+[90mstdout[2m | src/tools.test.ts[2m > [22m[2mHermes's tools in OpenClaw (#5635)[2m > [22m[2moffers Hermes's three tools, none of which takes a bank
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+ [32m✓[39m src/tools.test.ts [2m([22m[2m13 tests[22m[2m)[22m[32m 95[2mms[22m[39m
+ [32m✓[39m src/prompt-capture.wiring.test.ts [2m([22m[2m1 test[22m[2m)[22m[32m 82[2mms[22m[39m
+ [32m✓[39m src/session-state.test.ts [2m([22m[2m5 tests[22m[2m)[22m[32m 187[2mms[22m[39m
+[90mstdout[2m | src/recall-lifecycle.test.ts[2m > [22m[2mautomatic recall service lifecycle[2m > [22m[2mshares a recall within the running service
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+ [32m✓[39m src/recall-lifecycle.test.ts [2m([22m[2m5 tests[22m[2m)[22m[32m 50[2mms[22m[39m
+ [32m✓[39m src/setup-lib.test.ts [2m([22m[2m40 tests[22m[2m)[22m[32m 65[2mms[22m[39m
+ [32m✓[39m src/bank-defaults.test.ts [2m([22m[2m15 tests[22m[2m)[22m[32m 55[2mms[22m[39m
+[90mstdout[2m | src/local-daemon-parity.test.ts[2m > [22m[2mlocal-daemon mode parity (#3686)[2m > [22m[2mprobes the daemon's /version so retains use append instead of per-turn ids
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+ [32m✓[39m src/local-daemon-parity.test.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 50[2mms[22m[39m
+ [32m✓[39m src/count-anchor.test.ts [2m([22m[2m10 tests[22m[2m)[22m[32m 16[2mms[22m[39m
+ [32m✓[39m src/memory-provider.test.ts [2m([22m[2m7 tests[22m[2m)[22m[32m 21[2mms[22m[39m
+ [32m✓[39m src/recall-service-cancellation.test.ts [2m([22m[2m2 tests[22m[2m)[22m[32m 13[2mms[22m[39m
+ [32m✓[39m src/recall-deadline.test.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 21[2mms[22m[39m
+ [32m✓[39m src/derive-bank-id.test.ts [2m([22m[2m24 tests[22m[2m)[22m[32m 10[2mms[22m[39m
+ [32m✓[39m src/host-paths.test.ts [2m([22m[2m6 tests[22m[2m)[22m[32m 17[2mms[22m[39m
+[90mstdout[2m | src/engine-compat.test.ts[2m > [22m[2mordinary memory with the real slot value[2m > [22m[2mregisters memory hooks with slots={"contextEngine":"hindsight-openclaw"}
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+ [32m✓[39m src/engine-compat.test.ts [2m([22m[2m5 tests[22m[2m)[22m[32m 16[2mms[22m[39m
+ [32m✓[39m src/session-patterns.test.ts [2m([22m[2m11 tests[22m[2m)[22m[32m 7[2mms[22m[39m
+ [32m✓[39m src/packaging.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 5[2mms[22m[39m
+[90mstdout[2m | src/goal-safe-hooks.test.ts[2m > [22m[2mregisters no hook that blocks OpenClaw Goals
+[22m[39m[38;5;103mhindsight:[0m plugin entry invoked
+
+ [32m✓[39m src/goal-safe-hooks.test.ts [2m([22m[2m1 test[22m[2m)[22m[32m 8[2mms[22m[39m
+ [32m✓[39m src/legacy-state-cli.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 5[2mms[22m[39m
+
+[31m⎯⎯⎯⎯⎯⎯[39m[1m[41m Failed Tests 27 [49m[22m[31m⎯⎯⎯⎯⎯⎯⎯[39m
+
+[41m[1m FAIL [22m[49m src/astinus-pass.test.ts[2m > [22mturn_middle age (F2, turnMiddleAgeTurns = 6)[2m > [22mapplyMarks redacts a turn with 6 newer turns and not one with 5
+[31m[1mAssertionError[22m: expected '[{"role":"user","content":[{"type":"t…' not to contain 'thinking 2'[39m
+
+Expected: [32m"thinking 2"[39m
+Received: [31m"[{"role":"user","content":[{"type":"text","text":"question 1 about HindsightBank"}],"idempotencyKey":"ik-1"},{"role":"assistant","content":[{"type":"text","text":"thinking 1"}],"idempotencyKey":"ik-2"},{"role":"assistant","content":[{"type":"text","text":"answer 1"}],"idempotencyKey":"ik-3"},{"role":"user","content":[{"type":"text","text":"question 2 about HindsightBank"}],"idempotencyKey":"ik-4"},{"role":"assistant","content":[{"type":"text","text":"thinking 2"}],"idempotencyKey":"ik-5"},{"role":"assistant","content":[{"type":"text","text":"answer 2"}],"idempotencyKey":"ik-6"},{"role":"user","content":[{"type":"text","text":"question 3 about HindsightBank"}],"idempotencyKey":"ik-7"},{"role":"assistant","content":[{"type":"text","text":"thinking 3"}],"idempotencyKey":"ik-8"},{"role":"assistant","content":[{"type":"text","text":"answer 3"}],"idempotencyKey":"ik-9"},{"role":"user","content":[{"type":"text","text":"question 4 about HindsightBank"}],"idempotencyKey":"ik-10"},{"role":"assistant","content":[{"type":"text","text":"thinking 4"}],"idempotencyKey":"ik-11"},{"role":"assistant","content":[{"type":"text","text":"answer 4"}],"idempotencyKey":"ik-12"},{"role":"user","content":[{"type":"text","text":"question 5 about HindsightBank"}],"idempotencyKey":"ik-13"},{"role":"assistant","content":[{"type":"text","text":"thinking 5"}],"idempotencyKey":"ik-14"},{"role":"assistant","content":[{"type":"text","text":"answer 5"}],"idempotencyKey":"ik-15"},{"role":"user","content":[{"type":"text","text":"question 6 about HindsightBank"}],"idempotencyKey":"ik-16"},{"role":"assistant","content":[{"type":"text","text":"thinking 6"}],"idempotencyKey":"ik-17"},{"role":"assistant","content":[{"type":"text","text":"answer 6"}],"idempotencyKey":"ik-18"},{"role":"user","content":[{"type":"text","text":"question 7 about HindsightBank"}],"idempotencyKey":"ik-19"},{"role":"assistant","content":[{"type":"text","text":"thinking 7"}],"idempotencyKey":"ik-20"},{"role":"assistant","content":[{"type":"text","text":"answer 7"}],"idempotencyKey":"ik-21"},{"role":"user","content":[{"type":"text","text":"question 8 about HindsightBank"}],"idempotencyKey":"ik-22"},{"role":"assistant","content":[{"type":"text","text":"thinking 8"}],"idempotencyKey":"ik-23"},{"role":"assistant","content":[{"type":"text","text":"answer 8"}],"idempotencyKey":"ik-24"}]"[39m
+
+[36m [2m❯[22m src/astinus-pass.test.ts:[2m146:22[22m[39m
+    [90m144|[39m     })[33m;[39m
+    [90m145|[39m     [35mconst[39m text [33m=[39m [33mJSON[39m[33m.[39m[34mstringify[39m(res[33m.[39mmessages)[33m;[39m
+    [90m146|[39m     expect(text).not.toContain("thinking 2"); // turn 2: 6 newer turns…
+    [90m   |[39m                      [31m^[39m
+    [90m147|[39m     [34mexpect[39m(text)[33m.[39m[34mtoContain[39m([32m"turn interior redacted"[39m)[33m;[39m
+    [90m148|[39m     expect(text).toContain("thinking 3"); // turn 3: 5 newer turns - k…
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/27]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m src/context-engine.test.ts[2m > [22mcomposed assembly over a real ledger and compressed host store[2m > [22mprunes the view and stamps only admitted marks
+[31m[1mAssertionError[22m: expected 24 to be 23 // Object.is equality[39m
+
+[32m- Expected[39m
+[31m+ Received[39m
+
+[32m- 23[39m
+[31m+ 24[39m
+
+[36m [2m❯[22m src/context-engine.test.ts:[2m470:33[22m[39m
+    [90m468|[39m       tokenBudget[33m:[39m [33mMath[39m[33m.[39m[34mceil[39m([34mestimateTokensHost[39m(messages) [33m/[39m [34m0.9[39m)[33m,[39m
+    [90m469|[39m     })[33m;[39m
+    [90m470|[39m     [34mexpect[39m(out[33m.[39mmessages[33m.[39mlength)[33m.[39m[34mtoBe[39m([34m23[39m)[33m;[39m
+    [90m   |[39m                                 [31m^[39m
+    [90m471|[39m     [34mexpect[39m(out[33m.[39mpromptAuthority)[33m.[39m[34mtoBe[39m([32m"assembled"[39m)[33m;[39m
+    [90m472|[39m     [35mconst[39m stamped [33m=[39m opened[33m.[39mdb
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/27]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m src/context-engine.test.ts[2m > [22mastinusMarks through the real getPluginConfig (R9.1)[2m > [22mpreserves all supported overrides
+[31m[1mAssertionError[22m: expected undefined to deeply equal { minPressure: 0.99, …(3) }[39m
+
+[32m- Expected:[39m
+{
+  "admitShare": false,
+  "criticalPressure": 0.8,
+  "debounceTurns": 3,
+  "minPressure": 0.99,
+}
+
+[31m+ Received:[39m
+undefined
+
+[36m [2m❯[22m src/context-engine.test.ts:[2m549:33[22m[39m
+    [90m547|[39m     }[33m;[39m
+    [90m548|[39m     [35mconst[39m parsed [33m=[39m [34mloadConfig[39m({ astinusMarks[33m:[39m requested })[33m;[39m
+    [90m549|[39m     [34mexpect[39m(parsed[33m.[39mastinusMarks)[33m.[39m[34mtoEqual[39m(requested)[33m;[39m
+    [90m   |[39m                                 [31m^[39m
+    [90m550|[39m     [34mexpect[39m([34mmarksPolicyFromConfig[39m(parsed))[33m.[39m[34mtoEqual[39m(requested)[33m;[39m
+    [90m551|[39m   })[33m;[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/27]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m src/context-engine.test.ts[2m > [22mastinusMarks through the real getPluginConfig (R9.1)[2m > [22mkeeps a partial override partial and drops mistyped fields
+[31m[1mAssertionError[22m: expected undefined to deeply equal { minPressure: 0.5 }[39m
+
+[32m- Expected:[39m
+{
+  "minPressure": 0.5,
+}
+
+[31m+ Received:[39m
+undefined
+
+[36m [2m❯[22m src/context-engine.test.ts:[2m555:43[22m[39m
+    [90m553|[39m   it("keeps a partial override partial and drops mistyped fields", () …
+    [90m554|[39m     const parsed = loadConfig({ astinusMarks: { minPressure: 0.5, debo…
+    [90m555|[39m     expect(marksPolicyFromConfig(parsed)).toEqual({ minPressure: 0.5 }…
+    [90m   |[39m                                           [31m^[39m
+    [90m556|[39m   })[33m;[39m
+    [90m557|[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[4/27]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m src/context-engine.test.ts[2m > [22mastinusMarks policy wiring[2m > [22mparses only typed overrides
+[31m[1mAssertionError[22m: expected undefined to deeply equal { minPressure: 0.4, …(3) }[39m
+
+[32m- Expected:[39m
+{
+  "admitShare": false,
+  "criticalPressure": 0.8,
+  "debounceTurns": 3,
+  "minPressure": 0.4,
+}
+
+[31m+ Received:[39m
+undefined
+
+[36m [2m❯[22m src/context-engine.test.ts:[2m579:7[22m[39m
+    [90m577|[39m         }[33m,[39m
+    [90m578|[39m       })
+    [90m579|[39m     ).toEqual({ minPressure: 0.4, admitShare: false, debounceTurns: 3,…
+    [90m   |[39m       [31m^[39m
+    [90m580|[39m   })[33m;[39m
+    [90m581|[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[5/27]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m src/context-engine.test.ts[2m > [22mastinusMarks policy wiring[2m > [22mre-reads the policy on every assemble and passes it to applyMarks
+[31m[1mAssertionError[22m: expected undefined to deeply equal { minPressure: 0.5 }[39m
+
+[32m- Expected:[39m
+{
+  "minPressure": 0.5,
+}
+
+[31m+ Received:[39m
+undefined
+
+[36m [2m❯[22m src/context-engine.test.ts:[2m629:32[22m[39m
+    [90m627|[39m       (call) [33m=>[39m (call [35mas[39m unknown[])[[34m2[39m] [35mas[39m { policy[33m?[39m[33m:[39m unknown }
+    [90m628|[39m     )[33m;[39m
+    [90m629|[39m     [34mexpect[39m(policies[[34m0[39m][33m.[39mpolicy)[33m.[39m[34mtoEqual[39m({ minPressure[33m:[39m [34m0.5[39m })[33m;[39m
+    [90m   |[39m                                [31m^[39m
+    [90m630|[39m     [34mexpect[39m(policies[[34m1[39m][33m.[39mpolicy)[33m.[39m[34mtoEqual[39m({ debounceTurns[33m:[39m [34m2[39m })[33m;[39m
+    [90m631|[39m   })[33m;[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[6/27]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m src/log-level.test.ts[2m > [22mkeeps every manifest default through getPluginConfig
+[31m[1mAssertionError[22m: expected [ 'retainSegmentUnitThreshold', …(4) ] to deeply equal [][39m
+
+[32m- Expected[39m
+[31m+ Received[39m
+
+[32m- [][39m
+[31m+ [[39m
+[31m+   "retainSegmentUnitThreshold",[39m
+[31m+   "recallTopicFilter",[39m
+[31m+   "retainNonBlocking",[39m
+[31m+   "skipRetainSessionPatterns",[39m
+[31m+   "retainQualityGate",[39m
+[31m+ ][39m
+
+[36m [2m❯[22m src/log-level.test.ts:[2m43:19[22m[39m
+    [90m 41|[39m   const parsed = getPluginConfig(apiWith(defaults)) as unknown as Reco…
+    [90m 42|[39m   const dropped = Object.keys(defaults).filter((key) => parsed[key] ==…
+    [90m 43|[39m   [34mexpect[39m(dropped)[33m.[39m[34mtoEqual[39m([])[33m;[39m
+    [90m   |[39m                   [31m^[39m
+    [90m 44|[39m })[33m;[39m
+    [90m 45|[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[7/27]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m src/log-level.test.ts[2m > [22mkeeps object fields without a top-level default through getPluginConfig
+[31m[1mAssertionError[22m: expected undefined to deeply equal { pruneAtPressure: 0.7, …(1) }[39m
+
+[32m- Expected:[39m
+{
+  "pruneAtPressure": 0.7,
+  "pruneToPressure": 0.3,
+}
+
+[31m+ Received:[39m
+undefined
+
+[36m [2m❯[22m src/log-level.test.ts:[2m51:31[22m[39m
+    [90m 49|[39m   [35mconst[39m marks [33m=[39m { pruneAtPressure[33m:[39m [34m0.7[39m[33m,[39m pruneToPressure[33m:[39m [34m0.3[39m }[33m;[39m
+    [90m 50|[39m   const parsed = getPluginConfig(apiWith({ astinusMarks: marks, prompt…
+    [90m 51|[39m   [34mexpect[39m(parsed[33m.[39mastinusMarks)[33m.[39m[34mtoEqual[39m(marks)[33m;[39m
+    [90m   |[39m                               [31m^[39m
+    [90m 52|[39m   [34mexpect[39m(parsed[33m.[39mpromptCapture)[33m.[39m[34mtoBe[39m([35mtrue[39m)[33m;[39m
+    [90m 53|[39m })[33m;[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[8/27]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m src/manifest.test.ts[2m > [22mopenclaw.plugin.json[2m > [22mdeclares every PluginConfig field in configSchema and uiHints
+[31m[1mAssertionError[22m: PluginConfig fields missing from configSchema: expected [ 'memoryMode', …(7) ] to deeply equal [][39m
+
+[32m- Expected[39m
+[31m+ Received[39m
+
+[32m- [][39m
+[31m+ [[39m
+[31m+   "memoryMode",[39m
+[31m+   "allowKnowledgeDelete",[39m
+[31m+   "durableTurns",[39m
+[31m+   "turnMiddleAgeTurns",[39m
+[31m+   "passProviders",[39m
+[31m+   "retainScope",[39m
+[31m+   "skipOperationalSessions",[39m
+[31m+   "deriveHeartbeatFromSessionKey",[39m
+[31m+ ][39m
+
+[36m [2m❯[22m src/manifest.test.ts:[2m56:80[22m[39m
+    [90m 54|[39m     const extraInSchema = [...schemaKeys].filter((k) => !typeKeys.has(…
+    [90m 55|[39m
+    [90m 56|[39m     expect(missingFromSchema, "PluginConfig fields missing from config…
+    [90m   |[39m                                                                                [31m^[39m
+    [90m 57|[39m     expect(missingFromUi, "PluginConfig fields missing from uiHints").…
+    [90m 58|[39m     expect(extraInSchema, "configSchema declares fields not in PluginC…
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[9/27]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m src/package36.test.ts[2m > [22mB9 anchors[2m > [22man anchored mark follows its content across a renumber; unanchored keeps old numbers
+[31m[1mAssertionError[22m: expected '[{"role":"user","content":[{"type":"t…' to contain 'user 3'[39m
+
+Expected: [32m"user 3"[39m
+Received: [31m"[{"role":"user","content":[{"type":"text","text":"user 2"}],"idempotencyKey":"ik-user-2"},{"role":"assistant","timestamp":0,"content":[{"type":"text","text":"[injected context — earlier records of this session, digested; not current state; verify before acting] Astinus digest of seq 2-6: 3 earlier turn(s) removed at prune 1; recall, enrich or the transcript (seq 2-6) hold them"}]},{"role":"user","content":[{"type":"text","text":"user 5"}],"idempotencyKey":"ik-user-5"},{"role":"assistant","content":[{"type":"text","text":"assistant 5"}],"idempotencyKey":"ik-assistant-5"},{"role":"user","content":[{"type":"text","text":"user 6"}],"idempotencyKey":"ik-user-6"},{"role":"assistant","content":[{"type":"text","text":"assistant 6"}],"idempotencyKey":"ik-assistant-6"},{"role":"user","content":[{"type":"text","text":"user 7"}],"idempotencyKey":"ik-user-7"},{"role":"assistant","content":[{"type":"text","text":"assistant 7"}],"idempotencyKey":"ik-assistant-7"},{"role":"user","content":[{"type":"text","text":"user 8"}],"idempotencyKey":"ik-user-8"},{"role":"assistant","content":[{"type":"text","text":"assistant 8"}],"idempotencyKey":"ik-assistant-8"},{"role":"user","content":[{"type":"text","text":"user 9"}],"idempotencyKey":"ik-user-9"},{"role":"assistant","content":[{"type":"text","text":"assistant 9"}],"idempotencyKey":"ik-assistant-9"},{"role":"user","content":[{"type":"text","text":"user 10"}],"idempotencyKey":"ik-user-10"},{"role":"assistant","content":[{"type":"text","text":"assistant 10"}],"idempotencyKey":"ik-assistant-10"},{"role":"user","content":[{"type":"text","text":"user 11"}],"idempotencyKey":"ik-user-11"},{"role":"assistant","content":[{"type":"text","text":"assistant 11"}],"idempotencyKey":"ik-assistant-11"},{"role":"user","content":[{"type":"text","text":"user 12"}],"idempotencyKey":"ik-user-12"},{"role":"assistant","content":[{"type":"text","text":"assistant 12"}],"idempotencyKey":"ik-assistant-12"}]"[39m
+
+[36m [2m❯[22m src/package36.test.ts:[2m115:33[22m[39m
+    [90m113|[39m     const res = applyMarks(view(2, 12), [anchored], ctx(dbPath, "p36-a…
+    [90m114|[39m     [34mexpect[39m([34mtexts[39m(res[33m.[39mmessages))[33m.[39mnot[33m.[39m[34mtoContain[39m([32m"user 4"[39m)[33m;[39m
+    [90m115|[39m     [34mexpect[39m([34mtexts[39m(res[33m.[39mmessages))[33m.[39m[34mtoContain[39m([32m"user 3"[39m)[33m;[39m
+    [90m   |[39m                                 [31m^[39m
+    [90m116|[39m   })[33m;[39m
+    [90m117|[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[10/27]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m src/package36.test.ts[2m > [22mB9 anchors[2m > [22mskips a mark whose anchor is gone instead of re-aiming it, and never applies retired marks
+[31m[1mAssertionError[22m: expected true to be falsy[39m
+
+[32m- Expected[39m
+[31m+ Received[39m
+
+[32m- false[39m
+[31m+ true[39m
+
+[36m [2m❯[22m src/package36.test.ts:[2m123:25[22m[39m
+    [90m121|[39m     [35mconst[39m retired [33m=[39m [34mapplied[39m([34m5[39m[33m,[39m [34m6[39m[33m,[39m { retired_at[33m:[39m [34m1[39m })[33m;[39m
+    [90m122|[39m     const res = applyMarks(view(1, 12), [gone, retired], ctx(dbPath, "…
+    [90m123|[39m     [34mexpect[39m(res[33m.[39mchanged)[33m.[39m[34mtoBeFalsy[39m()[33m;[39m
+    [90m   |[39m                         [31m^[39m
+    [90m124|[39m     [34mexpect[39m(res[33m.[39mskipped[33m.[39m[34mjoin[39m([32m"\n"[39m))[33m.[39m[34mtoContain[39m([32m"anchor gone"[39m)[33m;[39m
+    [90m125|[39m     [34mexpect[39m([34mtexts[39m(res[33m.[39mmessages))[33m.[39m[34mtoContain[39m([32m"user 3"[39m)[33m;[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[11/27]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m src/package36.test.ts[2m > [22mB9 anchors[2m > [22mmigrates an old ledger in place and runs the one-time rebase once
+[31m[1mTypeError[22m: ensureMarkAnchorColumns is not a function[39m
+[36m [2m❯[22m src/package36.test.ts:[2m143:5[22m[39m
+    [90m141|[39m     ins[33m.[39m[34mrun[39m([34m7[39m[33m,[39m [34m8[39m[33m,[39m [35mnull[39m[33m,[39m [35mnull[39m)[33m;[39m [90m// remove (pending, unanchored)[39m
+    [90m142|[39m     ins.run(40, 41, "gen-now", 1); // backfill impossible (no rows) ->…
+    [90m143|[39m     [34mensureMarkAnchorColumns[39m(db)[33m;[39m [90m// idempotent on a migrated ledger[39m
+    [90m   |[39m     [31m^[39m
+    [90m144|[39m     [35mconst[39m warns[33m:[39m string[] [33m=[39m [][33m;[39m
+    [90m145|[39m     expect(runMarkRebaseCached(key, dbPath, "sid-1", (m) => warns.push…
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[12/27]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m src/package36.test.ts[2m > [22mB9 anchors[2m > [22mplans: anchored marks untouched; no current generation retires every applied mark
+[31m[1mTypeError[22m: planMarkRebase is not a function[39m
+[36m [2m❯[22m src/package36.test.ts:[2m160:18[22m[39m
+    [90m158|[39m
+    [90m159|[39m   it("plans: anchored marks untouched; no current generation retires e…
+    [90m160|[39m     [35mconst[39m plan [33m=[39m [34mplanMarkRebase[39m(
+    [90m   |[39m                  [31m^[39m
+    [90m161|[39m       [
+    [90m162|[39m         { mark_id: 1, applied_at: 1, applied_gen: "g", anchor_first_ev…
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[13/27]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m src/package36.test.ts[2m > [22mCodex A2/A3/A4 parity[2m > [22mrebase never pins old numbers to new content (host generation g-new)
+[41m[1m FAIL [22m[49m src/package36.test.ts[2m > [22mCodex A2/A3/A4 parity[2m > [22mrebase never pins old numbers to new content (host generation unreadable)
+[31m[1mTypeError[22m: runMarkRebaseCached is not a function[39m
+[36m [2m❯[22m src/package36.test.ts:[2m183:14[22m[39m
+    [90m181|[39m         "INSERT INTO marks(session_id,seq_start,seq_end,kind,action,di…
+    [90m182|[39m       )[33m.[39m[34mrun[39m()[33m;[39m
+    [90m183|[39m       expect(runMarkRebaseCached(key, dbPath, "sid-1", () => {})).toEq…
+    [90m   |[39m              [31m^[39m
+    [90m184|[39m       [35mconst[39m [m] [33m=[39m [34mreadMarksCached[39m(key[33m,[39m () [33m=>[39m {})[33m.[39mmarks [35mas[39m [33mLedgerMark[39m[][33m;[39m
+    [90m185|[39m       expect([m.anchor_first_event ?? null, m.retired_at != null]).toE…
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[14/27]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m src/package36.test.ts[2m > [22mCodex A2/A3/A4 parity[2m > [22mR36.1: a rebase that cannot take the write lock leaves legacy numeric marks unapplied, then retries
+[31m[1mTypeError[22m: runMarkRebaseCached is not a function[39m
+[36m [2m❯[22m src/package36.test.ts:[2m201:14[22m[39m
+    [90m199|[39m     writer[33m.[39m[34mexec[39m([32m"BEGIN IMMEDIATE"[39m)[33m;[39m
+    [90m200|[39m     [35mtry[39m {
+    [90m201|[39m       expect(runMarkRebaseCached(key, dbPath, "sid-1", () => {})).toBe…
+    [90m   |[39m              [31m^[39m
+    [90m202|[39m       [35mconst[39m read [33m=[39m [34mreadMarksCached[39m(key[33m,[39m () [33m=>[39m {})[33m;[39m
+    [90m203|[39m       [34mexpect[39m(read[33m.[39mok)[33m.[39m[34mtoBe[39m([35mtrue[39m)[33m;[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[15/27]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m src/package36.test.ts[2m > [22mCodex A2/A3/A4 parity[2m > [22mA3: anchors come from compressed (event_zstd) rows
+[31m[1mTypeError[22m: Cannot read properties of undefined (reading 'open')[39m
+[36m [2m❯[22m src/package36.test.ts:[2m225:31[22m[39m
+    [90m223|[39m     }
+    [90m224|[39m     db[33m.[39m[34mclose[39m()[33m;[39m
+    [90m225|[39m     [35mconst[39m ht [33m=[39m [33mHostTranscript[39m[33m.[39m[34mopen[39m(dbPath[33m,[39m [32m"sid-1"[39m)[33m;[39m
+    [90m   |[39m                               [31m^[39m
+    [90m226|[39m     [34mexpect[39m(ht[33m.[39m[34manchorsFor[39m([34m4[39m[33m,[39m [34m6[39m))[33m.[39m[34mtoEqual[39m({ first[33m:[39m [32m"e4"[39m[33m,[39m last[33m:[39m [32m"e6"[39m })[33m;[39m
+    [90m227|[39m     ht[33m.[39m[34mclose[39m()[33m;[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[16/27]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m src/pair-closure.test.ts[2m > [22mtool pairs stay closed[2m > [22ma drop on a lone result also takes the call of the result it absorbs
+[31m[1mAssertionError[22m: expected { calls: [ 'c1' ], results: [] } to deeply equal { calls: [], results: [] }[39m
+
+[32m- Expected[39m
+[31m+ Received[39m
+
+[2m  {[22m
+[32m-   "calls": [],[39m
+[31m+   "calls": [[39m
+[31m+     "c1",[39m
+[31m+   ],[39m
+[2m    "results": [],[22m
+[2m  }[22m
+
+[36m [2m❯[22m src/pair-closure.test.ts:[2m80:35[22m[39m
+    [90m 78|[39m     const res = applyMarks(messages, [applied(5, 5, { action: "drop" }…
+    [90m 79|[39m     [34mexpect[39m(res[33m.[39mchanged)[33m.[39m[34mtoBe[39m([35mtrue[39m)[33m;[39m
+    [90m 80|[39m     [34mexpect[39m([34morphans[39m(res[33m.[39mmessages))[33m.[39m[34mtoEqual[39m({ calls[33m:[39m [][33m,[39m results[33m:[39m [] })[33m;[39m
+    [90m   |[39m                                   [31m^[39m
+    [90m 81|[39m   })[33m;[39m
+    [90m 82|[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[17/27]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m src/pair-closure.test.ts[2m > [22mtool pairs stay closed[2m > [22mturn_middle starting on a call does not keep that call without its result
+[31m[1mAssertionError[22m: expected { calls: [ 'c1' ], results: [] } to deeply equal { calls: [], results: [] }[39m
+
+[32m- Expected[39m
+[31m+ Received[39m
+
+[2m  {[22m
+[32m-   "calls": [],[39m
+[31m+   "calls": [[39m
+[31m+     "c1",[39m
+[31m+   ],[39m
+[2m    "results": [],[22m
+[2m  }[22m
+
+[36m [2m❯[22m src/pair-closure.test.ts:[2m88:35[22m[39m
+    [90m 86|[39m     const res = applyMarks(messages, [tm], ctx(dbPath, "pairs-tm-call"…
+    [90m 87|[39m     [34mexpect[39m(res[33m.[39mchanged)[33m.[39m[34mtoBe[39m([35mtrue[39m)[33m;[39m
+    [90m 88|[39m     [34mexpect[39m([34morphans[39m(res[33m.[39mmessages))[33m.[39m[34mtoEqual[39m({ calls[33m:[39m [][33m,[39m results[33m:[39m [] })[33m;[39m
+    [90m   |[39m                                   [31m^[39m
+    [90m 89|[39m     expect(JSON.stringify(res.messages)).toContain("trimmed with its r…
+    [90m 90|[39m   })[33m;[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[18/27]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m src/pair-closure.test.ts[2m > [22mtool pairs stay closed[2m > [22mturn_middle ending on a result does not keep that result without its call
+[31m[1mAssertionError[22m: expected { calls: [], results: [ 'c1' ] } to deeply equal { calls: [], results: [] }[39m
+
+[32m- Expected[39m
+[31m+ Received[39m
+
+[2m  {[22m
+[2m    "calls": [],[22m
+[32m-   "results": [],[39m
+[31m+   "results": [[39m
+[31m+     "c1",[39m
+[31m+   ],[39m
+[2m  }[22m
+
+[36m [2m❯[22m src/pair-closure.test.ts:[2m96:35[22m[39m
+    [90m 94|[39m     const tm = applied(2, 4, { action: "digest", reason: "turn_middle:…
+    [90m 95|[39m     const res = applyMarks(messages, [tm], ctx(dbPath, "pairs-tm-resul…
+    [90m 96|[39m     [34mexpect[39m([34morphans[39m(res[33m.[39mmessages))[33m.[39m[34mtoEqual[39m({ calls[33m:[39m [][33m,[39m results[33m:[39m [] })[33m;[39m
+    [90m   |[39m                                   [31m^[39m
+    [90m 97|[39m   })[33m;[39m
+    [90m 98|[39m })[33m;[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[19/27]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m src/pass-provider.test.ts[2m > [22mHostTranscript[2m > [22mreads bounds, created_at and ranges, read-only
+[31m[1mTypeError[22m: Cannot read properties of undefined (reading 'open')[39m
+[36m [2m❯[22m src/pass-provider.test.ts:[2m36:31[22m[39m
+    [90m 34|[39m     ins[33m.[39m[34mrun[39m([32m"other"[39m[33m,[39m [34m99[39m[33m,[39m [32m"{}"[39m[33m,[39m [34m1[39m)[33m;[39m
+    [90m 35|[39m     db[33m.[39m[34mclose[39m()[33m;[39m
+    [90m 36|[39m     [35mconst[39m ht [33m=[39m [33mHostTranscript[39m[33m.[39m[34mopen[39m(dbPath[33m,[39m [32m"sid"[39m)[33m;[39m
+    [90m   |[39m                               [31m^[39m
+    [90m 37|[39m     [34mexpect[39m(ht[33m.[39m[34mseqBounds[39m())[33m.[39m[34mtoEqual[39m({ min[33m:[39m [34m1[39m[33m,[39m max[33m:[39m [34m6[39m })[33m;[39m
+    [90m 38|[39m     [34mexpect[39m(ht[33m.[39m[34mcreatedAt[39m([34m4[39m))[33m.[39m[34mtoBe[39m([34m4000[39m)[33m;[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[20/27]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m src/retain-capture.test.ts[2m > [22mkeeps retainNonBlocking accepted by the strict config schema as a deprecated key
+[31m[1mAssertionError[22m: expected 'When true, agent_end does not await t…' to match /deprecated/i[39m
+
+[32m- Expected:[39m
+/deprecated/i
+
+[31m+ Received:[39m
+"When true, agent_end does not await the retain RPC (fire-and-forget with the same success/failure/queue handling, just off the hot path). session_end always awaits regardless, since it is the last chance to flush before the process may exit. Default: false."
+
+[36m [2m❯[22m src/retain-capture.test.ts:[2m134:28[22m[39m
+    [90m132|[39m   [35mconst[39m key [33m=[39m manifest[33m.[39mconfigSchema[33m.[39mproperties[33m.[39mretainNonBlocking[33m;[39m
+    [90m133|[39m   [34mexpect[39m(key[33m?.[39mtype)[33m.[39m[34mtoBe[39m([32m"boolean"[39m)[33m;[39m
+    [90m134|[39m   [34mexpect[39m(key[33m?.[39mdescription)[33m.[39m[34mtoMatch[39m([36m/deprecated/i[39m)[33m;[39m
+    [90m   |[39m                            [31m^[39m
+    [90m135|[39m })[33m;[39m
+    [90m136|[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[21/27]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m src/session-ledger.harness.test.ts[2m > [22mpackage 32 - injective ledger names (R27.2 naming)[2m > [22mkeys that share a lossy name get separate ledgers, each recording its own key
+[31m[1mAssertionError[22m: expected false to be true // Object.is equality[39m
+
+[32m- Expected[39m
+[31m+ Received[39m
+
+[32m- true[39m
+[31m+ false[39m
+
+[36m [2m❯[22m src/session-ledger.harness.test.ts:[2m171:60[22m[39m
+    [90m169|[39m     [35mconst[39m b [33m=[39m [32m`[39m[36m${[39mk[36m}[39m[32m:a_b`[39m[33m;[39m [90m// same sanitized name as a[39m
+    [90m170|[39m     [34mexpect[39m([34minsertCommittedTurn[39m([34mrow[39m(a[33m,[39m [32m"adv-p1"[39m)[33m,[39m warn)[33m.[39mok)[33m.[39m[34mtoBe[39m([35mtrue[39m)[33m;[39m
+    [90m171|[39m     [34mexpect[39m([34minsertCommittedTurn[39m([34mrow[39m(b[33m,[39m [32m"adv-p2"[39m)[33m,[39m warn)[33m.[39mok)[33m.[39m[34mtoBe[39m([35mtrue[39m)[33m;[39m
+    [90m   |[39m                                                            [31m^[39m
+    [90m172|[39m     [34mcloseAllLedgers[39m()[33m;[39m
+    [90m173|[39m     [34mexpect[39m([34mledgerPath[39m(a))[33m.[39mnot[33m.[39m[34mtoBe[39m([34mledgerPath[39m(b))[33m;[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[22/27]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m src/session-ledger.harness.test.ts[2m > [22mpackage 32 - injective ledger names (R27.2 naming)[2m > [22man old lossy-named ledger fails closed and is never adopted
+[31m[1mAssertionError[22m: expected 'open-failed:table meta has no column …' to be 'legacy-ledger-unreconciled' // Object.is equality[39m
+
+Expected: [32m"[7mlegacy-ledger-unreconcile[27md"[39m
+Received: [31m"[7mopen-failed:table meta has no column named agent_i[27md"[39m
+
+[36m [2m❯[22m src/session-ledger.harness.test.ts:[2m201:22[22m[39m
+    [90m199|[39m     [35mconst[39m r [33m=[39m [34minsertCommittedTurn[39m([34mrow[39m(k[33m,[39m [32m"adv-p5"[39m)[33m,[39m warn)[33m;[39m
+    [90m200|[39m     [34mexpect[39m(r[33m.[39mok)[33m.[39m[34mtoBe[39m([35mfalse[39m)[33m;[39m
+    [90m201|[39m     [34mexpect[39m(r[33m.[39mreason)[33m.[39m[34mtoBe[39m([32m"legacy-ledger-unreconciled"[39m)[33m;[39m
+    [90m   |[39m                      [31m^[39m
+    [90m202|[39m     [34mexpect[39m([34mexistsSync[39m([34mledgerPath[39m(k)))[33m.[39m[34mtoBe[39m([35mfalse[39m)[33m;[39m
+    [90m203|[39m   })[33m;[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[23/27]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m src/session-ledger.harness.test.ts[2m > [22mpackage 33 - legacy ledger adoption[2m > [22madopts a matching-key legacy ledger on first open: same rows, old name gone
+[31m[1mError[22m: UNKNOWN: unknown error, copyfile 'C:\Users\Vern\AppData\Local\Temp\astinus-ledger-GvN4nC\workspace\state\astinus\agent_test_case13_adopt.sqlite-shm' -> 'C:\Users\Vern\AppData\Local\Temp\astinus-ledger-GvN4nC\workspace\state\astinus\agent_test_case13_adopt.sqlite-shm'[39m
+[36m [2m❯[22m legacyFor src/session-ledger.harness.test.ts:[2m235:9[22m[39m
+    [90m233|[39m     [35mfor[39m ([35mconst[39m ext [35mof[39m [[32m""[39m[33m,[39m [32m"-wal"[39m[33m,[39m [32m"-shm"[39m]) {
+    [90m234|[39m       [35mif[39m ([34mexistsSync[39m([34mledgerPath[39m(owner) [33m+[39m ext))
+    [90m235|[39m         [34mcopyFileSync[39m([34mledgerPath[39m(owner) [33m+[39m ext[33m,[39m [34mlossyPath[39m(k) [33m+[39m ext)[33m;[39m
+    [90m   |[39m         [31m^[39m
+    [90m236|[39m     }
+    [90m237|[39m     hold[33m?.[39m[34mclose[39m()[33m;[39m
+[90m [2m❯[22m src/session-ledger.harness.test.ts:[2m250:5[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[24/27]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m src/session-ledger.harness.test.ts[2m > [22mpackage 33 - legacy ledger adoption[2m > [22mrefuses a foreign-key legacy ledger and leaves it byte-unchanged
+[31m[1mAssertionError[22m: expected { ok: false, …(1) } to match object { ok: false, …(1) }[39m
+
+[32m- Expected[39m
+[31m+ Received[39m
+
+[2m  {[22m
+[2m    "ok": false,[22m
+[32m-   "reason": "legacy-ledger-unreconciled",[39m
+[31m+   "reason": "ledger-key-mismatch:agent:test:case14:foreign:someone-else",[39m
+[2m  }[22m
+
+[36m [2m❯[22m src/session-ledger.harness.test.ts:[2m265:15[22m[39m
+    [90m263|[39m     [35mconst[39m before [33m=[39m [34mreadFileSync[39m([34mlossyPath[39m(k))[33m;[39m
+    [90m264|[39m     [35mconst[39m r [33m=[39m [34minsertCommittedTurn[39m([34mrow[39m(k[33m,[39m [32m"adv-f"[39m)[33m,[39m warn)[33m;[39m
+    [90m265|[39m     expect(r).toMatchObject({ ok: false, reason: "legacy-ledger-unreco…
+    [90m   |[39m               [31m^[39m
+    [90m266|[39m     [34mexpect[39m([34mreadFileSync[39m([34mlossyPath[39m(k))[33m.[39m[34mequals[39m(before))[33m.[39m[34mtoBe[39m([35mtrue[39m)[33m;[39m
+    [90m267|[39m     [34mexpect[39m([34mexistsSync[39m([34mledgerPath[39m(k)))[33m.[39m[34mtoBe[39m([35mfalse[39m)[33m;[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[25/27]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m src/session-ledger.harness.test.ts[2m > [22mpackage 33 - legacy ledger adoption[2m > [22madopts a legacy ledger with WAL sidecars and loses no rows
+[31m[1mError[22m: UNKNOWN: unknown error, copyfile 'C:\Users\Vern\AppData\Local\Temp\astinus-ledger-6Y34Ef\workspace\state\astinus\agent_test_case15_wal.sqlite-shm' -> 'C:\Users\Vern\AppData\Local\Temp\astinus-ledger-6Y34Ef\workspace\state\astinus\agent_test_case15_wal.sqlite-shm'[39m
+[36m [2m❯[22m legacyFor src/session-ledger.harness.test.ts:[2m235:9[22m[39m
+    [90m233|[39m     [35mfor[39m ([35mconst[39m ext [35mof[39m [[32m""[39m[33m,[39m [32m"-wal"[39m[33m,[39m [32m"-shm"[39m]) {
+    [90m234|[39m       [35mif[39m ([34mexistsSync[39m([34mledgerPath[39m(owner) [33m+[39m ext))
+    [90m235|[39m         [34mcopyFileSync[39m([34mledgerPath[39m(owner) [33m+[39m ext[33m,[39m [34mlossyPath[39m(k) [33m+[39m ext)[33m;[39m
+    [90m   |[39m         [31m^[39m
+    [90m236|[39m     }
+    [90m237|[39m     hold[33m?.[39m[34mclose[39m()[33m;[39m
+[90m [2m❯[22m src/session-ledger.harness.test.ts:[2m272:5[22m[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[26/27]⎯[22m[39m
+
+
+[2m Test Files [22m [1m[31m9 failed[39m[22m[2m | [22m[1m[32m46 passed[39m[22m[90m (55)[39m
+[2m      Tests [22m [1m[31m27 failed[39m[22m[2m | [22m[1m[32m614 passed[39m[22m[90m (641)[39m
+[2m   Start at [22m 19:18:59
+[2m   Duration [22m 38.90s[2m (transform 2.49s, setup 0ms, import 11.20s, tests 77.94s, environment 8ms)[22m
+
