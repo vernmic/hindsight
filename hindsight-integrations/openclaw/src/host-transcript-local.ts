@@ -27,6 +27,8 @@ export type EventRange = {
   descending?: boolean;
   lo?: number;
   hi?: number;
+  /** Strictly after this seq (the host reader's `after`). */
+  after?: number;
   limit?: number;
 };
 
@@ -99,6 +101,7 @@ export class HostTranscript {
     for (const [op, v] of [
       ["seq >= ?", range.lo],
       ["seq <= ?", range.hi],
+      ["seq > ?", range.after],
     ] as const) {
       if (v !== undefined) (where.push(op), args.push(v));
     }
