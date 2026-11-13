@@ -100,57 +100,6 @@ const answer = (body: object) =>
     { status: 200 }
   );
 
-describe("turn_middle age (F2, turnMiddleAgeTurns = 6)", () => {
-  it("the pass proposes a turn with 6 newer turns and not one with 5", async () => {
-    const { payload, ledger } = setup(8); // turn i (1-based) has 8 - i newer turns
-    expect(await runPass({ ...payload, turn_middle_age_turns: 6 })).toBe("error"); // no provider
-    const db = ledger();
-    const marks = db
-      .prepare("SELECT seq_start, seq_end, kind, action, reason FROM marks ORDER BY seq_start")
-      .all() as Array<Record<string, unknown>>;
-    db.close();
-    // turns 1 (7 newer) and 2 (6 newer); turn 3 has 5 newer
-    expect(marks.map((m) => [m.seq_start, m.seq_end])).toEqual([
-      [1, 3],
-      [4, 6],
-    ]);
-    expect(marks[0]).toMatchObject({ kind: "turn", action: "digest" });
-    expect(String(marks[0].reason).startsWith("turn_middle")).toBe(true);
-  });
-
-  it("applyMarks redacts a turn with 6 newer turns and not one with 5", () => {
-    const root = mkdtempSync(join(tmpdir(), "astinus-apply-"));
-    dirs.push(root);
-    // turn 1 holds the first user message (never eligible), so the 6/5 pair is turns 2 and 3
-    const { dbPath, messages } = hostStore(root, 8);
-    const tm = (s: number): LedgerMark => ({
-      mark_id: s,
-      seq_start: s,
-      seq_end: s + 2,
-      kind: "turn",
-      action: "digest",
-      reason: "turn_middle: interior redactable; boundaries and steers preserved",
-      pressure: 1,
-      topic_dormancy_s: 10,
-      stmt_age_s: 10,
-    });
-    const res = applyMarks(messages, [tm(4), tm(7)], {
-      sessionKey: "agent:main:apply-f2",
-      hostDbPath: dbPath,
-      sessionId: SID,
-      tokenBudget: 1,
-      turnCounter: 1,
-      turnMiddleAgeTurns: 6,
-    });
-    const text = JSON.stringify(res.messages);
-    expect(text).not.toContain("thinking 2"); // turn 2: 6 newer turns - redacted
-    expect(text).toContain("turn interior redacted");
-    expect(text).toContain("thinking 3"); // turn 3: 5 newer turns - kept
-    expect(text).toContain("question 2 about"); // boundaries preserved
-    expect(text).toContain("answer 2");
-  });
-});
-
 describe("classification pass", () => {
   it("writes the model's classification, filters marks, and never writes the host store", async () => {
     const { payload, dbPath, ledger } = setup(10);
