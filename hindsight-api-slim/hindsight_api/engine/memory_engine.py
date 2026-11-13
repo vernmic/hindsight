@@ -7237,7 +7237,11 @@ class MemoryEngine(MemoryEngineInterface):
                         continue
                     carried = carried_by_doc.get(item.get("document_id") or "")
                     if carried:
-                        item["tags"] = list(carried)
+                        # Keep the carry off the item's own tag set: the request omitted
+                        # tags, so facts inserted from genuinely new content must stay
+                        # tagless (precision contract). The survivor update consumes this
+                        # key and writes the carried set only onto unchanged units.
+                        item["_append_carried_tags"] = list(carried)
 
         await self._validate_retain_update_modes(bank_id, contents, request_context)
 

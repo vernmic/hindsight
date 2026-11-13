@@ -657,7 +657,7 @@ async def _record_retain_event(
 # and only the resulting facts are wrong. Inverting it makes the safe case the
 # default — a new retain field round-trips unless someone deliberately excludes it,
 # and the single source of truth becomes what api_retain puts on the content dict.
-_RETAIN_PARAMS_NOT_REPLAYED = frozenset({"content", "document_id", "update_mode", "tags", "force_reextract"})
+_RETAIN_PARAMS_NOT_REPLAYED = frozenset({"content", "document_id", "update_mode", "tags", "force_reextract", "_append_carried_tags"})
 
 
 def _build_retain_params(contents_dicts, document_tags=None, doc_contents=None):
@@ -4627,11 +4627,20 @@ async def _try_delta_retain(
                         # survivors; new/changed units inserted below already carry
                         # the current metadata and tags.
                         step_start = time.perf_counter()
+                        survivor_tags = merged_tags
+                        if not survivor_tags:
+                            survivor_tags = list(
+                                dict.fromkeys(
+                                    tag
+                                    for _carried_item in contents_dicts
+                                    for tag in (_carried_item.get("_append_carried_tags") or [])
+                                )
+                            )
                         updated_count = await fact_storage.update_memory_units_metadata_and_tags(
                             conn,
                             bank_id,
                             effective_doc_id,
-                            merged_tags,
+                            survivor_tags,
                             retain_params.get("metadata", {}),
                             observation_scopes=retain_params.get("observation_scopes"),
                             label_tag_keys=label_tag_keys(getattr(config, "entity_labels", None)),
