@@ -4,13 +4,12 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { zstdCompressSync } from "node:zlib";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import {
-  applyMarks,
+import {applyMarks,
   ensureMarkAnchorColumns,
-  HostTranscript,
+  ,
   SeqIndex,
-  type LedgerMark,
-} from "./assemble-marks.js";
+  type LedgerMark} from "./assemble-marks.js";
+import { HostTranscript } from "./host-transcript-local.js";
 import { createContextEngine, estimateTokens } from "./context-engine.js";
 import {
   closeAllLedgers,
