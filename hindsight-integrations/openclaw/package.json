@@ -35,7 +35,7 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && node -e \"require('fs').cpSync('src/vendor/gpt-tokenizer/LICENSE','dist/vendor/gpt-tokenizer/LICENSE')\"",
     "dev": "tsc --watch",
     "clean": "rm -rf dist",
     "prepack": "node scripts/pack-manifest.mjs strip",
@@ -49,8 +49,7 @@
   "dependencies": {
     "@clack/prompts": "^1.2.0",
     "@vectorize-io/hindsight-all": "^0.6.2",
-    "@vectorize-io/hindsight-client": "^1.1.0",
-    "gpt-tokenizer": "^4.1.0"
+    "@vectorize-io/hindsight-client": "^1.1.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
