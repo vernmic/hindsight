@@ -13,8 +13,6 @@ import {
   openSessionLedger,
   planMarkRebase,
   readMarksCached,
-  runMarkRebaseCached,
-  ledgerPath,
 } from "./session-ledger.js";
 import { shouldQueueRetain } from "./retain-scope.js";
 import plugin from "./index.js";
@@ -49,6 +47,10 @@ function host(from = 1, to = 12, gen: string | null = "gen-now") {
   const dbPath = join(dir, "host.sqlite");
   const db = new DatabaseSync(dbPath);
   db.exec("CREATE TABLE transcript_events (session_id TEXT, seq INTEGER, event_json TEXT)");
+  // The host's identity rows (OpenClaw transcript_event_identities); mark anchors resolve through them.
+  db.exec(
+    "CREATE TABLE transcript_event_identities (session_id TEXT NOT NULL, event_id TEXT NOT NULL, seq INTEGER NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (session_id, event_id))"
+  );
   write(db, from, to);
   db.exec("CREATE TABLE transcript_rewrite_watermarks (session_id TEXT PRIMARY KEY, generation TEXT, updated_at INTEGER)");
   if (gen) db.prepare("INSERT INTO transcript_rewrite_watermarks VALUES ('sid-1', ?, 1)").run(gen);
@@ -57,15 +59,21 @@ function host(from = 1, to = 12, gen: string | null = "gen-now") {
 }
 function write(db: DatabaseSync, from: number, to: number, startSeq = 1) {
   const ins = db.prepare("INSERT INTO transcript_events VALUES (?,?,?)");
+  const ident = db.prepare(
+    "INSERT INTO transcript_event_identities (session_id, event_id, seq, created_at) VALUES (?,?,?,1)"
+  );
   let seq = startSeq;
   for (let t = from; t <= to; t++)
-    for (const role of ["user", "assistant"])
+    for (const role of ["user", "assistant"]) {
+      ident.run("sid-1", `ev-${role}-${t}`, seq);
       ins.run("sid-1", seq++, JSON.stringify({ id: `ev-${role}-${t}`, message: msg(role, t) }));
+    }
 }
 /** Simulate a manual trim: drop turn 1, renumber the survivors from 1 (ids kept). */
 function trimFirstTurn(dbPath: string, appendTurn?: number) {
   const db = new DatabaseSync(dbPath);
   db.exec("DELETE FROM transcript_events");
+  db.exec("DELETE FROM transcript_event_identities");
   write(db, 2, 12);
   if (appendTurn) write(db, appendTurn, appendTurn, 23);
   db.close();
@@ -79,7 +87,8 @@ const ctx = (dbPath: string, key: string) => ({
   sessionKey: key,
   hostDbPath: dbPath,
   sessionId: "sid-1",
-  tokenBudget: 1,
+  // 0 = no budget: the steady view only. These tests cover mark placement, not the prune cycle.
+  tokenBudget: 0,
   turnCounter: 100,
 });
 const applied = (lo: number, hi: number, extra: Partial<LedgerMark> = {}): LedgerMark =>
@@ -116,39 +125,8 @@ describe("B9 anchors", () => {
     const retired = applied(5, 6, { retired_at: 1 });
     const res = applyMarks(view(1, 12), [gone, retired], ctx(dbPath, "p36-b"));
     expect(res.changed).toBeFalsy();
-    expect(res.skipped.join("\n")).toContain("anchor gone");
+    expect(res.skipped.join("\n")).toContain("anchored content is gone");
     expect(texts(res.messages)).toContain("user 3");
-  });
-
-  it("migrates an old ledger in place and runs the one-time rebase once", () => {
-    const { dir, dbPath } = host();
-    configureSessionLedger(dir);
-    const key = "agent:main:p36";
-    const opened = openSessionLedger(key, "main", dbPath, () => {});
-    expect(opened.ok).toBe(true);
-    const db = (opened as { db: DatabaseSync }).db;
-    // Simulate a pre-anchor ledger: drop the new columns' values by reinserting plain rows.
-    const ins = db.prepare(
-      "INSERT INTO marks(session_id,seq_start,seq_end,kind,action,digest,reason,proposed_at,applied_gen,applied_at) VALUES('sid-1',?,?,'turn','digest','d','r',1,?,?)"
-    );
-    ins.run(3, 4, "gen-now", 1); // backfill
-    ins.run(5, 6, "gen-old", 1); // retire
-    ins.run(7, 8, null, null); // remove (pending, unanchored)
-    ins.run(40, 41, "gen-now", 1); // backfill impossible (no rows) -> retire
-    ensureMarkAnchorColumns(db); // idempotent on a migrated ledger
-    const warns: string[] = [];
-    expect(runMarkRebaseCached(key, dbPath, "sid-1", (m) => warns.push(m))).toEqual({
-      backfill: 1,
-      retire: 2,
-      remove: 1,
-    });
-    expect(runMarkRebaseCached(key, dbPath, "sid-1", () => {})).toBeNull(); // once
-    const marks = readMarksCached(key, () => {}).marks as LedgerMark[];
-    expect(marks.map((m) => [m.seq_start, m.anchor_first_event ?? null, m.retired_at != null])).toEqual([
-      [3, "ev-user-2", false],
-      [5, null, true],
-      [40, null, true],
-    ]);
   });
 
   it("plans: anchored marks untouched; no current generation retires every applied mark", () => {
@@ -164,47 +142,11 @@ describe("B9 anchors", () => {
 });
 
 describe("Codex A2/A3/A4 parity", () => {
-  // A2: the saved state says g-old (the mark's generation) but the host rewrote to g-new.
-  for (const gen of ["g-new", null])
-    it(`rebase never pins old numbers to new content (host generation ${gen ?? "unreadable"})`, () => {
-      const { dir, dbPath } = host(1, 12, gen);
-      trimFirstTurn(dbPath); // the rewrite: seq 3-4 now holds turn 3, not the marked turn 2
-      configureSessionLedger(dir);
-      const key = `agent:main:p36-a2-${gen}`;
-      const db = (openSessionLedger(key, "main", dbPath, () => {}) as { db: DatabaseSync }).db;
-      db.prepare(
-        "INSERT INTO marks(session_id,seq_start,seq_end,kind,action,digest,reason,proposed_at,applied_gen,applied_at) VALUES('sid-1',3,4,'turn','digest','d','r',1,'g-old',1)"
-      ).run();
-      expect(runMarkRebaseCached(key, dbPath, "sid-1", () => {})).toEqual({ backfill: 0, retire: 1, remove: 0 });
-      const [m] = readMarksCached(key, () => {}).marks as LedgerMark[];
-      expect([m.anchor_first_event ?? null, m.retired_at != null]).toEqual([null, true]);
-    });
-
-  it("R36.1: a rebase that cannot take the write lock leaves legacy numeric marks unapplied, then retries", () => {
-    const { dir, dbPath } = host(1, 12, "g-new");
-    trimFirstTurn(dbPath);
-    configureSessionLedger(dir);
-    const key = "agent:main:p36-r361";
-    const db = (openSessionLedger(key, "main", dbPath, () => {}) as { db: DatabaseSync }).db;
-    db.exec("PRAGMA busy_timeout=1");
-    db.prepare(
-      "INSERT INTO marks(session_id,seq_start,seq_end,kind,action,digest,reason,proposed_at,applied_gen,applied_at) VALUES('sid-1',3,4,'turn','digest','d','r',1,'g-old',1)"
-    ).run();
-    const writer = new DatabaseSync(ledgerPath(key));
-    writer.exec("BEGIN IMMEDIATE");
-    try {
-      expect(runMarkRebaseCached(key, dbPath, "sid-1", () => {})).toBeNull();
-      const read = readMarksCached(key, () => {});
-      expect(read.ok).toBe(true);
-      expect(read.marks).toEqual([]);
-      const res = applyMarks(view(2, 12), read.marks as never, ctx(dbPath, key));
-      expect(texts(res.messages)).toContain("user 3");
-    } finally {
-      writer.exec("ROLLBACK");
-      writer.close();
-    }
-    expect(runMarkRebaseCached(key, dbPath, "sid-1", () => {})).toEqual({ backfill: 0, retire: 1, remove: 0 });
-  });
+  // Retired 2026-11-14: the A2 rebase-pinning cases and R36.1 (rebase under a held write lock)
+  // tested runMarkRebaseCached, as did the B9 "migrates an old ledger in place and runs the
+  // one-time rebase once" case. The prune cycle (2026-11-03) removed the one-time rebase:
+  // supersession is decided by prune_epoch, and ensurePruneColumns upgrades an old ledger on
+  // every open (covered by session-ledger-retire.test.ts).
   it("A3: anchors come from compressed (event_zstd) rows", () => {
     const dir = mkdtempSync(join(tmpdir(), "p36-z-"));
     dirs.push(dir);
