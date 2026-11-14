@@ -13,7 +13,10 @@
 // Package subpath export. tsconfig maps this specifier to the shipped
 // declaration because this package compiles with moduleResolution "node", which
 // does not read an "exports" map; the bundler-side resolver uses the export.
-import { countTokens } from "gpt-tokenizer/encoding/cl100k_base";
+// Vendored cl100k_base closure (see src/vendor/gpt-tokenizer). The published package is 60 MB of
+// 3,124 files for this one import, and the host hashes every file of every dependency on its main
+// thread at plugin capture time, which froze the gateway. 24 files ship instead.
+import { countTokens } from "./vendor/gpt-tokenizer/encoding/cl100k_base.js";
 
 /** Token categories reported for a prompt. */
 export type TokenCategory =
