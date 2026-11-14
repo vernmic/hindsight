@@ -434,6 +434,14 @@ describe("composed assembly over a real ledger and compressed host store", () =>
     host.exec(
       "CREATE TABLE transcript_events (session_id TEXT, seq INTEGER, event_json TEXT, event_zstd BLOB, event_utf8_bytes INTEGER)"
     );
+    // The host writes an identity row per event (OpenClaw transcript_event_identities); mark
+    // anchors resolve through it.
+    host.exec(
+      "CREATE TABLE transcript_event_identities (session_id TEXT NOT NULL, event_id TEXT NOT NULL, seq INTEGER NOT NULL, event_type TEXT, parent_id TEXT, message_idempotency_key TEXT, created_at INTEGER NOT NULL, PRIMARY KEY (session_id, event_id))"
+    );
+    const insertIdentity = host.prepare(
+      "INSERT INTO transcript_event_identities (session_id, event_id, seq, created_at) VALUES (?,?,?,?)"
+    );
     const insert = host.prepare("INSERT INTO transcript_events VALUES (?,?,?,?,?)");
     const messages: unknown[] = [];
     for (let turn = 1; turn <= 12; turn++) {
@@ -446,6 +454,7 @@ describe("composed assembly over a real ledger and compressed host store", () =>
         messages.push(message);
         const bytes = Buffer.from(JSON.stringify({ id: `ev-${messages.length}`, message }), "utf8");
         insert.run("host-uuid", messages.length, null, zstdCompressSync(bytes), bytes.length);
+        insertIdentity.run("host-uuid", `ev-${messages.length}`, messages.length, 1);
       }
     }
     host.close();
@@ -467,7 +476,13 @@ describe("composed assembly over a real ledger and compressed host store", () =>
       sessionId: "host-uuid",
       tokenBudget: Math.ceil(estimateTokensHost(messages) / 0.9),
     });
-    expect(out.messages.length).toBe(23);
+    // Prune cycle (2026-11-03): at pressure 0.90 >= pruneAtPressure 0.6 the pending mark is
+    // admitted (seq 2 dropped) and the oldest-turns fallback cuts toward pruneToPressure 0.25,
+    // never touching the first user message or the 8-user-turn preserved tail.
+    expect(out.messages.length).toBe(18);
+    expect(out.messages[0]).toBe(messages[0]);
+    expect(out.messages.slice(-16)).toEqual(messages.slice(-16));
+    expect(out.messages).not.toContain(messages[1]);
     expect(out.promptAuthority).toBe("assembled");
     const stamped = opened.db
       .prepare("SELECT mark_id, applied_at FROM marks ORDER BY mark_id")
@@ -618,12 +633,12 @@ describe("astinusMarks policy wiring", () => {
       sessionId: "u",
     };
     await direct.assemble(params);
-    cfg = { astinusMarks: { debounceTurns: 2 } };
+    cfg = { astinusMarks: { pruneToPressure: 0.3 } };
     await direct.assemble(params);
     const policies = applyMarks.mock.calls.map(
       (call) => (call as unknown[])[2] as { policy?: unknown }
     );
     expect(policies[0].policy).toEqual({ pruneAtPressure: 0.5 });
-    expect(policies[1].policy).toEqual({ debounceTurns: 2 });
+    expect(policies[1].policy).toEqual({ pruneToPressure: 0.3 });
   });
 });
