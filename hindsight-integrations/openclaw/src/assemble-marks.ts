@@ -220,9 +220,24 @@ export class SeqIndex {
   private lastSeqId: string | null = null;
   private readonly map = new Map<string, number>();
   private loadedOnce = false;
+  /** Whether the host store has the compressed payload columns (OpenClaw zstd transcript rows). */
+  private zstdCols: boolean | null = null;
   failed = false;
 
   constructor(readonly dbPath: string, readonly sessionId: string) {}
+
+  /** Payload columns to select: compressed rows carry event_json NULL and the event in event_zstd. */
+  private payloadCols(): string {
+    if (this.zstdCols === null) {
+      try {
+        const cols = this.db!.prepare("PRAGMA table_info(transcript_events)").all() as Array<{ name?: unknown }>;
+        this.zstdCols = cols.some((c) => String(c.name) === "event_zstd");
+      } catch {
+        this.zstdCols = false;
+      }
+    }
+    return this.zstdCols ? "event_json, event_zstd" : "event_json";
+  }
 
   private open(): boolean {
     if (this.db) return true;
@@ -245,10 +260,11 @@ export class SeqIndex {
     if (this.lastSeqId === null) return true;
     try {
       const row = this.db!
-        .prepare("SELECT event_json FROM transcript_events WHERE session_id = ? AND seq = ?")
-        .get(this.sessionId, this.lastSeq) as { event_json: string } | undefined;
+        .prepare(`SELECT ${this.payloadCols()} FROM transcript_events WHERE session_id = ? AND seq = ?`)
+        .get(this.sessionId, this.lastSeq) as { event_json: string | null; event_zstd?: Uint8Array | null } | undefined;
       if (!row) return false;
-      return eventIdOf(row.event_json) === this.lastSeqId;
+      const json = row.event_json ?? decodeZstd(row.event_zstd ?? null);
+      return json !== null && eventIdOf(json) === this.lastSeqId;
     } catch {
       return false;
     }
@@ -265,23 +281,26 @@ export class SeqIndex {
         this.lastSeq = -1;
         this.lastSeqId = null;
       }
-      let rows: Array<{ seq: number; event_json: string }> = [];
+      let rows: Array<{ seq: number; event_json: string | null; event_zstd?: Uint8Array | null }> = [];
       do {
         rows = this.db!
           .prepare(
-            "SELECT seq, event_json FROM transcript_events WHERE session_id = ? AND seq > ? ORDER BY seq LIMIT ?"
+            `SELECT seq, ${this.payloadCols()} FROM transcript_events WHERE session_id = ? AND seq > ? ORDER BY seq LIMIT ?`
           )
-          .all(this.sessionId, this.lastSeq, LOAD_CHUNK) as Array<{ seq: number; event_json: string }>;
+          .all(this.sessionId, this.lastSeq, LOAD_CHUNK) as typeof rows;
         for (const r of rows) {
-          const key = eventIdentity(r.event_json);
+          // A compressed row (event_json NULL) decodes from event_zstd; an undecodable row only
+          // advances the cursor, as an identity-less row always did.
+          const json = r.event_json ?? decodeZstd(r.event_zstd ?? null);
+          const key = json === null ? null : eventIdentity(json);
           if (Number(r.seq) > this.lastSeq) {
             this.lastSeq = Number(r.seq);
-            this.lastSeqId = eventIdOf(r.event_json);
+            this.lastSeqId = json === null ? null : eventIdOf(json);
           }
-          if (!key) continue;
+          if (!key || json === null) continue;
           this.map.set(key, Number(r.seq));
           try {
-            const ev = JSON.parse(r.event_json) as Record<string, unknown>;
+            const ev = JSON.parse(json) as Record<string, unknown>;
             const tcKey = toolCallKeyOf((ev.message ?? ev) as Record<string, unknown>);
             if (tcKey) {
               const prev = this.map.get(tcKey);
