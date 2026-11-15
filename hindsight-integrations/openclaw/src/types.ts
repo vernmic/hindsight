@@ -107,18 +107,17 @@ export type PluginHookEndedTranscript =
       }): Promise<{ messages: readonly unknown[]; totalMessages: number; truncated: boolean }>;
     };
 
+/** Async enrichment sidecar (port of workspace/skills/astinus/enrich.py). Default off. */
+export type EnrichSidecarOptions = {
+  enabled?: boolean;
+  maxAgeHours?: number;
+  topicsCap?: number;
+  banks?: Array<{ bank: string; cap: number }>;
+  timeoutMs?: number;
+};
+
 export interface PluginConfig {
-  /**
-   * Async enrichment sidecar (port of workspace/skills/astinus/enrich.py). Default off.
-   * Writes the per-session inject file the host reads at the start of the next turn.
-   */
-  enrichSidecar?: {
-    enabled?: boolean;
-    maxAgeHours?: number;
-    topicsCap?: number;
-    banks?: Array<{ bank: string; cap: number }>;
-    timeoutMs?: number;
-  };
+  enrichSidecar?: EnrichSidecarOptions;
   /**
    * Mission for the Reflect operation. Stamped onto the bank's `reflect_mission`
    * field via createBank() on first use. Has no effect on retain or recall.

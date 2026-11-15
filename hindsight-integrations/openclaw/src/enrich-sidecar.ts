@@ -315,7 +315,16 @@ export async function runEnrichSidecar(
   }
 
   deps.served?.prune(live.map((t) => t.slug));
-  deps.served?.mark(servedNew);
+  // One id can be returned for two live topics in the same run; the served store keys on
+  // (slug, id), so mark each pair once (a duplicate pair made the store record twice).
+  const seenPairs = new Set<string>();
+  const uniquePairs = servedNew.filter(([slug, id]) => {
+    const key = slug + String.fromCharCode(0) + id;
+    if (seenPairs.has(key)) return false;
+    seenPairs.add(key);
+    return true;
+  });
+  deps.served?.mark(uniquePairs);
   return { status: "wrote", path: written, gathered, elapsedMs: now() - started };
 }
 
