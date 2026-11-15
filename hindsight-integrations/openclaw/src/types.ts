@@ -213,6 +213,7 @@ export interface PluginConfig {
   retainQueuePath?: string; // Path to JSONL file for buffering failed retains. Default: ~/.openclaw/data/hindsight-retain-queue.jsonl
   /** @deprecated Ignored. agent_end always returns once the retain is durably queued; delivery runs in the background. */
   retainNonBlocking?: boolean;
+  retainReleaseFailedHeads?: boolean; // When true, a terminally failed retain row stops holding its session's delivery slot. Default: false.
   retainQueueMaxAgeMs?: number; // Max age in ms for queued items. -1 = keep forever (default: -1)
   retainQueueFlushIntervalMs?: number; // How often to attempt flushing the queue in ms. Default: 60000 (1 min)
   /**
