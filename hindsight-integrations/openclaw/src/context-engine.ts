@@ -449,8 +449,12 @@ export function createContextEngine(log: Logger, options: ContextEngineOptions =
             windowFirstSeq = res.windowFirstSeq ?? null;
             hardCapped = res.prune !== null;
             if (res.prune) {
+              // Honesty (2026-11-15): the prune is computed against the view only - nothing here
+              // calls commitPrune, so this epoch is a candidate and is never written to the ledger.
+              // Logging it as a bare epoch read as a committed one (topic:192 logged epoch 1 while
+              // its ledger had prunes = 0 and prune_epoch = NULL).
               log.warn(
-                `[hindsight-engine] prune: epoch ${res.prune.epoch} dropped ${res.prune.dropped} pressure ${res.prune.pressureBefore.toFixed(2)} -> ${res.prune.pressureAfter.toFixed(2)} session=${key}`
+                `[hindsight-engine] prune: view-only, epoch ${res.prune.epoch} not committed; dropped ${res.prune.dropped} pressure ${res.prune.pressureBefore.toFixed(2)} -> ${res.prune.pressureAfter.toFixed(2)} session=${key}`
               );
             }
             viewLastSeq = res.windowLastSeq ?? null;
