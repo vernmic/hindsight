@@ -105,6 +105,19 @@ describe("enrich sidecar", () => {
     expect(mark).toHaveBeenCalledWith([["token-accounting", "d9"]]);
   });
 
+  it("marks a document once even when two banks return it in the same run", async () => {
+    const r = root();
+    const mark = vi.fn();
+    const out = await runEnrichSidecar(payload(r), {
+      config: cfg({ enabled: true }),
+      gather: async () => [mem("d1")],
+      synthesize: async () => ({ text: "Relevance: ok" }),
+      served: { load: () => new Set(), mark, prune: vi.fn() },
+    });
+    expect(out.status).toBe("wrote");
+    expect(mark).toHaveBeenCalledWith([["token-accounting", "d1"]]);
+  });
+
   it("sweeps keyed files older than the age limit", async () => {
     const r = root();
     const keyedDir = join(r, "workspace", "inject", "astinus");
