@@ -168,7 +168,13 @@ function captureHookLifecycle(): { signal: AbortSignal | undefined; isCurrent: (
 import type { RecallResponse } from "./types.js";
 import { qualityGateSkipReason } from "./retain-quality-gate.js";
 import { marksPolicyFromConfig, registerHindsightContextEngine } from "./context-engine.js";
-import type { PassProvider } from "./pass-provider.js";
+import { callLlm, type PassProvider } from "./pass-provider.js";
+import {
+  createHindsightGather,
+  resolveEnrichConfig,
+  runEnrichSidecar,
+} from "./enrich-sidecar.js";
+import { readLiveTopics } from "./session-ledger.js";
 import { resolveHostStateRoot, resolveRetainQueuePath } from "./host-paths.js";
 import {
   lifecycleAuthorityFor,
@@ -3718,9 +3724,83 @@ ${memoriesFormatted}
       }
     };
 
+    // Async enrichment (port of enrich.py; default off). Fire-and-forget: a slow bank or model
+    // must never delay the next turn, and a failure here must never fail the hook.
+    const runEnrichAfterTurn = async (event: any, ctx?: PluginHookAgentContext): Promise<void> => {
+      const sidecar = resolveEnrichConfig(pluginConfig.enrichSidecar);
+      if (!sidecar.enabled) return;
+      try {
+        const msgs = Array.isArray(event?.messages) ? event.messages : [];
+        let lastUser = "";
+        for (let i = msgs.length - 1; i >= 0; i--) {
+          const m = msgs[i] as { role?: string; content?: unknown } | null;
+          if (!m || m.role !== "user") continue;
+          const c = m.content;
+          lastUser =
+            typeof c === "string"
+              ? c
+              : Array.isArray(c)
+                ? c.map((p) => String((p as { text?: unknown })?.text ?? "")).join(" ")
+                : "";
+          if (lastUser.trim()) break;
+        }
+        const sessionKey = String((ctx as { sessionKey?: string } | undefined)?.sessionKey ?? "");
+        let liveSlugs: string[] = [];
+        try {
+          liveSlugs = sessionKey ? readLiveTopics(sessionKey, sidecar.topicsCap) : [];
+        } catch {
+          liveSlugs = [];
+        }
+        const providers = Array.isArray(pluginConfig.passProviders)
+          ? pluginConfig.passProviders.filter(
+              (p): p is PassProvider =>
+                !!p && typeof p.url === "string" && typeof p.model === "string" && typeof p.apiKey === "string"
+            )
+          : [];
+        const gather = createHindsightGather({
+          apiUrl: pluginConfig.hindsightApiUrl ?? "http://127.0.0.1:8888",
+          timeoutMs: sidecar.timeoutMs,
+        });
+        const outcome = await runEnrichSidecar(
+          {
+            root: hostStateRoot,
+            sessionKey,
+            topics: [],
+            lastUserMessage: lastUser,
+            // Live topics come from the session ledger when it is open for this key; the module
+            // falls back to the substance query when it is not (first touch of a session).
+            liveTopics: liveSlugs.map((slug) => ({ slug, label: slug, digest: "" })),
+          },
+          {
+            config: sidecar,
+            gather,
+            synthesize: async (system, user) => {
+              const res = await callLlm(providers, system, user, {
+                log: debug,
+                timeoutMs: sidecar.timeoutMs,
+              });
+              if (!res.ok) throw new Error("no provider answered");
+              return {
+                text: res.text,
+                model: res.model,
+                elapsedS: Math.round(res.elapsedMs / 1000),
+                reasoningTokens: res.reasoningTokens,
+                fallbackFrom: res.fallbackFrom,
+                fallbackReason: res.fallbackReason,
+              };
+            },
+          }
+        );
+        debug("[Hindsight] enrich " + outcome.status + (outcome.path ? " -> " + outcome.path : ""));
+      } catch (e) {
+        log.warn("[Hindsight] enrich error: " + String((e as Error)?.message ?? e));
+      }
+    };
+
     // Hook signature: (event, ctx) where event has {messages, success, error?, durationMs?}
     onScoped("agent_end", async (event: any, ctx?: PluginHookAgentContext) => {
       await runRetain(event, ctx, { hookName: "agent_end" });
+      void runEnrichAfterTurn(event, ctx);
     });
 
     // session_end fires once per OpenClaw session close. We force-flush so
