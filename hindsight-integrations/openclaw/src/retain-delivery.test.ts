@@ -253,6 +253,33 @@ describe("durable terminal retain reconciliation", () => {
     expect(h.applied).toHaveBeenCalledOnce();
     expect(h.queue.peek().map((row) => row.content)).toEqual(["head", "tail"]);
   });
+  it("a terminally failed head blocks its session unless retainReleaseFailedHeads is on (P0 2026-11-12)", async () => {
+    for (const release of [false, true]) {
+      const h = harness();
+      h.add("s", "failed-head");
+      h.setStatus("failed");
+      await h.pass();
+      expect(h.queue.peek()[0].deliveryState).toBe("failed");
+      const failedOp = h.queue.peek()[0].operationId;
+      h.add("s", "newer");
+      // The head's server operation stays failed (the incident); everything else completes.
+      vi.mocked(h.transport.status).mockImplementation(async (_bank, id) => ({
+        operation_id: id,
+        status: id === failedOp ? "failed" : "completed",
+      }));
+      await h.pass({ releaseFailedHeads: release });
+      const sent = vi.mocked(h.transport.submit).mock.calls.map(([item]) => item.content);
+      // The failed row is submitted exactly once, either way.
+      expect(sent.filter((c) => c === "failed-head")).toHaveLength(1);
+      if (release) {
+        expect(sent).toContain("newer");
+        expect(h.queue.peek().map((row) => row.content)).toEqual(["failed-head"]);
+      } else {
+        expect(sent).not.toContain("newer");
+        expect(h.queue.peek().map((row) => row.content)).toEqual(["failed-head", "newer"]);
+      }
+    }
+  });
   it("does not let one blocked session consume the entire scan budget", async () => {
     const h = harness();
     for (let index = 0; index < 60; index++) h.add("blocked", `held-${index}`);

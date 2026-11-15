@@ -434,6 +434,7 @@ function initRetainQueue(
     const queueFlushInterval = pluginConfig.retainQueueFlushIntervalMs ?? DEFAULT_FLUSH_INTERVAL_MS;
     const queueMaxAge = pluginConfig.retainQueueMaxAgeMs ?? -1;
     lifecycle.queue = new RetainQueue({ filePath: queuePath, maxAgeMs: queueMaxAge });
+    lifecycle.releaseFailedRetainHeads = pluginConfig.retainReleaseFailedHeads === true;
     const pending = lifecycle.queue.size();
     if (pending > 0) {
       log.info(`retain queue: ${pending} items pending from previous session, will flush shortly`);
@@ -495,6 +496,7 @@ export async function flushRetainQueue(
       capability,
       signal,
       isCurrent,
+      releaseFailedHeads: lifecycle.releaseFailedRetainHeads,
       // A row carrying a completion action is acknowledged only after its session-state write
       // succeeds; a failed write (or no state root to write to) keeps the receipt queued.
       applyCompletion: (item) => {
@@ -2342,6 +2344,7 @@ export function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
       : [],
     skipStatelessSessions: config.skipStatelessSessions !== false,
     retainQualityGate: config.retainQualityGate === true,
+    retainReleaseFailedHeads: config.retainReleaseFailedHeads === true,
     skipOperationalSessions: config.skipOperationalSessions !== false,
     // New host: commitTurn carries no isHeartbeat, so derive it from the session key when asked.
     deriveHeartbeatFromSessionKey: config.deriveHeartbeatFromSessionKey === true,
