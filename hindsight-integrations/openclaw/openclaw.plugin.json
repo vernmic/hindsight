@@ -338,6 +338,43 @@
           ]
         }
       },
+      "enrichSidecar": {
+        "type": "object",
+        "description": "Async post-turn enrichment (port of the astinus enrich sidecar). Writes the per-session inject file the host reads next turn. Default off; turn it on only with passProviders set.",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "maxAgeHours": {
+            "type": "number"
+          },
+          "topicsCap": {
+            "type": "number"
+          },
+          "banks": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "bank": {
+                  "type": "string"
+                },
+                "cap": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "bank",
+                "cap"
+              ]
+            }
+          },
+          "timeoutMs": {
+            "type": "number"
+          }
+        },
+        "additionalProperties": false
+      },
       "retainOverlapTurns": {
         "type": "integer",
         "description": "Extra prior turns to include when chunked retention fires. Window = retainEveryNTurns + retainOverlapTurns. Only applies when retainEveryNTurns > 1.",
@@ -587,6 +624,10 @@
     "additionalProperties": false
   },
   "uiHints": {
+    "enrichSidecar": {
+      "label": "Enrich Sidecar",
+      "placeholder": "default off (needs passProviders)"
+    },
     "daemonIdleTimeout": {
       "label": "Daemon Idle Timeout",
       "placeholder": "deprecated, ignored"

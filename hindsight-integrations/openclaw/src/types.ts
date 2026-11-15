@@ -109,6 +109,17 @@ export type PluginHookEndedTranscript =
 
 export interface PluginConfig {
   /**
+   * Async enrichment sidecar (port of workspace/skills/astinus/enrich.py). Default off.
+   * Writes the per-session inject file the host reads at the start of the next turn.
+   */
+  enrichSidecar?: {
+    enabled?: boolean;
+    maxAgeHours?: number;
+    topicsCap?: number;
+    banks?: Array<{ bank: string; cap: number }>;
+    timeoutMs?: number;
+  };
+  /**
    * Mission for the Reflect operation. Stamped onto the bank's `reflect_mission`
    * field via createBank() on first use. Has no effect on retain or recall.
    * Leave unset (or empty) to manage missions out-of-band via the API.
