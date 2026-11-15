@@ -171,6 +171,7 @@ function captureHookLifecycle(): { signal: AbortSignal | undefined; isCurrent: (
 
 // In-flight recall deduplication: concurrent recalls for the same bank reuse one promise
 import type { RecallResponse } from "./types.js";
+import { qualityGateSkipReason } from "./retain-quality-gate.js";
 import { marksPolicyFromConfig, registerHindsightContextEngine } from "./context-engine.js";
 import type { PassProvider } from "./pass-provider.js";
 import { resolveHostStateRoot, resolveRetainQueuePath } from "./host-paths.js";
@@ -2346,6 +2347,7 @@ export function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
       ? config.statelessSessionPatterns
       : [],
     skipStatelessSessions: config.skipStatelessSessions !== false,
+    retainQualityGate: config.retainQualityGate === true,
     skipOperationalSessions: config.skipOperationalSessions !== false,
     // New host: commitTurn carries no isHeartbeat, so derive it from the session key when asked.
     deriveHeartbeatFromSessionKey: config.deriveHeartbeatFromSessionKey === true,
@@ -3597,6 +3599,18 @@ ${memoriesFormatted}
         if (isEphemeralOperationalText(transcript)) {
           debug("[Hindsight Hook] Transcript is operational/ephemeral noise, skipping retention");
           return;
+        }
+
+        if (pluginConfig.retainQualityGate) {
+          try {
+            const skipReason = qualityGateSkipReason(transcript);
+            if (skipReason) {
+              debug(`[Hindsight] Skipping retain - quality gate: ${skipReason}`);
+              return;
+            }
+          } catch (e) {
+            debug(`[Hindsight] Quality gate error: ${e}`);
+          }
         }
 
         // Wait for client to be ready

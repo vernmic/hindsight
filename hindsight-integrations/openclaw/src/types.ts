@@ -203,6 +203,7 @@ export interface PluginConfig {
   ignoreSessionPatterns?: string[]; // Session key glob patterns to skip entirely (no recall, no retain). E.g. ["agent:main:**", "agent:*:cron:**"]
   statelessSessionPatterns?: string[]; // Session key glob patterns for read-only sessions (recall allowed, retain skipped). E.g. ["agent:*:subagent:**"]
   skipStatelessSessions?: boolean; // When true (default), stateless sessions also skip recall. When false, they recall but never retain.
+  retainQualityGate?: boolean; // When true, skip retain for low-signal turns via a regex classifier (retain-quality-gate.ts). Default: false.
   skipOperationalSessions?: boolean; // When true (default), cron and heartbeat sessions (agent:<id>:(cron|heartbeat):...) skip recall and retain. When false, they are handled like any other session.
   /** Derive isHeartbeat from the session key when the host does not send it. Leave off for hosts that send isHeartbeat; set true where the host never sends it. */
   deriveHeartbeatFromSessionKey?: boolean;
