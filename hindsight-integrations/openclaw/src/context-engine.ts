@@ -282,6 +282,9 @@ export function commitPruneIfNeeded(
   input: PruneCommitInput
 ): PruneCommitResult {
   if (input.dropped <= 0 && input.fallback === null) return "skipped-nothing";
+  // Test doubles and older hosts may not expose the writer; a missing writer is a failed
+  // commit, never a silent success (the caller then serves the steady view).
+  if (typeof side.commitPrune !== "function") return "failed";
   const ok = side.commitPrune(
     input.sessionKey,
     input.epoch,
