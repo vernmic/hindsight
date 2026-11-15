@@ -168,6 +168,24 @@ export type MarksReadSide = {
     tokensBefore: number,
     tokensAfter: number
   ): void;
+  commitPrune(
+    sessionKey: string,
+    epoch: number,
+    admittedIds: Array<number | unknown>,
+    fallback: {
+      session_id?: string;
+      seq_start: number;
+      seq_end: number;
+      kind?: string;
+      action: string;
+      digest?: string | null;
+      reason?: string;
+    } | null,
+    gen: string,
+    tokensBefore: number,
+    tokensAfter: number,
+    dropped?: number
+  ): boolean;
   applyMarks: typeof import("./assemble-marks.js").applyMarks;
   estimateTokensHost(list: unknown[]): number;
 };
@@ -225,9 +243,56 @@ async function loadMarksReadSide(): Promise<MarksReadSide> {
     readMarksCached: ledger.readMarksCached,
     readMaxTurnId: ledger.readMaxTurnId,
     markMarksApplied: ledger.markMarksApplied,
+    commitPrune: ledger.commitPrune,
     applyMarks: marks.applyMarks,
     estimateTokensHost: marks.estimateTokensHost,
   };
+}
+
+/** A prune outcome as the assemble path sees it (assemble-marks PruneOutcome subset). */
+export type PruneCommitInput = {
+  sessionKey: string;
+  epoch: number;
+  admitted: Array<number | unknown>;
+  fallback: {
+    session_id?: string;
+    seq_start: number;
+    seq_end: number;
+    kind?: string;
+    action: string;
+    digest?: string | null;
+    reason?: string;
+  } | null;
+  gen: string;
+  tokensBefore: number;
+  tokensAfter: number;
+  dropped: number;
+};
+
+export type PruneCommitResult = "committed" | "skipped-nothing" | "failed";
+
+/** Commit a prune exactly when there is something to commit.
+ *
+ *  Ported from production 0e6a94acf (old dist index.js, the commitPrune call in the assemble
+ *  path). Two rules from that code: a prune with no drops and no fallback is not a prune (it must
+ *  not advance the epoch or write a prunes row), and a prune that fails to commit must not reach
+ *  the model (the caller re-applies with pruning disabled). */
+export function commitPruneIfNeeded(
+  side: Pick<MarksReadSide, "commitPrune">,
+  input: PruneCommitInput
+): PruneCommitResult {
+  if (input.dropped <= 0 && input.fallback === null) return "skipped-nothing";
+  const ok = side.commitPrune(
+    input.sessionKey,
+    input.epoch,
+    input.admitted,
+    input.fallback,
+    input.gen,
+    input.tokensBefore,
+    input.tokensAfter,
+    input.dropped
+  );
+  return ok ? "committed" : "failed";
 }
 
 export type ContextEngineOptions = {
@@ -426,7 +491,7 @@ export function createContextEngine(log: Logger, options: ContextEngineOptions =
           if (marks.length > 0) {
             // Durable state document (e8cb loadSessionStateCached): generation stamp + seq counter.
             const state = loadSessionStateCached(options.hostStateRoot ?? "", key);
-            const res = side.applyMarks(list, marks as never, {
+            let res = side.applyMarks(list, marks as never, {
               sessionKey: key,
               hostDbPath,
               // B1: transcript rows are keyed by the HOST session UUID, never the session key.
@@ -444,11 +509,62 @@ export function createContextEngine(log: Logger, options: ContextEngineOptions =
                 `[hindsight-engine] assemble: ${res.skipped.length} row(s) skipped (${res.skipped.slice(0, 3).join("; ")})`
               );
             }
+            hardCapped = res.prune !== null;
+            let pruneCommitted = false;
+            if (res.prune) {
+              // Ported from production 0e6a94acf (old dist index.js, the commitPrune call in the
+              // assemble path). A prune must be COMMITTED to the ledger, or the next view rebuilds
+              // the old epoch and flips back. The replay lost this call, so every prune was
+              // computed and thrown away: topic:192 logged "epoch 1" while its ledger stayed at
+              // prunes = 0 and prune_epoch = NULL.
+              const prune = res.prune;
+              const commitOutcome = commitPruneIfNeeded(side, {
+                sessionKey: key,
+                epoch: prune.epoch,
+                admitted: res.admitted.map((m) => m.mark_id),
+                fallback: prune.fallback,
+                gen: state?.lastGenerationSeen ?? "",
+                tokensBefore: Math.round(prune.tokensBefore * scale),
+                tokensAfter: Math.round(res.tokensAfter * scale),
+                dropped: prune.dropped,
+              });
+              pruneCommitted = commitOutcome === "committed";
+              if (commitOutcome === "skipped-nothing") {
+                log.warn(
+                  `[hindsight-engine] prune ` + prune.epoch +
+                    `: nothing to commit (dropped 0, no fallback); steady view served session=` + key
+                );
+              } else {
+                if (commitOutcome === "committed") {
+                  log.warn(
+                    `[hindsight-engine] prune ` + prune.epoch +
+                      `: pressure ` + prune.pressureBefore.toFixed(2) + ` -> ` + prune.pressureAfter.toFixed(2) + `, ` +
+                      `view ` + Math.round(prune.tokensBefore * scale) + ` -> ` + Math.round(res.tokensAfter * scale) + ` tok (scale ` + scale.toFixed(3) + `), ` +
+                      ` ` + res.admitted.length + ` admitted, ` + prune.dropped + ` dropped` +
+                      (prune.fallback ? `, oldest turns cut at seq ` + prune.fallback.seq_start + `-` + prune.fallback.seq_end : "") +
+                      ` session=` + key
+                  );
+                } else {
+                  // An uncommitted prune must not reach the model: the next view would rebuild the
+                  // old epoch and flip back. Serve the steady view; the next request retries.
+                  log.warn(
+                    `[hindsight-engine] prune ` + prune.epoch + ` not committed (ledger write failed); steady view served session=` + key
+                  );
+                  res = side.applyMarks(list, marks as never, {
+                    sessionKey: key,
+                    hostDbPath,
+                    sessionId: params.sessionId,
+                    tokenBudget: params.tokenBudget ?? 0,
+                    policy: { ...(options.getPolicy?.() ?? {}), pruneAtPressure: Number.POSITIVE_INFINITY },
+                    pressureScale: scale,
+                    turnCounter: side.readMaxTurnId(key) ?? state.lastCommittedSeq,
+                  });
+                }
+              }
+            }
             outList = res.messages;
             // Captured unconditionally (e8cb Q1 2026-10-07): the held-marks case needs it most.
             windowFirstSeq = res.windowFirstSeq ?? null;
-            hardCapped = res.prune !== null;
-            if (res.prune) {
               // Honesty (2026-11-15): the prune is computed against the view only - nothing here
               // calls commitPrune, so this epoch is a candidate and is never written to the ledger.
               // Logging it as a bare epoch read as a committed one (topic:192 logged epoch 1 while
@@ -462,7 +578,8 @@ export function createContextEngine(log: Logger, options: ContextEngineOptions =
             estimatedTokens = res.tokensBefore;
             marksInEffect = res.marksInEffect;
             const admittedIds = res.admitted.map((m) => m.mark_id);
-            if (admittedIds.length > 0) {
+            // A committed prune already stamped these ids (with prune_epoch) inside commitPrune.
+            if (admittedIds.length > 0 && !pruneCommitted) {
               side.markMarksApplied(
                 key,
                 admittedIds,
