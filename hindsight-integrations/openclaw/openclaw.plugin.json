@@ -505,6 +505,11 @@
         "type": "boolean",
         "description": "Deprecated and ignored. agent_end always returns once the turn's retain is durably queued; delivery runs in the background. Accepted so existing configs keep validating."
       },
+      "retainReleaseFailedHeads": {
+        "type": "boolean",
+        "description": "When true, a retain row that failed terminally stops holding its session's delivery slot: it stays queued (never resubmitted) and newer retains for that session submit. Default: false (a failed row blocks its session).",
+        "default": false
+      },
       "retainQueueMaxAgeMs": {
         "type": "number",
         "description": "Max age in ms for queued retain items. -1 = keep forever.",
@@ -848,6 +853,10 @@
     },
     "retainNonBlocking": {
       "label": "Retain Non-Blocking (deprecated, ignored)"
+    },
+    "retainReleaseFailedHeads": {
+      "label": "Release Failed Retain Heads",
+      "placeholder": "false (default)"
     },
     "ignoreSessionPatterns": {
       "label": "Ignore Session Patterns",

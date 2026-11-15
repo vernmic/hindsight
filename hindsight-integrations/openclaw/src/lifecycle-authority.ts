@@ -65,6 +65,8 @@ export interface LifecycleAuthority {
   queue: RetainQueue | null;
   flushTimer: ReturnType<typeof setInterval> | null;
   flushInProgress: boolean;
+  /** retainReleaseFailedHeads from the plugin config at queue init (default false). */
+  releaseFailedRetainHeads: boolean;
   /** Lifecycle generation whose unknown-capability warning was already logged (e8cb). */
   capabilityWarningGeneration: number | null;
   // --- context engine (R2: the host can adopt one copy's engine while another copy's hook runs) ---
@@ -97,6 +99,7 @@ export function newLifecycleAuthority(): LifecycleAuthority {
     queue: null,
     flushTimer: null,
     flushInProgress: false,
+    releaseFailedRetainHeads: false,
     capabilityWarningGeneration: null,
     lastAssemble: new Map(),
     marksIndex: new Map(),
