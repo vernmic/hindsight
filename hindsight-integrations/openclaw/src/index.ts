@@ -178,8 +178,14 @@ import {
   createHindsightGather,
   resolveEnrichConfig,
   runEnrichSidecar,
+  type EnrichServed,
 } from "./enrich-sidecar.js";
-import { readLiveTopics } from "./session-ledger.js";
+import {
+  markEnrichServed,
+  pruneEnrichServed,
+  readEnrichServed,
+  readLiveTopicsDetail,
+} from "./session-ledger.js";
 import { resolveHostStateRoot, resolveRetainQueuePath } from "./host-paths.js";
 import {
   lifecycleAuthorityFor,
@@ -3751,12 +3757,19 @@ ${memoriesFormatted}
           if (lastUser.trim()) break;
         }
         const sessionKey = String((ctx as { sessionKey?: string } | undefined)?.sessionKey ?? "");
-        let liveSlugs: string[] = [];
+        let liveTopics: Array<{ slug: string; label: string; digest: string }> = [];
         try {
-          liveSlugs = sessionKey ? readLiveTopics(sessionKey, sidecar.topicsCap) : [];
+          liveTopics = sessionKey ? readLiveTopicsDetail(sessionKey, sidecar.topicsCap) : [];
         } catch {
-          liveSlugs = [];
+          liveTopics = [];
         }
+        // The delta rule state lives in the session ledger (ported from enrich.py).
+        const servedMap = sessionKey ? readEnrichServed(sessionKey) : new Map<string, Set<string>>();
+        const served: EnrichServed = {
+          load: (slug) => servedMap.get(slug) ?? new Set<string>(),
+          mark: (pairs) => markEnrichServed(sessionKey, pairs),
+          prune: (slugs) => pruneEnrichServed(sessionKey, slugs),
+        };
         const providers = Array.isArray(pluginConfig.passProviders)
           ? pluginConfig.passProviders.filter(
               (p): p is PassProvider =>
@@ -3777,11 +3790,12 @@ ${memoriesFormatted}
             lastUserMessage: lastUser,
             // Live topics come from the session ledger when it is open for this key; the module
             // falls back to the substance query when it is not (first touch of a session).
-            liveTopics: liveSlugs.map((slug) => ({ slug, label: slug, digest: "" })),
+            liveTopics,
           },
           {
             config: sidecar,
             gather,
+            served,
             synthesize: async (system, user) => {
               const res = await callLlm(providers, system, user, {
                 log: debug,

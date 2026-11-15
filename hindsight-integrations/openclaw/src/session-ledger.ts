@@ -111,6 +111,17 @@ function ensurePruneColumns(db: DatabaseSync): void {
   } catch {
     // marks table lacks the anchor or applied columns; nothing to retire
   }
+  // Enrich delta rule state (ported from enrich.py load_served_for / prune_and_mark_served):
+  // one row per (live topic, document id) already served for that topic.
+  try {
+    db.exec(
+      "CREATE TABLE IF NOT EXISTS enrich_served (" +
+        "topic_slug TEXT NOT NULL, document_id TEXT NOT NULL, served_at INTEGER NOT NULL, " +
+        "PRIMARY KEY (topic_slug, document_id))"
+    );
+  } catch {
+    // locked or read-only ledger: dedup degrades to none, enrichment still runs
+  }
 }
 
 const SCHEMA = `
@@ -295,7 +306,8 @@ export function openSessionLedger(
         return { ok: false, reason };
       }
     }
-    // Idempotent, and it also upgrades a ledger written before the prune era (columns + retirement).
+    // Idempotent, and it also upgrades a ledger written before the prune era (columns, retirement,
+    // and the enrich served-id table the ported sidecar dedupes against).
     ensurePruneColumns(db);
     if (cache.size >= MAX_CACHED_LEDGERS) {
       const oldest = cache.keys().next().value;
@@ -648,6 +660,98 @@ export function readLiveTopics(sessionKey: string, limit: number): string[] {
     return rows.map((r) => (typeof r.slug === "string" ? r.slug : "")).filter((s) => s.length > 0);
   } catch {
     return [];
+  }
+}
+
+/** Live topics with their label and digest (the enrich query shape). Same filter as
+ *  readLiveTopics: terminal_at IS NULL and model-classified, newest first. */
+export function readLiveTopicsDetail(
+  sessionKey: string,
+  limit: number
+): Array<{ slug: string; label: string; digest: string }> {
+  const db = cache.get(sessionKey);
+  if (!db || limit <= 0) return [];
+  try {
+    const rows = db
+      .prepare(
+        `SELECT slug, label, digest FROM topics
+         WHERE terminal_at IS NULL
+           AND EXISTS (SELECT 1 FROM turn_topics tt
+                       WHERE tt.topic_id = topics.topic_id AND tt.source = 'model')
+         ORDER BY last_seen_seq DESC LIMIT ?`
+      )
+      .all(Math.floor(limit)) as Array<{ slug: string; label: string; digest: string | null }>;
+    return rows
+      .filter((r) => typeof r.slug === "string" && r.slug.length > 0)
+      .map((r) => ({
+        slug: r.slug,
+        label: typeof r.label === "string" && r.label ? r.label : r.slug,
+        digest: typeof r.digest === "string" ? r.digest : "",
+      }));
+  } catch {
+    return [];
+  }
+}
+
+/** Document ids already served per live topic, for the enrich delta rule. */
+export function readEnrichServed(sessionKey: string): Map<string, Set<string>> {
+  const out = new Map<string, Set<string>>();
+  const db = cache.get(sessionKey);
+  if (!db) return out;
+  try {
+    const rows = db
+      .prepare("SELECT topic_slug, document_id FROM enrich_served")
+      .all() as Array<{ topic_slug: string; document_id: string }>;
+    for (const r of rows) {
+      const key = String(r.topic_slug ?? "");
+      const id = String(r.document_id ?? "");
+      if (!key || !id) continue;
+      const set = out.get(key) ?? new Set<string>();
+      set.add(id);
+      out.set(key, set);
+    }
+  } catch {
+    /* no table yet or locked */
+  }
+  return out;
+}
+
+/** Record the (topic, document) pairs this enrich run served. */
+export function markEnrichServed(sessionKey: string, pairs: Array<[string, string]>): void {
+  const db = cache.get(sessionKey);
+  if (!db || pairs.length === 0) return;
+  try {
+    const st = db.prepare(
+      "INSERT OR IGNORE INTO enrich_served (topic_slug, document_id, served_at) VALUES (?,?,?)"
+    );
+    const now = Date.now();
+    for (const [slug, id] of pairs) {
+      if (slug && id) st.run(slug, id, now);
+    }
+  } catch {
+    /* dedup is an optimisation; never throw into the hook */
+  }
+}
+
+/** Drop served ids for topics that are no longer live (the ledger is the liveness source). */
+export function pruneEnrichServed(sessionKey: string, liveSlugs: string[]): void {
+  const db = cache.get(sessionKey);
+  if (!db) return;
+  try {
+    if (liveSlugs.length === 0) {
+      db.prepare("DELETE FROM enrich_served").run();
+      return;
+    }
+    const keep = new Set(liveSlugs);
+    const rows = db.prepare("SELECT DISTINCT topic_slug FROM enrich_served").all() as Array<{
+      topic_slug: string;
+    }>;
+    const del = db.prepare("DELETE FROM enrich_served WHERE topic_slug = ?");
+    for (const r of rows) {
+      if (!keep.has(String(r.topic_slug))) del.run(String(r.topic_slug));
+    }
+  } catch {
+    /* best effort */
   }
 }
 
