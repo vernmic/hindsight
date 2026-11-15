@@ -534,6 +534,11 @@
         "description": "When true (default), sessions matching statelessSessionPatterns also skip recall. When false, they can recall but never retain.",
         "default": true
       },
+      "retainQualityGate": {
+        "type": "boolean",
+        "description": "When true, skip retain for low-signal turns (chitchat, memory-meta, procedural/narrative noise, pure tool calls) via a lightweight regex classifier. Default: false (disabled).",
+        "default": false
+      },
       "skipOperationalSessions": {
         "type": "boolean",
         "description": "When true (default), cron and heartbeat sessions skip recall and retain (subagent sessions are ordinary sessions; exclude them with ignoreSessionPatterns or statelessSessionPatterns). When false, they recall and retain like any other session, and ignoreSessionPatterns / statelessSessionPatterns apply to them.",
@@ -851,6 +856,10 @@
     "skipStatelessSessions": {
       "label": "Skip Stateless Sessions",
       "placeholder": "true (default)"
+    },
+    "retainQualityGate": {
+      "label": "Retain Quality Gate",
+      "placeholder": "false (default)"
     },
     "skipOperationalSessions": {
       "label": "Skip Operational Sessions",
