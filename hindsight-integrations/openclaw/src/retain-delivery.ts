@@ -68,6 +68,11 @@ export async function reconcileRetainQueue(params: {
   isCurrent(): boolean;
   applyCompletion(item: QueuedRetain): void;
   onIssue(message: string): void;
+  /** retainReleaseFailedHeads (default off): a terminally failed row no longer holds its
+   *  session's slot. It stays queued with its debt and is never resubmitted; the rows behind it
+   *  submit. Without it one failed row blocks its session for good (2026-11-12: 102 and 31
+   *  retains held for ten days behind two 11-03 rows). */
+  releaseFailedHeads?: boolean;
 }): Promise<number> {
   const { queue, transport } = params;
   const blocked = new Set<string>();
@@ -90,6 +95,7 @@ export async function reconcileRetainQueue(params: {
     if (!current() || Date.now() >= deadline) return completed;
     const session = item.completion?.sessionKey ?? `${item.bankId}:${item.documentId}`;
     if (blocked.has(session)) continue;
+    if (params.releaseFailedHeads && item.deliveryState === "failed") continue;
     if (++visited > 50) break;
     blocked.add(session);
     if (!item.targetFingerprint || item.targetFingerprint !== transport.targetFingerprint) {
