@@ -3763,14 +3763,16 @@ ${memoriesFormatted}
                 !!p && typeof p.url === "string" && typeof p.model === "string" && typeof p.apiKey === "string"
             )
           : [];
+        const enrichRoot = typeof hostStateRoot === "string" ? hostStateRoot : "";
+        if (!enrichRoot) return;
         const gather = createHindsightGather({
           apiUrl: pluginConfig.hindsightApiUrl ?? "http://127.0.0.1:8888",
           timeoutMs: sidecar.timeoutMs,
         });
         const outcome = await runEnrichSidecar(
           {
-            root: hostStateRoot,
-            sessionKey,
+            root: enrichRoot,
+            sessionKey: sessionKey || "",
             topics: [],
             lastUserMessage: lastUser,
             // Live topics come from the session ledger when it is open for this key; the module
