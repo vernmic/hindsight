@@ -60,15 +60,24 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-DOCS_ROOT="/home/vern/.hermes/hermes-agent/website/docs"
-CHUNKS_DIR="/mnt/i/hermes/knowledge/upstream-docs-chunks"
-BANK="hermes-ops"
-HINDSIGHT_URL="${HINDSIGHT_URL:-http://host.docker.internal:8888}"
-PY="/mnt/i/hermes/scripts/ingest-docs.py"
-BACKUP_DIR="/mnt/i/hermes/backups"
+HOME_DIR=${HERMES_HOME:-$HOME/.hermes}
+WORKSPACE=${HERMES_OPS_WORKSPACE:-$HOME_DIR/workspace}
+DOCS_ROOT=${HERMES_OPS_DOCS_ROOT:-$HOME_DIR/hermes-agent/website/docs}
+CHUNKS_DIR=${HERMES_OPS_CHUNKS_DIR:-$WORKSPACE/knowledge/upstream-docs-chunks}
+BANK=${HERMES_OPS_BANK:-}
+if [ -z "$BANK" ]; then
+  echo "ingest-docs: aborted: set HERMES_OPS_BANK" >&2
+  exit 1
+fi
+case "$BANK" in
+  main|openclaw) echo "ingest-docs: aborted: protected bank refused" >&2; exit 1 ;;
+esac
+HINDSIGHT_URL="${HINDSIGHT_URL:-http://localhost:8888}"
+PY=${HERMES_OPS_INGEST_PY:-$WORKSPACE/scripts/ingest-docs.py}
+BACKUP_DIR=${HERMES_OPS_BACKUP_DIR:-$WORKSPACE/backups}
 LOG="$BACKUP_DIR/ingest-docs.log"
-DKR_WIN="/mnt/c/Program Files/Docker/Docker/resources/bin/docker.exe"
-PG_VERSION_DIR="/home/hindsight/.pg0/installation/18.1.0/bin"
+DKR_WIN=${HINDSIGHT_DOCKER:-$(command -v docker 2>/dev/null || echo docker)}
+PG_VERSION_DIR=${HINDSIGHT_PG_BIN_DIR:-/home/hindsight/.pg0/installation/18.1.0/bin}
 
 # Verify gates (kanban t_9bfe1701 item d). ratios are percent of the parse.
 MIN_UNIT_RATIO=80      # retained raw units >= 80% of parsed chunk items
@@ -82,11 +91,9 @@ docker_cli() {
   return 1
 }
 container_for_url() {
-  case "$HINDSIGHT_URL" in
-    *:8889*) echo "hindsight2-hindsight-1" ;;
-    *:8888*) echo "hindsight-hindsight-1" ;;
-    *) echo "${HINDSIGHT_CONTAINER:-hindsight-hindsight-1}" ;;
-  esac
+  # The container is an explicit deployment setting; there is no container name
+  # that is correct for every host.
+  echo "${HINDSIGHT_CONTAINER:-hindsight}"
 }
 DKR="$(docker_cli || true)"
 CT="$(container_for_url)"

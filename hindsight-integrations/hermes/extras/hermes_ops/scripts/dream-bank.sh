@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# dream-bank.sh -- nightly bank pass. Banks: hermes-ops, human-model.
+# dream-bank.sh -- nightly bank pass over HERMES_OPS_BANKS.
 # Never reads or writes main or openclaw. Never issues an HTTP DELETE.
 # Default is the nightly path: execute only inside the caps. --dry-run deletes nothing.
 # A missing 02:00 tar exits 0. A tool failure exits 1.
@@ -17,28 +17,44 @@ for arg in "$@"; do
 done
 
 : "${HINDSIGHT_PGPASSWORD:?HINDSIGHT_PGPASSWORD must be set}"
-DOCKER="/mnt/c/Program Files/Docker/Docker/resources/bin/docker.exe"
-API="http://host.docker.internal:8888"
-LOG="/home/vern/.hermes/workspace/dream-bank-log.jsonl"
-DEST="/mnt/i/hermes/backups"
+# Operator settings. Nothing here names a deployment: set HERMES_HOME, the
+# workspace roots, HINDSIGHT_URL, HINDSIGHT_CONTAINER and HERMES_OPS_BANKS.
+HOME_DIR=${HERMES_HOME:-$HOME/.hermes}
+WORKSPACE=${HERMES_OPS_WORKSPACE:-$HOME_DIR/workspace}
+DOCKER=${HINDSIGHT_DOCKER:-$(command -v docker 2>/dev/null || echo docker)}
+CONTAINER=${HINDSIGHT_CONTAINER:-hindsight}
+PG_BIN_DIR=${HINDSIGHT_PG_BIN_DIR:-/home/hindsight/.pg0/installation/18.1.0/bin}
+API=${HINDSIGHT_URL:-http://localhost:8888}
+LOG=${HERMES_OPS_DREAM_LOG:-$WORKSPACE/dream-bank-log.jsonl}
+DEST=${HERMES_OPS_BACKUP_DIR:-$WORKSPACE/backups}
+GARDENER_PY=${HERMES_OPS_PYTHON:-$HOME_DIR/venvs/ops/bin/python}
+GARDENER_RUN=${HERMES_OPS_GARDENER_RUN:-$WORKSPACE/scripts/gardener_run.py}
+GARDENER_LOG=${HERMES_OPS_GARDENER_LOG:-$WORKSPACE/gardener-nightly.log}
 TODAY="$(date +%Y%m%d)"
 TAR="$DEST/hindsight-data-${TODAY}.tar.gz"
+BANKS="${HERMES_OPS_BANKS:-${HERMES_OPS_BANK:-}}"
 
 refuse_bank() {
-  case "$1" in
-    hermes-ops|human-model) ;;
-    *) echo "aborted: bank refused" >&2; exit 1 ;;
-  esac
+  # Safety policy first: these Hindsight banks are never read or written here,
+  # whatever the configured list says.
   if [ "$1" = "main" ] || [ "$1" = "openclaw" ]; then
-    echo "aborted: openclaw bank refused" >&2
+    echo "aborted: protected bank refused" >&2
+    exit 1
+  fi
+  local allowed=0
+  for configured in ${BANKS//,/ }; do
+    [ "$1" = "$configured" ] && allowed=1
+  done
+  if [ "$allowed" -ne 1 ]; then
+    echo "aborted: bank not in HERMES_OPS_BANKS" >&2
     exit 1
   fi
 }
 
 psql_sql() {
   refuse_bank "$1"
-  "$DOCKER" exec -i -e "PGPASSWORD=$HINDSIGHT_PGPASSWORD" hindsight-hindsight-1 \
-    sh -c 'PATH=/home/hindsight/.pg0/installation/18.1.0/bin:$PATH psql -U hindsight -d hindsight -v ON_ERROR_STOP=1 -q -At'
+  "$DOCKER" exec -i -e "PGPASSWORD=$HINDSIGHT_PGPASSWORD" "$CONTAINER" \
+    sh -c "PATH=$PG_BIN_DIR:\$PATH psql -U \${HINDSIGHT_DB_USER:-hindsight} -d \${HINDSIGHT_DB:-hindsight} -v ON_ERROR_STOP=1 -q -At"
 }
 
 victim_setup() {
@@ -267,6 +283,11 @@ PY
 # Sourcing exposes functions for isolated tests; it never runs the bank pass.
 if [ "${BASH_SOURCE[0]}" != "$0" ]; then return 0; fi
 
+if [ -z "$BANKS" ]; then
+  echo "dream-bank: aborted: set HERMES_OPS_BANKS to the banks to garden" >&2
+  exit 1
+fi
+
 if [ "$DRY" -eq 0 ] && [ ! -s "$TAR" ]; then
   write_log "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"aborted\":\"no fresh backup\",\"backup\":\"$TAR\",\"banks\":{}}"
   echo "dream-bank: aborted: no fresh backup"
@@ -313,7 +334,7 @@ declare -A NODES_BEFORE PENDING VICTIMS BATCH DEDUPED REMAINING FLAGGED FLAGREAS
 SUMMARY=""
 ANY_ABORT=""
 
-for bank in hermes-ops human-model; do
+for bank in ${BANKS//,/ }; do
   refuse_bank "$bank"
   st="$(curl -sS -m 30 "$API/v1/default/banks/${bank}/stats")" || {
     echo "dream-bank: stats failed for $bank"
@@ -405,61 +426,37 @@ for bank in hermes-ops human-model; do
   SUMMARY="${SUMMARY}${bank} deduped=${dropped} remaining=${remaining}; "
 done
 
-python3 - "$LOG" << PY
+STATS="["
+for bank in ${BANKS//,/ }; do
+  aborted_json=null
+  [ -n "${ABORTED[$bank]}" ] && aborted_json="\"${ABORTED[$bank]}\""
+  STATS="${STATS}{\"bank\":\"$bank\",\"nodes_before\":${NODES_BEFORE[$bank]},\"nodes_after\":${NODES_AFTER[$bank]},\"pending\":${PENDING[$bank]},\"safe_victims\":${VICTIMS[$bank]},\"batch\":${BATCH[$bank]},\"deduped\":${DEDUPED[$bank]},\"remaining\":${REMAINING[$bank]},\"flagged\":${FLAGGED[$bank]},\"flag_reason\":${FLAGREASON[$bank]:-{}},\"aborted\":${aborted_json}},"
+done
+STATS="${STATS%,}]"
+
+python3 - "$LOG" "$STATS" "$TAR" "$ABS_CAP" "$ANY_ABORT" "$DRY" << 'PY'
 import json, sys
 from datetime import datetime, timezone
-path = sys.argv[1]
+
+path, stats, tar, abs_cap, any_abort, dry = sys.argv[1:7]
 row = {
     "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-    "live": ${DRY} == 0,
-    "dry_run": ${DRY} == 1,
-    "backup": "${TAR}",
-    "abs_cap": ${ABS_CAP},
-    "aborted": "${ANY_ABORT}" or None,
-    "banks": {
-        "hermes-ops": {
-            "nodes_before": int("${NODES_BEFORE[hermes-ops]}"),
-            "nodes_after": int("${NODES_AFTER[hermes-ops]}"),
-            "pending": int("${PENDING[hermes-ops]}"),
-            "safe_victims": int("${VICTIMS[hermes-ops]}"),
-            "batch": int("${BATCH[hermes-ops]}"),
-            "deduped": int("${DEDUPED[hermes-ops]}"),
-            "remaining": int("${REMAINING[hermes-ops]}"),
-            "flagged": int("${FLAGGED[hermes-ops]}"),
-            "flag_reason": json.loads('${FLAGREASON[hermes-ops]}' or '{}'),
-            "aborted": "${ABORTED[hermes-ops]}" or None,
-        },
-        "human-model": {
-            "nodes_before": int("${NODES_BEFORE[human-model]}"),
-            "nodes_after": int("${NODES_AFTER[human-model]}"),
-            "pending": int("${PENDING[human-model]}"),
-            "safe_victims": int("${VICTIMS[human-model]}"),
-            "batch": int("${BATCH[human-model]}"),
-            "deduped": int("${DEDUPED[human-model]}"),
-            "remaining": int("${REMAINING[human-model]}"),
-            "flagged": int("${FLAGGED[human-model]}"),
-            "flag_reason": json.loads('${FLAGREASON[human-model]}' or '{}'),
-            "aborted": "${ABORTED[human-model]}" or None,
-        },
-    },
+    "live": dry != "0",
+    "dry_run": dry == "0",
+    "backup": tar,
+    "abs_cap": int(abs_cap),
+    "aborted": any_abort or None,
+    "banks": {entry["bank"]: {k: v for k, v in entry.items() if k != "bank"} for entry in json.loads(stats)},
 }
-# The live flag above is a bash comparison pasted as Python. Fix it explicitly.
-row["live"] = $( [ "$DRY" -eq 0 ] && echo True || echo False )
-row["dry_run"] = $( [ "$DRY" -eq 1 ] && echo True || echo False )
-if not row["aborted"]:
-    row["aborted"] = None
-for b in row["banks"].values():
-    if not b["aborted"]:
-        b["aborted"] = None
 with open(path, "a", encoding="utf-8") as fh:
     fh.write(json.dumps(row, separators=(",", ":")) + "\n")
 PY
 
 echo "dream-bank: ${SUMMARY}"
 
-# Jev gardening uses only hermes-ops and its own exclusive lock and off switch.
+# Jev gardening uses only the configured banks and its own exclusive lock and off switch.
 # Detach from the short cron wrapper; persistent journals permit safe resumption.
 if [ "$DRY" -eq 0 ] && [ -z "${ANY_ABORT}" ]; then
-  nohup /home/vern/.hermes/hermes-agent/venv/bin/python /mnt/i/hermes/scripts/gardener_run.py --incremental --max-pages 2 >> /home/vern/.hermes/workspace/gardener-nightly.log 2>&1 < /dev/null &
+  nohup "$GARDENER_PY" "$GARDENER_RUN" --incremental --max-pages 2 >> "$GARDENER_LOG" 2>&1 < /dev/null &
 fi
 exit 0

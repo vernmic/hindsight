@@ -1,4 +1,9 @@
-"""Compare or mirror fork-maintained operator source; configuration stays untouched."""
+"""Compare or mirror fork-maintained operator source; configuration stays untouched.
+
+Roots come from hermes_ops_config: an explicit --workspace/--hermes-home, then
+HERMES_OPS_WORKSPACE / HERMES_HOME, then the resolved Hermes home. Nothing is
+copied and no configuration is changed unless --apply is given.
+"""
 
 from __future__ import annotations
 
@@ -9,21 +14,34 @@ import json
 import shutil
 from pathlib import Path
 
+import hermes_ops_config as config
+
 
 def digest(path: Path) -> str | None:
     return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
 
 
+# Runtime-only tools: maintained here, installed by hand after review because a
+# formatted copy would invalidate their own journals or gate receipts.
+MANUAL_ONLY = (
+    "retain-takeaway.py",
+    "index-part.py",
+    "tag02_gate_apply.py",
+    "tag02_gate_dryrun.py",
+    "verify_post_extraction_tag_queue.py",
+)
+# The tag queue and its helpers keep operator state (queue.sqlite, ledger,
+# control switch) beside them and are installed by the operator, not mirrored.
+QUEUE_FILES = ("post_extraction_tag_queue.py", "tagger_lock.py", "tagger_ledger.py", "tagger_fallback.py")
+# Shell operators that live in the Hermes home rather than the workspace.
+HOME_SCRIPTS = ("dream-bank.sh", "monitor-brief-input.sh", "health-check.sh")
+
+
 def targets(source: Path, workspace: Path, home: Path) -> dict[Path, Path]:
     scripts = {p: workspace / "scripts" / p.name for p in (source / "scripts").iterdir() if p.is_file()}
-    # dream-bank has always lived in the Hermes home, rather than the workspace.
-    scripts[source / "scripts/dream-bank.sh"] = home / "scripts/dream-bank.sh"
-    scripts.pop(source / "scripts/retain-takeaway.py", None)
-    # Its source is maintained here; applying a formatted update needs a new
-    # TAG-02 rollback receipt instead of invalidating the existing md5 journal.
-    scripts.pop(source / "scripts/index-part.py", None)
-    # Knowledge templates and journal-driven gate applicators require manual review.
-    for name in ("tag02_gate_apply.py", "tag02_gate_dryrun.py", "verify_post_extraction_tag_queue.py"):
+    for name in HOME_SCRIPTS:
+        scripts[source / "scripts" / name] = home / "scripts" / name
+    for name in MANUAL_ONLY + QUEUE_FILES:
         scripts.pop(source / "scripts" / name, None)
     plugin = {
         p: home / "plugins/jev_gate" / p.relative_to(source / "jev_gate")
@@ -35,12 +53,12 @@ def targets(source: Path, workspace: Path, home: Path) -> dict[Path, Path]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--workspace", type=Path, default=Path("/mnt/i/hermes"))
-    parser.add_argument("--hermes-home", type=Path, default=Path.home() / ".hermes")
+    parser.add_argument("--workspace", type=Path, help="operator workspace root (default: resolved, see module doc)")
+    parser.add_argument("--hermes-home", type=Path, help="Hermes home (default: resolved)")
     parser.add_argument("--apply", action="store_true", help="back up and copy reviewed source files")
     args = parser.parse_args()
     source = Path(__file__).resolve().parent
-    workspace, home = args.workspace.resolve(), args.hermes_home.resolve()
+    workspace, home = config.workspace(args.workspace).resolve(), config.hermes_home(args.hermes_home).resolve()
     if not workspace.is_dir() or not home.is_dir():
         parser.error("Both existing target directories must be specified correctly")
     plan = targets(source, workspace, home)
