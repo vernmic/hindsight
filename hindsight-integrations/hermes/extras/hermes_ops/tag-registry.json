@@ -1,0 +1,450 @@
+{
+  "artifact": "task/target/value tag registry",
+  "project": "TAG",
+  "project_id": "TAG",
+  "card": "t_caff2c35",
+  "registry_version": "tag-registry-v1",
+  "version": "tag-registry-v1-20261007",
+  "published": "2026-10-07",
+  "date": "2026-10-07",
+  "axes_supported": [
+    "task",
+    "target",
+    "value"
+  ],
+  "supersedes": "registry version \"unvalidated\" with empty axes (plugins/jev_gate/constants.py DEFAULTS); no prior published registry existed",
+  "authority_note": "The classifier scripts/gardener_batch_v7.py is the authoritative emitter of these axes; plugins/jev_gate/constants.py ships an empty unvalidated registry and plugins/jev_gate/selector.py offers registry options plus an appended \"none\" exit per axis.",
+  "axis_rules": {
+    "task": {
+      "top_k": 3,
+      "floor": 0.7
+    },
+    "value": {
+      "top_k": 3,
+      "floor": 0.5
+    },
+    "target": "single-choice",
+    "source": "scripts/gardener_batch_v7.py line 365 (axis selection rules)"
+  },
+  "entries": {
+    "task": [
+      {
+        "value": "design",
+        "tag": "task:design",
+        "sources": [
+          "scripts/gardener_batch_v7.py"
+        ]
+      },
+      {
+        "value": "build",
+        "tag": "task:build",
+        "sources": [
+          "scripts/gardener_batch_v7.py",
+          "reports/third-project-tag-filter-probe-20261007.json"
+        ]
+      },
+      {
+        "value": "patch",
+        "tag": "task:patch",
+        "sources": [
+          "scripts/gardener_batch_v7.py"
+        ]
+      },
+      {
+        "value": "debug",
+        "tag": "task:debug",
+        "sources": [
+          "scripts/gardener_batch_v7.py",
+          "reports/third-project-tag-filter-probe-20261007.json"
+        ]
+      },
+      {
+        "value": "validate",
+        "tag": "task:validate",
+        "sources": [
+          "scripts/gardener_batch_v7.py",
+          "reports/third-project-tag-filter-probe-20261007.json"
+        ]
+      },
+      {
+        "value": "review",
+        "tag": "task:review",
+        "sources": [
+          "scripts/gardener_batch_v7.py",
+          "reports/third-project-tag-filter-probe-20261007.json"
+        ]
+      },
+      {
+        "value": "research",
+        "tag": "task:research",
+        "sources": [
+          "scripts/gardener_batch_v7.py",
+          "reports/third-project-tag-filter-probe-20261007.json"
+        ]
+      },
+      {
+        "value": "ingest",
+        "tag": "task:ingest",
+        "sources": [
+          "scripts/gardener_batch_v7.py"
+        ]
+      },
+      {
+        "value": "configure",
+        "tag": "task:configure",
+        "sources": [
+          "scripts/gardener_batch_v7.py",
+          "reports/third-project-tag-filter-probe-20261007.json"
+        ]
+      },
+      {
+        "value": "ops",
+        "tag": "task:ops",
+        "sources": [
+          "scripts/gardener_batch_v7.py",
+          "reports/third-project-tag-filter-probe-20261007.json"
+        ]
+      }
+    ],
+    "target": [
+      {
+        "value": "service:marker",
+        "tag": "target:service:marker",
+        "sources": [
+          "scripts/gardener_batch_v7.py"
+        ]
+      },
+      {
+        "value": "repo:hermes",
+        "tag": "target:repo:hermes",
+        "sources": [
+          "scripts/gardener_batch_v7.py"
+        ]
+      },
+      {
+        "value": "service:hindsight",
+        "tag": "target:service:hindsight",
+        "sources": [
+          "scripts/gardener_batch_v7.py"
+        ]
+      },
+      {
+        "value": "bank:hermes-ops",
+        "tag": "target:bank:hermes-ops",
+        "sources": [
+          "scripts/gardener_batch_v7.py"
+        ]
+      },
+      {
+        "value": "service:docling",
+        "tag": "target:service:docling",
+        "sources": [
+          "scripts/gardener_batch_v7.py"
+        ]
+      },
+      {
+        "value": "repo:trading",
+        "tag": "target:repo:trading",
+        "sources": [
+          "scripts/gardener_batch_v7.py"
+        ]
+      },
+      {
+        "value": "tool:terminal",
+        "tag": "target:tool:terminal",
+        "sources": [
+          "scripts/gardener_batch_v7.py"
+        ]
+      },
+      {
+        "value": "bank:agentic-design",
+        "tag": "target:bank:agentic-design",
+        "sources": [
+          "scripts/gardener_batch_v7.py"
+        ]
+      },
+      {
+        "value": "service:firecrawl",
+        "tag": "target:service:firecrawl",
+        "sources": [
+          "scripts/gardener_batch_v7.py"
+        ]
+      },
+      {
+        "value": "repo:hermes-agent",
+        "tag": "target:repo:hermes-agent",
+        "sources": [
+          "scripts/gardener_batch_v7.py",
+          "reports/third-project-tag-filter-probe-20261007.json"
+        ]
+      },
+      {
+        "value": "tool:jev",
+        "tag": "target:tool:jev",
+        "sources": [
+          "scripts/gardener_batch_v7.py"
+        ]
+      },
+      {
+        "value": "other",
+        "tag": "target:other",
+        "sources": [
+          "scripts/gardener_batch_v7.py"
+        ],
+        "role": "staging"
+      },
+      {
+        "value": "repo:hindsight",
+        "tag": "target:repo:hindsight",
+        "sources": [
+          "scripts/gardener_batch_v7.py"
+        ]
+      },
+      {
+        "value": "repo:other-code",
+        "tag": "target:repo:other-code",
+        "sources": [
+          "scripts/gardener_batch_v7.py"
+        ]
+      },
+      {
+        "value": "none",
+        "tag": "target:none",
+        "sources": [
+          "scripts/gardener_batch_v7.py"
+        ],
+        "role": "exit"
+      },
+      {
+        "value": "repo:openclaw",
+        "tag": "target:repo:openclaw",
+        "sources": [
+          "scripts/gardener_batch_v7.py"
+        ]
+      }
+    ],
+    "value": [
+      {
+        "value": "pitfall",
+        "tag": "value:pitfall",
+        "sources": [
+          "scripts/gardener_batch_v7.py"
+        ]
+      },
+      {
+        "value": "fix",
+        "tag": "value:fix",
+        "sources": [
+          "scripts/gardener_batch_v7.py"
+        ]
+      },
+      {
+        "value": "reference",
+        "tag": "value:reference",
+        "sources": [
+          "scripts/gardener_batch_v7.py",
+          "reports/third-project-tag-filter-probe-20261007.json"
+        ]
+      },
+      {
+        "value": "decision",
+        "tag": "value:decision",
+        "sources": [
+          "scripts/gardener_batch_v7.py"
+        ]
+      },
+      {
+        "value": "constraint",
+        "tag": "value:constraint",
+        "sources": [
+          "scripts/gardener_batch_v7.py",
+          "reports/third-project-tag-filter-probe-20261007.json"
+        ]
+      },
+      {
+        "value": "procedure",
+        "tag": "value:procedure",
+        "sources": [
+          "scripts/gardener_batch_v7.py",
+          "reports/third-project-tag-filter-probe-20261007.json"
+        ]
+      },
+      {
+        "value": "fact",
+        "tag": "value:fact",
+        "sources": [
+          "scripts/gardener_batch_v7.py",
+          "reports/third-project-tag-filter-probe-20261007.json"
+        ]
+      }
+    ]
+  },
+  "axis_notes": {
+    "task": "Axis action labels. Source: scripts/gardener_batch_v7.py line 17 (TASKS). Design contract: knowledge/design/retain-tagging-tree.md section 3.1.",
+    "target": "Axis target labels. Source: scripts/gardener_batch_v7.py lines 26-29 (TARGETS). Design contract: knowledge/design/retain-tagging-tree.md section 3.2. Values \"other\" and \"none\" are classifier staging/exit entries, retained as source-backed options.",
+    "value": "Axis value labels. Source: scripts/gardener_batch_v7.py line 18 (VALUES). Design contract: knowledge/design/retain-tagging-tree.md section 3.3."
+  },
+  "counts_per_axis": {
+    "task": 10,
+    "target": 16,
+    "value": 7
+  },
+  "excluded_prefixes": [
+    "kind",
+    "scope",
+    "domain",
+    "confidence",
+    "source",
+    "docset",
+    "version",
+    "git",
+    "session"
+  ],
+  "probe_evidence": {
+    "file": "reports/third-project-tag-filter-probe-20261007.json",
+    "rows": 25,
+    "observed_per_axis": {
+      "task": [
+        "build",
+        "configure",
+        "debug",
+        "ops",
+        "research",
+        "review",
+        "validate"
+      ],
+      "target": [
+        "repo:hermes-agent"
+      ],
+      "value": [
+        "constraint",
+        "fact",
+        "procedure",
+        "reference"
+      ]
+    },
+    "observed_counts_per_axis": {
+      "task": 7,
+      "target": 1,
+      "value": 4
+    },
+    "non_axis_prefixes_present": [
+      "confidence",
+      "docset",
+      "domain",
+      "git",
+      "kind",
+      "scope",
+      "source",
+      "version"
+    ]
+  },
+  "change_notes": [
+    {
+      "vs": "unvalidated (ships in plugins/jev_gate/constants.py, empty axes)",
+      "change": "Published the three axes for the first time: task=10, target=16, value=7. Version stamped \"tag-registry-v1\"."
+    },
+    {
+      "vs": "unvalidated",
+      "change": "Every entry is source-backed by the classifier and, where present, by the probe evidence; staging/exit target entries (\"other\", \"none\") are marked with a role and kept because the classifier defines them."
+    },
+    {
+      "vs": "unvalidated",
+      "change": "No filter default changed. tag_filters_enabled stays false, filter_threshold stays 0.90, and this artifact is NOT wired into config.yaml; the runtime registry is unchanged by this card."
+    },
+    {
+      "vs": "unvalidated",
+      "change": "task/value carry no staged \"other\" entry in the classifier; the selector appends \"none\" as the per-axis exit. Non-axis prefixes (kind, scope, domain, confidence, source, docset, version, git, session) are explicitly excluded."
+    }
+  ],
+  "validation": {
+    "undefined_probe_tags_per_axis": {
+      "task": [],
+      "target": [],
+      "value": []
+    },
+    "undefined_probe_tags_total": 0,
+    "duplicate_registry_entries_per_axis": {
+      "task": [],
+      "target": [],
+      "value": []
+    },
+    "duplicate_registry_entries_total": 0,
+    "non_axis_prefixes_in_probe": [
+      "confidence:high",
+      "docset:hermes-agent-docs-v2026.9.24",
+      "domain:architecture",
+      "domain:hermes-install",
+      "domain:install",
+      "domain:models",
+      "domain:skills",
+      "domain:web",
+      "git:dd440c4",
+      "kind:docs",
+      "kind:fact",
+      "scope:hermes-agent",
+      "scope:project",
+      "source:/mnt/i/hermes/research/sources/web/20260412-installation-hermes-agent.md",
+      "source:docs/getting-started/installation.md",
+      "source:docs/getting-started/nix-setup.md",
+      "source:docs/getting-started/termux.md",
+      "source:docs/reference/faq.md",
+      "source:docs/user-guide/skills/bundled/creative/creative-ascii-video.md",
+      "source:docs/user-guide/skills/bundled/creative/creative-manim-video.md",
+      "source:docs/user-guide/skills/bundled/productivity/productivity-pdf.md",
+      "source:docs/user-guide/skills/optional/creative/creative-heartmula.md",
+      "source:docs/user-guide/skills/optional/gaming/gaming-minecraft-modpack-server.md",
+      "source:docs/user-guide/skills/optional/gaming/gaming-pokemon-player.md",
+      "source:docs/user-guide/skills/optional/mlops/mlops-flash-attention.md",
+      "source:docs/user-guide/skills/optional/mlops/mlops-inference-llama-cpp.md",
+      "source:docs/user-guide/skills/optional/mlops/mlops-saelens.md",
+      "source:docs/user-guide/skills/optional/mlops/mlops-simpo.md",
+      "source:docs/user-guide/skills/optional/mlops/mlops-tensorrt-llm.md",
+      "source:docs/user-guide/skills/optional/mlops/mlops-whisper.md",
+      "source:docs/user-guide/skills/optional/research/research-scrapling.md",
+      "version:v2026.9.24"
+    ],
+    "non_axis_prefixes_in_registry": [],
+    "probe_rows": 25,
+    "probe_rows_missing_task_axis": 0,
+    "probe_rows_missing_target_axis": 0,
+    "probe_rows_missing_value_axis": 0,
+    "and_across_axes_violations": 0,
+    "counts_per_axis": {
+      "task": 10,
+      "target": 16,
+      "value": 7
+    },
+    "probe_observed_per_axis": {
+      "task": [
+        "build",
+        "configure",
+        "debug",
+        "ops",
+        "research",
+        "review",
+        "validate"
+      ],
+      "target": [
+        "repo:hermes-agent"
+      ],
+      "value": [
+        "constraint",
+        "fact",
+        "procedure",
+        "reference"
+      ]
+    },
+    "probe_observed_counts_per_axis": {
+      "task": 7,
+      "target": 1,
+      "value": 4
+    }
+  },
+  "filter_defaults_unchanged": {
+    "tag_filters_enabled": false,
+    "filter_threshold": 0.9,
+    "registry_wired_into_config": false,
+    "note": "Publication only. Activation is a separate, explicitly scoped change (TAG-03 canary + activation record)."
+  }
+}

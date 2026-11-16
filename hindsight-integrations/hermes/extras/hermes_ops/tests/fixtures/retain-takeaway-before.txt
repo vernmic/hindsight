@@ -1,0 +1,4 @@
+# Synthetic intake fixture; no runtime or memory data.
+        tags = list(row.get("tags") or [])
+        blob = " ".join(tags) + " " + content
+        missing = [p for p in REQUIRED if p not in blob]
