@@ -297,13 +297,10 @@ class Queue:
         record = identity(row, version)
         if self.db.execute("SELECT 1 FROM queue WHERE key=?", (record["key"],)).fetchone():
             return dict(record, enqueued=False)
-        marks = ",".join("?" for _ in TERMINAL_ROW_STATES)
-        terminal = self.db.execute(
-            "SELECT 1 FROM queue WHERE unit_id=? AND state IN (%s) LIMIT 1" % marks,
-            (record["unit_id"], *TERMINAL_ROW_STATES),
-        ).fetchone()
-        if terminal:
-            return dict(record, enqueued=False, skipped_terminal=True)
+        # A finished identity is not re-queued (the key check above covers it).
+        # A *changed* unit must still be queued: its version, text hash or source
+        # signature is part of the identity, and suppressing that would leave a
+        # rewritten fact untagged forever.
         stamp = now()
         with self.db:
             self.db.execute(

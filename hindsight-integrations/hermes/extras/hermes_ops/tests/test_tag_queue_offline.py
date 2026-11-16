@@ -113,12 +113,20 @@ class ClaimTests(QueueCase):
 
 
 class TerminalTests(QueueCase):
-    def test_terminal_entry_is_not_requeued(self):
+    def test_terminal_entry_is_not_requeued_under_the_same_identity(self):
         entry = self.hash()
         self.queue.mark(entry["key"], "done", reason="tagged")
-        again = self.hash(text="different text now")
+        again = self.hash()
         self.assertFalse(again["enqueued"])
-        self.assertTrue(again.get("skipped_terminal"))
+        self.assertEqual(again["key"], entry["key"])
+
+    def test_changed_unit_is_queued_again_after_a_terminal_state(self):
+        """A rewritten fact must not be stranded just because its old identity finished."""
+        entry = self.hash()
+        self.queue.mark(entry["key"], "done", reason="tagged")
+        changed = self.hash(text="the fact was rewritten with new content")
+        self.assertTrue(changed["enqueued"])
+        self.assertNotEqual(changed["key"], entry["key"])
 
     def test_completion_requires_a_new_identity_after_terminal(self):
         entry = self.hash()
