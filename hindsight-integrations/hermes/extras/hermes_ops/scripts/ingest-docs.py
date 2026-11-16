@@ -41,10 +41,12 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
-DEFAULT_DOCS_ROOT = "/home/vern/.hermes/hermes-agent/website/docs"
-DEFAULT_BANK = "hermes-ops"
-DEFAULT_URL = "http://host.docker.internal:8888"
+HERMES_HOME = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+WORKSPACE = Path(os.environ.get("HERMES_OPS_WORKSPACE") or HERMES_HOME / "workspace")
+DEFAULT_DOCS_ROOT = str(HERMES_HOME / "hermes-agent" / "website" / "docs")
+DEFAULT_URL = os.environ.get("HINDSIGHT_URL") or "http://localhost:8888"
 SUBDIRS = ["getting-started", "reference", "guides", "integrations", "user-guide"]
 
 DOCSET_PREFIX = "hermes-agent-docs-"
@@ -501,7 +503,7 @@ def main():
 
     version = args.version
     docset_id = docset_id_for(version)
-    state_path = args.state or "/mnt/i/hermes/backups/ingest-docs-%s.state.json" % version
+    state_path = args.state or str(WORKSPACE / "backups" / ("ingest-docs-%s.state.json" % version))
     state = load_state(state_path)
     prev_design = state.get("design")
     state["version"] = version
@@ -551,7 +553,7 @@ def main():
     # Amendment (Vern #2246, bank separation): the SAME parse is emitted as a
     # version-scoped JSONL artifact so the OpenClaw desk can ingest it into its own
     # bank from its own side. One parse, two sinks.
-    chunks_path = args.chunks_out or "/mnt/i/hermes/knowledge/upstream-docs-chunks/%s.jsonl" % version
+    chunks_path = args.chunks_out or str(WORKSPACE / "knowledge" / "upstream-docs-chunks" / ("%s.jsonl" % version))
     chunks_tmp = chunks_path + ".tmp"
     os.makedirs(os.path.dirname(chunks_path), exist_ok=True)
     chunk_fh = None if args.dry_run else open(chunks_tmp, "w", encoding="utf-8")
