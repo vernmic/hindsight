@@ -1,5 +1,15 @@
 """Exercise writer SQL only on session-local tables cloned from the deployed schema."""
 
+import os
+import unittest
+
+if not os.environ.get("HERMES_OPS_TEST_DB"):
+    raise unittest.SkipTest(
+        "isolated database required: this suite runs docker psql against a real server."
+        " Point HERMES_OPS_TEST_DB at an owned synthetic Postgres and it will run; it never"
+        " runs against a production bank."
+    )
+
 import json
 import unittest
 import uuid

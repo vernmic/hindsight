@@ -64,6 +64,16 @@ real shape: a rename or reshaped signature must fail loudly, not be adapted to.
   enqueue_backfill / reconcile
 """
 
+import os
+import unittest
+
+if not os.environ.get("HERMES_OPS_TEST_DB"):
+    raise unittest.SkipTest(
+        "isolated database required: this suite runs docker psql against a real server."
+        " Point HERMES_OPS_TEST_DB at an owned synthetic Postgres and it will run; it never"
+        " runs against a production bank."
+    )
+
 import asyncio
 import importlib
 import importlib.util
