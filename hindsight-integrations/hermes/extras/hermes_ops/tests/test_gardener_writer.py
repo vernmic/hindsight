@@ -3,11 +3,16 @@
 import os
 import unittest
 
-if not os.environ.get("HERMES_OPS_TEST_DB"):
+# Fail closed. An opt-in flag alone proves nothing: the run must name the owned
+# throwaway container AND resolve HINDSIGHT_CONTAINER to that same name, so the
+# psql target cannot be an unknown or shared server.
+_isolated = os.environ.get("HERMES_OPS_TEST_DB", "")
+_container = os.environ.get("HINDSIGHT_CONTAINER", "")
+if not (_isolated and _isolated == _container and _container.startswith("q8-ops-test-")):
     raise unittest.SkipTest(
-        "isolated database required: this suite runs docker psql against a real server."
-        " Point HERMES_OPS_TEST_DB at an owned synthetic Postgres and it will run; it never"
-        " runs against a production bank."
+        "isolated database required: set HERMES_OPS_TEST_DB to an owned throwaway"
+        " container named q8-ops-test-* and HINDSIGHT_CONTAINER to the same name."
+        " The database, user, bank and roots must be configured before import."
     )
 
 import json
