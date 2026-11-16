@@ -384,7 +384,7 @@
       "kind:fact",
       "scope:hermes-agent",
       "scope:project",
-      "source:/mnt/i/hermes/research/sources/web/20260412-installation-hermes-agent.md",
+      "source:<workspace>/research/sources/web/20260412-installation-hermes-agent.md",
       "source:docs/getting-started/installation.md",
       "source:docs/getting-started/nix-setup.md",
       "source:docs/getting-started/termux.md",

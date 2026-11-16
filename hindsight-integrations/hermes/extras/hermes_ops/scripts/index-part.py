@@ -14,8 +14,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-PY = "/home/vern/.hermes/hermes-agent/venv/bin/python"
-RETAIN = "/home/vern/.hermes/scripts/retain-takeaway.py"
+import hermes_ops_config as config
+
+PY = config.ops_python()
+RETAIN = str(config.hermes_home() / "scripts" / "retain-takeaway.py")
 
 
 def arg(flag, default=None):

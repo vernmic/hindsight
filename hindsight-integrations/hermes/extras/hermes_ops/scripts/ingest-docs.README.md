@@ -44,7 +44,7 @@ by an older layout, every page's `done` flag is cleared and the set is re-posted
 
 ## What it produces
 
-* Source: `/home/vern/.hermes/hermes-agent/website/docs/{getting-started,reference,guides,integrations,user-guide}`
+* Source: `$HERMES_HOME/hermes-agent/website/docs/{getting-started,reference,guides,integrations,user-guide}`
   (387 pages, 6.6 MB, developer-guide/ deliberately out of scope per the card).
 * ~1688 retain items (one per page section group, split at H2 boundaries, grouped
   to <=5 KB), posted in ~79 batches of <=25 items over 391 page-part documents.
@@ -114,10 +114,10 @@ parse state (`--report`) and asserts, for a full set (>= 100 parsed pages):
   item. Re-ingest only when the docs tree actually changed.
 * Idempotent per version: a re-run skips pages marked `done` in the state file and
   re-posts identical page-part documents (replace, not append), so no duplicates.
-* Docker access: the WSL2 docker socket is not available; the psql steps go through
-  the Windows CLI (`/mnt/c/Program Files/Docker/Docker/resources/bin/docker.exe`)
-  against container `hindsight-hindsight-1` (port 8888). Container is derived from
-  the port in `HINDSIGHT_URL` (8889 -> `hindsight2-hindsight-1`).
+* Docker access: the psql steps go through whatever `HINDSIGHT_DOCKER` names (for
+  a Docker Desktop host, the Windows CLI), against the container named by
+  `HINDSIGHT_CONTAINER`, as database `HINDSIGHT_DB` with role `HINDSIGHT_DB_USER`
+  over `HINDSIGHT_PG_BIN` (discovered in the container when unset).
 * Recall surfaces doc knowledge at BOTH layers: raw `world`/`experience` units
   carry the `docset:`/`source:` tags; consolidation also emits observations tagged
   `version:<version>` / `docset:<doc-set>`, which is what the plugin's default

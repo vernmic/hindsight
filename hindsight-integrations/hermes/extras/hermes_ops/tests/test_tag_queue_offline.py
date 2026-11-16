@@ -175,32 +175,52 @@ class RequeueTests(QueueCase):
 
 
 class OutcomeTests(QueueCase):
+    def claimed(self):
+        """_outcomes finishes rows this run holds; acquire first, as drain does."""
+        self.hash()
+        return self.queue.acquire(run_id="run-1", pid=os.getpid())[0]
+
     def test_no_label_change_is_no_op(self):
-        entry = self.hash()
+        claimed = self.claimed()
         receipt = queue_mod._outcomes(
-            self.queue, [{"unit_id": UNIT, "key": entry["key"]}], {"held": [{"id": UNIT, "reason": "no-label-change"}]}, "run"
+            self.queue, [claimed], {"held": [{"id": UNIT, "reason": "no-label-change"}]}, "run-1"
         )
         self.assertEqual(receipt.get("no_op"), 1)
-        self.assertEqual(self.queue.get(entry["key"])["state"], "no_op")
+        self.assertEqual(self.queue.get(claimed["key"])["state"], "no_op")
 
     def test_confirmed_duplicate_is_terminal(self):
-        entry = self.hash()
+        claimed = self.claimed()
         receipt = queue_mod._outcomes(
             self.queue,
-            [{"unit_id": UNIT, "key": entry["key"]}],
+            [claimed],
             {"held": [{"id": UNIT, "reason": "confirmed-duplicate:abc"}]},
-            "run",
+            "run-1",
         )
         self.assertEqual(receipt.get("dup_resolved"), 1)
-        self.assertEqual(self.queue.get(entry["key"])["state"], "dup_resolved")
+        self.assertEqual(self.queue.get(claimed["key"])["state"], "dup_resolved")
 
     def test_plain_failure_stays_held(self):
-        entry = self.hash()
+        claimed = self.claimed()
         receipt = queue_mod._outcomes(
-            self.queue, [{"unit_id": UNIT, "key": entry["key"]}], {"held": [{"id": UNIT, "reason": "oversized-record"}]}, "run"
+            self.queue, [claimed], {"held": [{"id": UNIT, "reason": "oversized-record"}]}, "run-1"
         )
         self.assertEqual(receipt["held"], 1)
-        self.assertEqual(self.queue.get(entry["key"])["state"], "held")
+        self.assertEqual(self.queue.get(claimed["key"])["state"], "held")
+
+    def test_outcome_from_a_released_claim_is_refused(self):
+        claimed = self.claimed()
+        import datetime as _dt
+
+        old = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=3)).isoformat()
+        with self.queue.db:
+            self.queue.db.execute("UPDATE queue SET claim_at=? WHERE key=?", (old, claimed["key"]))
+        self.queue._release_claim(claimed["key"], claimed["claim_pid"], old)
+        receipt = queue_mod._outcomes(
+            self.queue, [claimed], {"held": [{"id": UNIT, "reason": "oversized-record"}]}, "run-1"
+        )
+        self.assertEqual(receipt["held"], 0)
+        self.assertEqual(receipt["claim_lost"], 1)
+        self.assertEqual(self.queue.get(claimed["key"])["state"], "pending")
 
 
 class RunnerLockTests(QueueCase):

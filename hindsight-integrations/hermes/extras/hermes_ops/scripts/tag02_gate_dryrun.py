@@ -18,10 +18,12 @@ import sys
 import tempfile
 from pathlib import Path
 
-VENV_PY = "/home/vern/.hermes/hermes-agent/venv/bin/python"
-RETAIN = Path("/home/vern/.hermes/scripts/retain-takeaway.py")
-INDEX_PART = Path("/mnt/i/hermes/knowledge/index-extracts/index-part.py")
-SCAN_DEFAULT = Path("/mnt/i/hermes/knowledge/index-extracts")
+import hermes_ops_config as config
+
+VENV_PY = config.ops_python()
+RETAIN = Path(config.hermes_home()) / "scripts" / "retain-takeaway.py"
+INDEX_PART = Path(config.workspace()) / "knowledge" / "index-extracts" / "index-part.py"
+SCAN_DEFAULT = Path(config.workspace()) / "knowledge" / "index-extracts"
 
 BANK_CALLS = []
 
@@ -112,33 +114,33 @@ LEGIT = {
     "bank": "hermes-ops",
     "content": "2026-09-26: Hermes upgraded from v0.13.0 to v0.21.5 on the WSL2 host.",
     "context": "install",
-    "source": "/mnt/i/hermes/docs/install.md",
+    "source": "<workspace>/docs/install.md",
     "tags": [
         "kind:fact",
         "scope:hermes-ops",
         "domain:install",
         "confidence:confirmed",
-        "source:/mnt/i/hermes/docs/install.md",
+        "source:<workspace>/docs/install.md",
     ],
 }
 PROSE_ONLY_SOURCE = {
     "bank": "hermes-ops",
     "content": "2026-09-26: Hermes upgraded; remember every fact needs a source: tag.",
     "context": "install",
-    "source": "/mnt/i/hermes/docs/install.md",
+    "source": "<workspace>/docs/install.md",
     "tags": ["kind:fact", "scope:hermes-ops", "domain:install", "confidence:confirmed"],
 }
 VALUELESS_TAG = {
     "bank": "hermes-ops",
     "content": "2026-09-26: Hermes upgraded from v0.13.0 to v0.21.5.",
     "context": "install",
-    "source": "/mnt/i/hermes/docs/install.md",
+    "source": "<workspace>/docs/install.md",
     "tags": [
         "kind:",
         "scope:hermes-ops",
         "domain:install",
         "confidence:confirmed",
-        "source:/mnt/i/hermes/docs/install.md",
+        "source:<workspace>/docs/install.md",
     ],
 }
 CASES = [

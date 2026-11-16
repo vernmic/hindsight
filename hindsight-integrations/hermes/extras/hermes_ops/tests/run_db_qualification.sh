@@ -10,13 +10,13 @@ set -uo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 OPS=$(cd "$HERE/.." && pwd)
-DOCKER=${HINDSIGHT_DOCKER:-/mnt/c/Program Files/Docker/Docker/resources/bin/docker.exe}
+DOCKER=${HINDSIGHT_DOCKER:-docker}
 IMAGE=${Q8_IMAGE:-pgvector/pgvector:pg18}
 NAME=${Q8_NAME:-"q8-ops-test-$(printf '%s' "$$$(date +%s)" | sha256sum | cut -c1-8)"}
 PASS="q8-fixture-$(printf '%s' "$NAME$$" | sha256sum | cut -c1-16)"
 DB="q8fixture"
 ROLE="q8role"
-PY=${HERMES_OPS_PYTHON:-/home/vern/.hermes/venvs/ops/bin/python}
+PY=${HERMES_OPS_PYTHON:-python3}
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/q8db.XXXXXX")
 WS="$TMP/ws"
 HOME_DIR="$TMP/home"

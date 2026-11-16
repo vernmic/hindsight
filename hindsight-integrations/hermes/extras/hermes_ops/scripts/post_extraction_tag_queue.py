@@ -370,18 +370,30 @@ class Queue:
             datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=self.CLAIM_STALE_SECONDS)
         ).isoformat()
         stale = self.db.execute(
-            "SELECT key,claim_pid FROM queue WHERE state='in_flight' AND claim_at < ?", (cutoff,)
+            "SELECT key,claim_pid,claim_at FROM queue WHERE state='in_flight' AND claim_at < ?", (cutoff,)
         ).fetchall()
         for row in stale:
             if row["claim_pid"] and pid_alive(row["claim_pid"]):
                 continue
-            with self.db:
-                self.db.execute(
-                    "UPDATE queue SET state='pending',claim_pid=NULL,claim_at=NULL,claim_run=NULL,"
-                    "updated_at=? WHERE key=? AND state='in_flight'",
-                    (now(), row["key"]),
-                )
-                self._history(row["key"], "in_flight", "pending", "stale-claim-released")
+            self._release_claim(row["key"], row["claim_pid"], row["claim_at"])
+
+    def _release_claim(self, key, claim_pid, claim_at):
+        """Compare-and-set release of one observed claim; True when it was released.
+
+        The observed owner is part of the WHERE clause, so a row that was
+        released and re-claimed between the select and this update keeps its new
+        claim, and no history row is invented for it.
+        """
+        with self.db:
+            released = self.db.execute(
+                "UPDATE queue SET state='pending',claim_pid=NULL,claim_at=NULL,claim_run=NULL,"
+                "updated_at=? WHERE key=? AND state='in_flight' AND claim_pid IS ? AND claim_at IS ?",
+                (now(), key, claim_pid, claim_at),
+            )
+            if released.rowcount == 1:
+                self._history(key, "in_flight", "pending", "stale-claim-released")
+                return True
+        return False
 
     def _history(self, key, from_state, to_state, reason=None, run_id=None, attempts=None):
         self.db.execute(
@@ -406,17 +418,53 @@ class Queue:
         row = self.db.execute("SELECT * FROM queue WHERE key=?", (key,)).fetchone()
         return dict(row) if row else None
 
-    def mark(self, key, state, reason=None, run_id=None, bump_attempts=False):
+    def mark(self, key, state, reason=None, run_id=None, bump_attempts=False, claim=None):
+        """Transition a row. Pass `claim` (the dict returned by acquire) to fence it.
+
+        A worker that outlived its claim must not transition the row: if the stale
+        release already handed the row to another run, this call reports False and
+        writes no history, leaving the live owner's claim and row untouched. Both
+        the in-memory claim and the stored claim_run/claim_pid must still match.
+        """
         with self.db:
-            prior = self.db.execute("SELECT state,attempts FROM queue WHERE key=?", (key,)).fetchone()
-            self.db.execute(
-                "UPDATE queue SET state=?,reason=?,run_id=COALESCE(?,run_id),"
-                "attempts=attempts+(CASE WHEN ? THEN 1 ELSE 0 END),updated_at=?,"
-                "claim_pid=NULL,claim_at=NULL,claim_run=NULL WHERE key=?",
-                (state, reason, run_id, 1 if bump_attempts else 0, now(), key),
-            )
-            if prior and prior["state"] != state:
+            prior = self.db.execute(
+                "SELECT state,attempts,claim_pid,claim_run FROM queue WHERE key=?", (key,)
+            ).fetchone()
+            if prior is None:
+                return False
+            if claim is not None:
+                if prior["state"] != "in_flight":
+                    return False
+                if (prior["claim_run"], prior["claim_pid"]) != (claim.get("claim_run"), claim.get("claim_pid")):
+                    return False
+                changed = self.db.execute(
+                    "UPDATE queue SET state=?,reason=?,run_id=COALESCE(?,run_id),"
+                    "attempts=attempts+(CASE WHEN ? THEN 1 ELSE 0 END),updated_at=?,"
+                    "claim_pid=NULL,claim_at=NULL,claim_run=NULL"
+                    " WHERE key=? AND state='in_flight' AND claim_run=? AND claim_pid IS ?",
+                    (
+                        state,
+                        reason,
+                        run_id,
+                        1 if bump_attempts else 0,
+                        now(),
+                        key,
+                        claim.get("claim_run"),
+                        claim.get("claim_pid"),
+                    ),
+                )
+                if changed.rowcount != 1:
+                    return False
+            else:
+                self.db.execute(
+                    "UPDATE queue SET state=?,reason=?,run_id=COALESCE(?,run_id),"
+                    "attempts=attempts+(CASE WHEN ? THEN 1 ELSE 0 END),updated_at=?,"
+                    "claim_pid=NULL,claim_at=NULL,claim_run=NULL WHERE key=?",
+                    (state, reason, run_id, 1 if bump_attempts else 0, now(), key),
+                )
+            if prior["state"] != state:
                 self._history(key, prior["state"], state, reason, run_id, prior["attempts"])
+        return True
 
     def counts(self):
         rows = self.db.execute("SELECT state,cursor,count(*) AS n FROM queue GROUP BY state,cursor").fetchall()
@@ -706,29 +754,37 @@ def verify_sources_unchanged(before, after):
 def _outcomes(queue, entries, result, run_id):
     actions = {item["id"]: item for item in result.get("actions", [])}
     held = {item["id"]: item for item in result.get("held", [])}
-    receipt = {"tagged": 0, "held": 0, "stale": 0}
+    receipt = {"tagged": 0, "held": 0, "stale": 0, "claim_lost": 0}
     by_key = {entry["unit_id"]: entry for entry in entries}
     for unit_id, entry in by_key.items():
         action = actions.get(unit_id)
         if action is not None and action.get("applied") and action.get("action") == "TAG":
-            queue.mark(entry["key"], "done", reason="tagged", run_id=run_id, bump_attempts=True)
-            receipt["tagged"] += 1
+            if queue.mark(entry["key"], "done", reason="tagged", run_id=run_id, bump_attempts=True, claim=entry):
+                receipt["tagged"] += 1
+            else:
+                receipt["claim_lost"] += 1
             continue
         if action is not None and action.get("blocked"):
             state = "stale" if action["blocked"] == "version-conflict" else "held"
-            queue.mark(entry["key"], state, reason=action["blocked"], run_id=run_id, bump_attempts=True)
-            receipt["stale" if state == "stale" else "held"] += 1
+            if queue.mark(entry["key"], state, reason=action["blocked"], run_id=run_id, bump_attempts=True, claim=entry):
+                receipt["stale" if state == "stale" else "held"] += 1
+            else:
+                receipt["claim_lost"] += 1
             continue
         reason = (held.get(unit_id) or {}).get("reason") or (action or {}).get("reason") or "no-outcome"
         if reason == "no-label-change":
-            queue.mark(entry["key"], "no_op", reason="no-label-change", run_id=run_id, bump_attempts=True)
-            receipt["no_op"] = receipt.get("no_op", 0) + 1
+            ok = queue.mark(entry["key"], "no_op", reason="no-label-change", run_id=run_id, bump_attempts=True, claim=entry)
+            receipt["no_op"] = receipt.get("no_op", 0) + (1 if ok else 0)
         elif reason and reason.startswith("confirmed-duplicate:"):
-            queue.mark(entry["key"], "dup_resolved", reason=reason, run_id=run_id, bump_attempts=True)
-            receipt["dup_resolved"] = receipt.get("dup_resolved", 0) + 1
+            ok = queue.mark(
+                entry["key"], "dup_resolved", reason=reason, run_id=run_id, bump_attempts=True, claim=entry
+            )
+            receipt["dup_resolved"] = receipt.get("dup_resolved", 0) + (1 if ok else 0)
         else:
-            queue.mark(entry["key"], "held", reason=reason, run_id=run_id, bump_attempts=True)
-            receipt["held"] += 1
+            ok = queue.mark(entry["key"], "held", reason=reason, run_id=run_id, bump_attempts=True, claim=entry)
+            receipt["held"] += 1 if ok else 0
+        if not ok:
+            receipt["claim_lost"] += 1
     return receipt
 
 
@@ -794,7 +850,7 @@ async def drain(
             present = set(exists([entry["unit_id"] for entry in entries]))
             absent = [entry for entry in entries if entry["unit_id"] not in present]
             for entry in absent:
-                queue.mark(entry["key"], "absent", reason="deleted-before-tagging", run_id=run)
+                queue.mark(entry["key"], "absent", reason="deleted-before-tagging", run_id=run, claim=entry)
             receipt["absent"] += len(absent)
             live = [entry for entry in entries if entry["unit_id"] in present]
             if not live:
@@ -817,7 +873,9 @@ async def drain(
                 else:
                     eligible.append((entry, row))
             for entry, row, current in refreshed:
-                queue.mark(entry["key"], "superseded", reason="version-or-context-changed", run_id=run)
+                queue.mark(
+                    entry["key"], "superseded", reason="version-or-context-changed", run_id=run, claim=entry
+                )
                 queue.enqueue(
                     row, origin=entry["origin"], cursor=entry["cursor"], completion_key=entry["completion_key"]
                 )
@@ -846,7 +904,9 @@ async def drain(
                     ok, _amount = budget.reserve(len(eligible))
                     if not ok:
                         for entry, row in eligible:
-                            queue.mark(entry["key"], "pending", reason="budget-deferred", run_id=run)
+                            queue.mark(
+                                entry["key"], "pending", reason="budget-deferred", run_id=run, claim=entry
+                            )
                             tagger_ledger.attempt_outcome(
                                 ledger,
                                 run_id=run,
@@ -910,7 +970,12 @@ async def drain(
             for case in held_cases:
                 entry = next(entry for entry, row in eligible if row["id"] == case["id"])
                 queue.mark(
-                    entry["key"], "held", reason=case["reason"] or case["disposition"], run_id=run, bump_attempts=True
+                    entry["key"],
+                    "held",
+                    reason=case["reason"] or case["disposition"],
+                    run_id=run,
+                    bump_attempts=True,
+                    claim=entry,
                 )
                 receipt["held"] += 1
                 receipt["held_cases"].append(case)
@@ -935,7 +1000,9 @@ async def drain(
                 except ValueError as exc:
                     if "version mismatch" in str(exc).lower():
                         for entry, row in eligible:
-                            queue.mark(entry["key"], "stale", reason="writer-version-conflict", run_id=run)
+                            queue.mark(
+                                entry["key"], "stale", reason="writer-version-conflict", run_id=run, claim=entry
+                            )
                         receipt["stale"] += len(eligible)
                         receipt["pages"] += 1
                         continue
@@ -978,6 +1045,11 @@ async def drain(
                     if violations:
                         for entry in entries_by_id.values():
                             if entry["unit_id"] in set(applied):
+                                # Those rows were already completed by _outcomes above, so
+                                # their claim is gone. A detected mutation is a hard failure
+                                # of this run and must override the completion; the row cannot
+                                # be in_flight for another owner at this point because it is
+                                # terminal under this run's identity.
                                 queue.mark(entry["key"], "violation", reason="source-immutability", run_id=run)
                         receipt["source_immutability"] = "violation"
                         raise RuntimeError("Source immutability violated: " + json.dumps(violations))

@@ -35,6 +35,9 @@ MANUAL_ONLY = (
 QUEUE_FILES = ("post_extraction_tag_queue.py", "tagger_lock.py", "tagger_ledger.py", "tagger_fallback.py")
 # Shell operators that live in the Hermes home rather than the workspace.
 HOME_SCRIPTS = ("dream-bank.sh", "monitor-brief-input.sh", "health-check.sh")
+# Data files the runtime reads from the package root; a synced install keeps them
+# beside the scripts directory, which is where hermes_ops_config looks for them.
+ROOT_DATA = ("extraction-policy.json", "tag-registry.json")
 
 
 def targets(source: Path, workspace: Path, home: Path) -> dict[Path, Path]:
@@ -43,12 +46,13 @@ def targets(source: Path, workspace: Path, home: Path) -> dict[Path, Path]:
         scripts[source / "scripts" / name] = home / "scripts" / name
     for name in MANUAL_ONLY + QUEUE_FILES:
         scripts.pop(source / "scripts" / name, None)
+    data = {source / name: workspace / name for name in ROOT_DATA}
     plugin = {
         p: home / "plugins/jev_gate" / p.relative_to(source / "jev_gate")
         for p in (source / "jev_gate").iterdir()
         if p.is_file()
     }
-    return {**scripts, **plugin}
+    return {**scripts, **data, **plugin}
 
 
 def main() -> None:

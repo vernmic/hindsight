@@ -10,6 +10,17 @@ Hermes integration, not an automatically loaded part of the Hindsight server.
 * `extraction-policy.json`: bank-specific candidate and rollback fields.
 * `source-manifest.json`: hashes of the maintained source; no raw memories.
 
+## Approved Jev payload and its exception
+
+`jev_gate/` (14 files) and the two Python controls `scripts/jev-control.py` and
+`scripts/jev-write-control.py` are carried byte-identical to the approved
+dependency `0aacb00a`. The four `scripts/jev*.ps1` wrappers are **not** identical:
+under a root-approved scope exception they were parameterized to take their
+distro, interpreter, controller path and Hermes home from `HERMES_HOME`,
+`HERMES_OPS_WORKSPACE`, `HERMES_OPS_PYTHON`, `HERMES_WSL_DISTRO` and the
+`HERMES_OPS_*_CONTROL` overrides, and to call `wsl.exe -e` with argv instead of
+a quoted shell string. Plugin runtime behaviour is unchanged.
+
 ## Settings
 
 Every deployment value is resolved at runtime by `scripts/hermes_ops_config.py`:
@@ -24,9 +35,9 @@ target or host path.
 | `HERMES_OPS_BANK` | none - required | the one garden bank; `main` and `openclaw` are refused |
 | `HERMES_OPS_BANKS` | `HERMES_OPS_BANK` | comma list for the nightly pass |
 | `HINDSIGHT_URL` | `http://localhost:8888` | set `host.docker.internal` only on Docker Desktop hosts |
-| `HINDSIGHT_CONTAINER` | `hindsight` | the server container name in your deployment |
+| `HINDSIGHT_CONTAINER` | `hindsight` (the compose service name) | set it whenever your deployment renamed the service |
 | `HINDSIGHT_DB` / `HINDSIGHT_DB_USER` / `HINDSIGHT_DB_HOST` | `hindsight` / `hindsight` / `127.0.0.1` | expected database identity |
-| `HINDSIGHT_PG_BIN` / `HINDSIGHT_PG_LIB` | image-embedded pg0 paths | adjust for a different image |
+| `HINDSIGHT_PG_BIN` / `HINDSIGHT_PG_LIB` | discovered inside the container | set explicitly when discovery cannot find psql; an explicit `<prefix>/bin/psql` implies `<prefix>/lib` |
 | `HINDSIGHT_PGPASSWORD` | none - required for DB tools | read only from the authorized environment |
 | `HERMES_OPS_PYTHON` | `$HERMES_HOME/venvs/ops/bin/python`, else the running interpreter | gardener and ingest subprocesses |
 | `ALERT_TARGET` | unset | unset means no alert delivery, never a default chat |
