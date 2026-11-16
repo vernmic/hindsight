@@ -290,13 +290,16 @@ function samePath(a: string, b: string): boolean {
 }
 
 /** Deterministic turn_middle proposals (design A.11 + F2): a turn becomes redactable once
- *  `ageTurns` NEWER turns exist. Additive to the model's marks; skips overlaps. */
+ *  `ageTurns` NEWER turns exist. Additive to the model's marks; skips overlaps. Turns that end
+ *  below the assembled window are skipped: the next pass retires any pending mark there, so
+ *  proposing one only churned delete+insert every turn (seen 2026-11-15: 29 and 125 per pass). */
 function proposeTurnMiddleMarks(
   db: DatabaseSync,
   ht: HostTranscript,
   sessionId: string,
   ageTurns: number,
-  nowS: number
+  nowS: number,
+  windowFloor: number
 ): number {
   const rows = db
     .prepare("SELECT seq_start, seq_end FROM turns WHERE session_id = ? ORDER BY turn_id")
@@ -310,6 +313,7 @@ function proposeTurnMiddleMarks(
   let n = 0;
   rows.forEach((r, idx) => {
     if (rows.length - 1 - idx < ageTurns) return;
+    if (windowFloor > 0 && r.seq_end < windowFloor) return;
     if (existing.some((m) => m.seq_start <= r.seq_end && m.seq_end >= r.seq_start)) return;
     const a = ht.anchorsFor(r.seq_start, r.seq_end);
     if (!a) return; // an unanchorable range cannot survive a reindex
@@ -632,7 +636,7 @@ export async function runPass(payload: PassPayload, deps: PassDeps = {}): Promis
             .get(startedAt) as Json
         ).n
       );
-      proposeTurnMiddleMarks(db, ht!, sessionId, ageTurns, nowS);
+      proposeTurnMiddleMarks(db, ht!, sessionId, ageTurns, nowS, windowFloor);
       db.prepare(
         "UPDATE passes SET outcome=?, model=?, effort=?, elapsed_ms=?, reasoning_tokens=?, marks_proposed=?," +
           " fallback_from=?, fallback_reason=?, finished_at=?, lag_turns=? WHERE pass_id=?"
