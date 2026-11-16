@@ -197,7 +197,13 @@ def requeue_held(queue, now_iso=None):
         attempts = entry.get("attempts") or 0
         updated = entry.get("updated_at")
         if attempts >= cap:
-            queue.mark(entry["key"], "blocked", reason="attempts-exhausted:" + reason, bump_attempts=False)
+            queue.mark(
+                entry["key"],
+                "blocked",
+                reason="attempts-exhausted:" + reason,
+                bump_attempts=False,
+                expect_state="held",
+            )
             receipt["blocked"] += 1
             continue
         age_h = 0.0
@@ -211,7 +217,13 @@ def requeue_held(queue, now_iso=None):
                 age_h = 0.0
         need_h = base_h * 2 ** max(0, attempts - 1)
         if age_h >= need_h:
-            queue.mark(entry["key"], "pending", reason="requeued-by-class", bump_attempts=False)
+            queue.mark(
+                entry["key"],
+                "pending",
+                reason="requeued-by-class",
+                bump_attempts=False,
+                expect_state="held",
+            )
             receipt["requeued"] += 1
         else:
             receipt["kept"] += 1
@@ -418,17 +430,26 @@ class Queue:
         row = self.db.execute("SELECT * FROM queue WHERE key=?", (key,)).fetchone()
         return dict(row) if row else None
 
-    def mark(self, key, state, reason=None, run_id=None, bump_attempts=False, claim=None):
-        """Transition a row. Pass `claim` (the dict returned by acquire) to fence it.
+    def mark(self, key, state, reason=None, run_id=None, bump_attempts=False, claim=None,
+             expect_state=None, expect_run=None):
+        """Transition a row, fenced by either an acquired claim or an explicit CAS.
 
-        A worker that outlived its claim must not transition the row: if the stale
-        release already handed the row to another run, this call reports False and
-        writes no history, leaving the live owner's claim and row untouched. Both
-        the in-memory claim and the stored claim_run/claim_pid must still match.
+        Worker paths pass `claim` (the dict returned by acquire): the row must
+        still be in_flight under that exact claim_run/claim_pid, re-checked in the
+        UPDATE, and a released claim reports False without touching the row or
+        writing history.
+
+        Maintenance paths pass `expect_state` (and `expect_run` when the expected
+        owner matters). There is no unconditional branch: an in_flight row is
+        refused unless the caller names that state AND the owning run id, so a
+        stale caller cannot clear an active claim by omitting them. Any other
+        state transition is conditional on the state observed in the same
+        transaction, and callers that need protection against a concurrent
+        maintenance change pass `expect_state` explicitly.
         """
         with self.db:
             prior = self.db.execute(
-                "SELECT state,attempts,claim_pid,claim_run FROM queue WHERE key=?", (key,)
+                "SELECT state,attempts,claim_pid,claim_run,run_id FROM queue WHERE key=?", (key,)
             ).fetchone()
             if prior is None:
                 return False
@@ -453,15 +474,29 @@ class Queue:
                         claim.get("claim_pid"),
                     ),
                 )
-                if changed.rowcount != 1:
-                    return False
             else:
-                self.db.execute(
+                # No acquired claim. Live ownership is never touched without an
+                # exact expectation: an in_flight row needs expect_state and the
+                # owning run id, otherwise the call is refused outright.
+                if prior["state"] == "in_flight":
+                    if expect_state != "in_flight" or not expect_run:
+                        return False
+                    if (prior["run_id"] or "") != expect_run:
+                        return False
+                expected = expect_state or prior["state"]
+                sql = (
                     "UPDATE queue SET state=?,reason=?,run_id=COALESCE(?,run_id),"
                     "attempts=attempts+(CASE WHEN ? THEN 1 ELSE 0 END),updated_at=?,"
-                    "claim_pid=NULL,claim_at=NULL,claim_run=NULL WHERE key=?",
-                    (state, reason, run_id, 1 if bump_attempts else 0, now(), key),
+                    "claim_pid=NULL,claim_at=NULL,claim_run=NULL"
+                    " WHERE key=? AND state=?"
                 )
+                params = [state, reason, run_id, 1 if bump_attempts else 0, now(), key, expected]
+                if expect_run is not None:
+                    sql += " AND COALESCE(run_id,'')=?"
+                    params.append(expect_run)
+                changed = self.db.execute(sql, tuple(params))
+            if changed.rowcount != 1:
+                return False
             if prior["state"] != state:
                 self._history(key, prior["state"], state, reason, run_id, prior["attempts"])
         return True
@@ -1050,7 +1085,14 @@ async def drain(
                                 # of this run and must override the completion; the row cannot
                                 # be in_flight for another owner at this point because it is
                                 # terminal under this run's identity.
-                                queue.mark(entry["key"], "violation", reason="source-immutability", run_id=run)
+                                queue.mark(
+                                    entry["key"],
+                                    "violation",
+                                    reason="source-immutability",
+                                    run_id=run,
+                                    expect_state="done",
+                                    expect_run=run,
+                                )
                         receipt["source_immutability"] = "violation"
                         raise RuntimeError("Source immutability violated: " + json.dumps(violations))
                 receipt["runs"].append(
@@ -1099,14 +1141,14 @@ def reconcile(queue, version=None):
     receipt = {"candidates": len(entries), "present": len(present), "requeued": 0, "deleted": 0}
     for entry in entries:
         if entry["unit_id"] not in present:
-            queue.mark(entry["key"], "absent", reason="deleted-before-tagging")
+            queue.mark(entry["key"], "absent", reason="deleted-before-tagging", expect_state=entry["state"])
             receipt["deleted"] += 1
             continue
         rows = unit_identities([entry["unit_id"]])
         for row in rows:
             outcome = queue.enqueue(row, origin=entry["origin"], cursor=entry["cursor"], version=version)
             if outcome["enqueued"]:
-                queue.mark(entry["key"], "superseded", reason="reconciled")
+                queue.mark(entry["key"], "superseded", reason="reconciled", expect_state=entry["state"])
                 receipt["requeued"] += 1
     return receipt
 

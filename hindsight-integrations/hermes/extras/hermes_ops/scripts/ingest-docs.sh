@@ -60,6 +60,15 @@ while [ $# -gt 0 ]; do
   shift
 done
 
+# Supported version-tag grammar. Ingest tags in use look like v2026.9.24; the
+# class below accepts those and any date/semver-style tag while excluding
+# quotes, whitespace, shell metacharacters and SQL syntax.
+VERSION_TAG_PATTERN='^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'
+if [ -n "$VERSION_TAG" ] && ! printf '%s' "$VERSION_TAG" | grep -Eq "$VERSION_TAG_PATTERN"; then
+  echo "ingest-docs: aborted: version tag must match $VERSION_TAG_PATTERN (letters, digits, dot, underscore, hyphen; max 64)" >&2
+  exit 2
+fi
+
 HOME_DIR=${HERMES_HOME:-$HOME/.hermes}
 WORKSPACE=${HERMES_OPS_WORKSPACE:-$HOME_DIR/workspace}
 DOCS_ROOT=${HERMES_OPS_DOCS_ROOT:-$HOME_DIR/hermes-agent/website/docs}
@@ -125,13 +134,16 @@ if [ -z "$PSQL_BIN" ] && [ "$MODE" != "list" ] && [ -n "${VERSION_TAG:-}" ]; the
 fi
 [ -n "$PG_LIB" ] || { case "$PSQL_BIN" in */bin/psql) PG_LIB="${PSQL_BIN%/bin/psql}/lib" ;; esac; }
 
-sql() {  # statement arrives on stdin: argv only, no shell re-expansion
+sql() {  # sql <statement> [psql -v name=value ...]; statement and bindings on argv/stdin
+  local statement="$1"; shift
+  local binds=()
+  while [ $# -gt 0 ]; do binds+=(-v "$1"); shift; done
   [ -n "$DKR" ] || { echo "NO_DOCKER"; return 1; }
   : "${HINDSIGHT_PGPASSWORD:?HINDSIGHT_PGPASSWORD must be set}"
   local args=(-i -e "PGPASSWORD=$HINDSIGHT_PGPASSWORD")
   [ -n "$PG_LIB" ] && args+=(-e "LD_LIBRARY_PATH=$PG_LIB")
-  printf '%s\n' "$1" | "$DKR" exec "${args[@]}" "$CT" "$PSQL_BIN" \
-    -h "$DB_HOST" -U "$DB_USER" -d "$DB_NAME" -v ON_ERROR_STOP=1 -A -F'|' -t -f - 2>&1
+  printf '%s\n' "$statement" | "$DKR" exec "${args[@]}" "$CT" "$PSQL_BIN" \
+    -h "$DB_HOST" -U "$DB_USER" -d "$DB_NAME" -v ON_ERROR_STOP=1 "${binds[@]}" -A -F'|' -t -f - 2>&1
 }
 
 mkdir -p "$BACKUP_DIR"
@@ -174,16 +186,18 @@ purge_docset() {  # purge_docset <tag>  -- one psql session, tag-scoped CTE
   local tag="$1"; local did="hermes-agent-docs-$tag"
   echo "--- psql purge of docset:$did (tag-scoped units + observations + document rows) ---"
   echo "HARD RULE: psql only, never the HTTP DELETE endpoint."
-  echo "before: units_tagged=$(sql "SELECT count(*) FROM memory_units WHERE bank_id='$BANK' AND 'docset:$did' = ANY(tags);") documents=$(sql "SELECT count(*) FROM documents WHERE bank_id='$BANK' AND (id='$did' OR id LIKE '$did-%');") chunks=$(sql "SELECT count(*) FROM chunks WHERE bank_id='$BANK' AND (document_id='$did' OR document_id LIKE '$did-%');")"
-  local sql_text="WITH purged AS (SELECT id FROM memory_units WHERE bank_id='$BANK' AND ('docset:$did' = ANY(tags) OR document_id='$did' OR document_id LIKE '$did-%')), d_obs AS (DELETE FROM memory_units WHERE bank_id='$BANK' AND fact_type='observation' AND (source_memory_ids && (SELECT coalesce(array_agg(id),'{}'::uuid[]) FROM purged) OR 'version:$tag' = ANY(tags) OR 'docset:$did' = ANY(tags)) RETURNING 1), d_units AS (DELETE FROM memory_units WHERE bank_id='$BANK' AND ('docset:$did' = ANY(tags) OR document_id='$did' OR document_id LIKE '$did-%') RETURNING 1), d_chunks AS (DELETE FROM chunks WHERE bank_id='$BANK' AND (document_id='$did' OR document_id LIKE '$did-%') RETURNING 1), d_docs AS (DELETE FROM documents WHERE bank_id='$BANK' AND (id='$did' OR id LIKE '$did-%') RETURNING 1) SELECT 'observations_deleted|' || (SELECT count(*) FROM d_obs) || ' units_deleted|' || (SELECT count(*) FROM d_units) || ' chunks_deleted|' || (SELECT count(*) FROM d_chunks) || ' documents_deleted|' || (SELECT count(*) FROM d_docs);"
+  echo "before: $(sql "SELECT 'units_tagged|'||(SELECT count(*) FROM memory_units WHERE bank_id=:'bank' AND 'docset:'||:'did' = ANY(tags))||' documents|'||(SELECT count(*) FROM documents WHERE bank_id=:'bank' AND (id=:'did' OR id LIKE :'did'||'-%'))||' chunks|'||(SELECT count(*) FROM chunks WHERE bank_id=:'bank' AND (document_id=:'did' OR document_id LIKE :'did'||'-%'));" "did=$did" "bank=$BANK")"
+  # External data is bound through psql variables (:'tag', :'did', :'bank'),
+  # which psql quotes as literals client-side; nothing is spliced into the text.
+  local sql_text="WITH purged AS (SELECT id FROM memory_units WHERE bank_id=:'bank' AND ('docset:'||:'did' = ANY(tags) OR document_id=:'did' OR document_id LIKE :'did'||'-%')), d_obs AS (DELETE FROM memory_units WHERE bank_id=:'bank' AND fact_type='observation' AND (source_memory_ids && (SELECT coalesce(array_agg(id),'{}'::uuid[]) FROM purged) OR 'version:'||:'tag' = ANY(tags) OR 'docset:'||:'did' = ANY(tags)) RETURNING 1), d_units AS (DELETE FROM memory_units WHERE bank_id=:'bank' AND ('docset:'||:'did' = ANY(tags) OR document_id=:'did' OR document_id LIKE :'did'||'-%') RETURNING 1), d_chunks AS (DELETE FROM chunks WHERE bank_id=:'bank' AND (document_id=:'did' OR document_id LIKE :'did'||'-%') RETURNING 1), d_docs AS (DELETE FROM documents WHERE bank_id=:'bank' AND (id=:'did' OR id LIKE :'did'||'-%') RETURNING 1) SELECT 'observations_deleted|' || (SELECT count(*) FROM d_obs) || ' units_deleted|' || (SELECT count(*) FROM d_units) || ' chunks_deleted|' || (SELECT count(*) FROM d_chunks) || ' documents_deleted|' || (SELECT count(*) FROM d_docs);"
   local out
-  out=$(sql "$sql_text")
+  out=$(sql "$sql_text" "tag=$tag" "did=$did" "bank=$BANK")
   echo "$out"
   case "$out" in
     *observations_deleted*) : ;;
     *) echo "WARN: purge did not return counts (see line above)" ;;
   esac
-  echo "after: units_tagged=$(sql "SELECT count(*) FROM memory_units WHERE bank_id='$BANK' AND 'docset:$did' = ANY(tags);") units_docidprefix=$(sql "SELECT count(*) FROM memory_units WHERE bank_id='$BANK' AND (document_id='$did' OR document_id LIKE '$did-%');") documents=$(sql "SELECT count(*) FROM documents WHERE bank_id='$BANK' AND (id='$did' OR id LIKE '$did-%');") chunks=$(sql "SELECT count(*) FROM chunks WHERE bank_id='$BANK' AND (document_id='$did' OR document_id LIKE '$did-%');") observations_tagged=$(sql "SELECT count(*) FROM memory_units WHERE bank_id='$BANK' AND fact_type='observation' AND 'version:$tag' = ANY(tags);")"
+  echo "after: $(sql "SELECT 'units_tagged|'||(SELECT count(*) FROM memory_units WHERE bank_id=:'bank' AND 'docset:'||:'did' = ANY(tags))||' units_docidprefix|'||(SELECT count(*) FROM memory_units WHERE bank_id=:'bank' AND (document_id=:'did' OR document_id LIKE :'did'||'-%'))||' documents|'||(SELECT count(*) FROM documents WHERE bank_id=:'bank' AND (id=:'did' OR id LIKE :'did'||'-%'))||' chunks|'||(SELECT count(*) FROM chunks WHERE bank_id=:'bank' AND (document_id=:'did' OR document_id LIKE :'did'||'-%'))||' observations_tagged|'||(SELECT count(*) FROM memory_units WHERE bank_id=:'bank' AND fact_type='observation' AND 'version:'||:'tag' = ANY(tags));" "did=$did" "tag=$tag" "bank=$BANK")"
 }
 
 # -------------------------------------------------------------------- verify

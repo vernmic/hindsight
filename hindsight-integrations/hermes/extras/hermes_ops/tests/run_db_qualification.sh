@@ -80,29 +80,57 @@ mkdir -p "$WS/reports"
 [ -f "$WS/reports/gardener-control-20261007.json" ] || printf '{"enabled": false, "bank": "hermes-ops"}\n' > "$WS/reports/gardener-control-20261007.json"
 [ -f "$WS/reports/tagger-control-20261007.json" ] || printf '{"enabled": false, "bank": "hermes-ops"}\n' > "$WS/reports/tagger-control-20261007.json"
 
+relay_ok() {
+  # The Windows docker CLI is reached over the WSL interop relay, which wedges
+  # for seconds at a time ("UtilAcceptVsock ... accept4 failed 110"). Probe it
+  # before the suites so a flap is not reported as a test failure.
+  local attempt
+  for attempt in 1 2 3 4 5; do
+    "$DOCKER" exec "$NAME" /bin/true >/dev/null 2>&1 && return 0
+    sleep 5
+  done
+  return 1
+}
+relay_ok || { echo "FAIL: docker relay unavailable"; exit 9; }
+
+run_suite() {  # run_suite <pattern> <label> ; retries once on a relay flap only
+  local pattern="$1" label="$2" log="$TMP/$2.log" rc
+  env -i \
+    PATH="/usr/local/bin:/usr/bin:/bin" HOME="$TMP" \
+    HERMES_HOME="$HOME_DIR" HERMES_OPS_WORKSPACE="$WS" HERMES_OPS_REPORTS="$WS/reports" \
+    HERMES_OPS_BANK="hermes-ops" \
+    HERMES_OPS_TEST_DB="$NAME" HINDSIGHT_CONTAINER="$NAME" \
+    HINDSIGHT_DB="$DB" HINDSIGHT_DB_USER="$ROLE" HINDSIGHT_DB_HOST="127.0.0.1" \
+    HINDSIGHT_PG_BIN="/usr/lib/postgresql/18/bin/psql" HINDSIGHT_PG_LIB="/usr/lib/x86_64-linux-gnu" \
+    HINDSIGHT_DOCKER="$DOCKER" HINDSIGHT_PGPASSWORD="$PASS" \
+    PYTHONPATH="$OPS/scripts" TAG_QUEUE_STRICT=1 \
+    "$PY" -m unittest discover -s "$HERE" -t "$HERE" -p "$pattern" -v > "$log" 2>&1
+  rc=$?
+  cat "$log"
+  if [ "$rc" -ne 0 ] && grep -q "UtilAcceptVsock" "$log"; then
+    echo "== relay flap detected in $label; retrying once"
+    relay_ok || { echo "FAIL: docker relay unavailable on retry"; return 9; }
+    env -i \
+      PATH="/usr/local/bin:/usr/bin:/bin" HOME="$TMP" \
+      HERMES_HOME="$HOME_DIR" HERMES_OPS_WORKSPACE="$WS" HERMES_OPS_REPORTS="$WS/reports" \
+      HERMES_OPS_BANK="hermes-ops" \
+      HERMES_OPS_TEST_DB="$NAME" HINDSIGHT_CONTAINER="$NAME" \
+      HINDSIGHT_DB="$DB" HINDSIGHT_DB_USER="$ROLE" HINDSIGHT_DB_HOST="127.0.0.1" \
+      HINDSIGHT_PG_BIN="/usr/lib/postgresql/18/bin/psql" HINDSIGHT_PG_LIB="/usr/lib/x86_64-linux-gnu" \
+      HINDSIGHT_DOCKER="$DOCKER" HINDSIGHT_PGPASSWORD="$PASS" \
+      PYTHONPATH="$OPS/scripts" TAG_QUEUE_STRICT=1 \
+      "$PY" -m unittest discover -s "$HERE" -t "$HERE" -p "$pattern" -v > "$log.retry" 2>&1
+    rc=$?
+    cat "$log.retry"
+  fi
+  return "$rc"
+}
+
 echo "== run the two database suites"
 cd "$OPS" || exit 7
-env -i \
-  PATH="/usr/local/bin:/usr/bin:/bin" HOME="$TMP" \
-  HERMES_HOME="$HOME_DIR" HERMES_OPS_WORKSPACE="$WS" HERMES_OPS_REPORTS="$WS/reports" \
-  HERMES_OPS_BANK="hermes-ops" \
-  HERMES_OPS_TEST_DB="$NAME" HINDSIGHT_CONTAINER="$NAME" \
-  HINDSIGHT_DB="$DB" HINDSIGHT_DB_USER="$ROLE" HINDSIGHT_DB_HOST="127.0.0.1" \
-  HINDSIGHT_PG_BIN="/usr/lib/postgresql/18/bin/psql" HINDSIGHT_PG_LIB="/usr/lib/x86_64-linux-gnu" \
-  HINDSIGHT_DOCKER="$DOCKER" HINDSIGHT_PGPASSWORD="$PASS" \
-  PYTHONPATH="$OPS/scripts" TAG_QUEUE_STRICT=1 \
-  "$PY" -m unittest discover -s "$HERE" -t "$HERE" -p "test_gardener_writer.py" -v
+run_suite "test_gardener_writer.py" "writer"
 WRITER_RC=$?
-env -i \
-  PATH="/usr/local/bin:/usr/bin:/bin" HOME="$TMP" \
-  HERMES_HOME="$HOME_DIR" HERMES_OPS_WORKSPACE="$WS" HERMES_OPS_REPORTS="$WS/reports" \
-  HERMES_OPS_BANK="hermes-ops" \
-  HERMES_OPS_TEST_DB="$NAME" HINDSIGHT_CONTAINER="$NAME" \
-  HINDSIGHT_DB="$DB" HINDSIGHT_DB_USER="$ROLE" HINDSIGHT_DB_HOST="127.0.0.1" \
-  HINDSIGHT_PG_BIN="/usr/lib/postgresql/18/bin/psql" HINDSIGHT_PG_LIB="/usr/lib/x86_64-linux-gnu" \
-  HINDSIGHT_DOCKER="$DOCKER" HINDSIGHT_PGPASSWORD="$PASS" \
-  PYTHONPATH="$OPS/scripts" TAG_QUEUE_STRICT=1 \
-  "$PY" -m unittest discover -s "$HERE" -t "$HERE" -p "test_tag_queue.py" -v
+run_suite "test_tag_queue.py" "queue"
 QUEUE_RC=$?
 
 echo "== public rows after the run (must be untouched)"
