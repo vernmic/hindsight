@@ -25,11 +25,14 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-JOURNAL = Path("/mnt/i/hermes/reports/tag02-change-journal-20261007.json")
+import hermes_ops_config as config
+
+RUN_DIR = Path(config.reports_dir())
+JOURNAL = RUN_DIR / "tag02-change-journal.json"
 VERSION = "tag02-change-journal-v1"
 TASK_ID = "t_076f1993"
-AUDIT = "/mnt/i/hermes/reports/legacy-routing-audit-20261007.json"
-SNAPSHOT_DIR = "/mnt/i/hermes/backups/tag02-20261007"
+AUDIT = str(RUN_DIR / "legacy-routing-audit.json")
+SNAPSHOT_DIR = str(Path(config.workspace()) / "backups" / "tag02")
 
 # ---- C2: retain-takeaway.py lines 34-35 (drop the tags+content blob) --------
 C2_OLD = (
@@ -57,7 +60,7 @@ C2B_NEW = (
     "                return 4\n"
 )
 
-# ---- C3: /home/vern/.hermes/workspace/memory-index.md lines 10-15 (docs) ---
+# ---- C3: the operator's memory-index lines 10-15 (docs) ---
 C3_OLD = (
     "- kind:        decision | skill-distillation | research-finding | dream-observation |\n"
     "               gepa-outcome | preference | correction | cadence | goal | seed\n"
@@ -84,16 +87,16 @@ ITEMS = [
     {
         "id": "C2",
         "kind": "routing (intake gate)",
-        "path": "/home/vern/.hermes/scripts/retain-takeaway.py",
+        "path": config.hermes_home().as_posix() + "/scripts/retain-takeaway.py",
         "before_md5": "10658b9c3725fa3724a83d176141e793",
-        "bak": "/home/vern/.hermes/scripts/retain-takeaway.py.bak-20261007",
+        "bak": config.hermes_home().as_posix() + "/scripts/retain-takeaway.py.bak-20261007",
         "rollback": "journal revert, or copy the .bak back",
         "replacements": [(C2_OLD, C2_NEW)],
     },
     {
         "id": "C2b",
         "kind": "routing (intake gate, same class)",
-        "path": "/mnt/i/hermes/knowledge/index-extracts/index-part.py",
+        "path": config.workspace().as_posix() + "/knowledge/index-extracts/index-part.py",
         "before_md5": "74df7d853e76332a508c6430db3a5123",
         "bak": None,
         "rollback": "journal revert, or git checkout -- knowledge/index-extracts/index-part.py",
@@ -102,9 +105,9 @@ ITEMS = [
     {
         "id": "C3",
         "kind": "documentation (NOT routing)",
-        "path": "/home/vern/.hermes/workspace/memory-index.md",
+        "path": config.hermes_home().as_posix() + "/workspace/memory-index.md",
         "before_md5": "3845baae4b8022e326166f7f2f93e00f",
-        "bak": "/home/vern/.hermes/workspace/memory-index.md.bak-20261007",
+        "bak": config.hermes_home().as_posix() + "/workspace/memory-index.md.bak-20261007",
         "rollback": "journal revert, or copy the .bak back",
         "replacements": [(C3_OLD, C3_NEW)],
     },

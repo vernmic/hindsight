@@ -11,7 +11,7 @@ the implementation card's own acceptance receipt for:
   3. the separate off switch is present and wired (disabled = queue only),
   4. no code path mutates or prunes sources (static plus runtime assertions).
 
-Run: /home/vern/.hermes/hermes-agent/venv/bin/python scripts/verify_post_extraction_tag_queue.py
+Run: $HERMES_OPS_PYTHON scripts/verify_post_extraction_tag_queue.py
 """
 
 import asyncio

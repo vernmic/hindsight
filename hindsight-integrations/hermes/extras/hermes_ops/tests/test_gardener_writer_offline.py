@@ -38,7 +38,16 @@ def report(disposition, reason, **extra):
 
 class WriterTests(unittest.TestCase):
     def setUp(self):
-        self.env = patch.dict(os.environ, {"HERMES_OPS_BANK": BANK}, clear=False)
+        self.env = patch.dict(
+            os.environ,
+            {
+                "HERMES_OPS_BANK": BANK,
+                # explicit psql location: discovery would otherwise ask a container
+                "HINDSIGHT_PG_BIN": "/opt/pg/bin/psql",
+                "HINDSIGHT_PG_LIB": "/opt/pg/lib",
+            },
+            clear=False,
+        )
         self.env.start()
         self.addCleanup(self.env.stop)
 
@@ -63,6 +72,7 @@ class WriterTests(unittest.TestCase):
         self.assertEqual(rows, [{"ok": 1}])
         argv, kwargs = calls[0]
         self.assertIn("PGPASSWORD=temporary-secret", argv)
+        self.assertIn("LD_LIBRARY_PATH=/opt/pg/lib", argv)
         self.assertEqual(kwargs["input"], "SELECT 1;")
 
     def test_ddl_binds_the_configured_bank(self):

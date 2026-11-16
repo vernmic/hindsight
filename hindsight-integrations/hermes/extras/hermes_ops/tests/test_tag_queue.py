@@ -3,7 +3,7 @@
 Run cold (from any directory):
 
     (from the extras/hermes_ops directory, with the environment below)
-    /home/vern/.hermes/hermes-agent/venv/bin/python -m unittest test_tag_queue -v
+    $HERMES_OPS_PYTHON -m unittest test_tag_queue -v
 
 Prerequisites
   * Windows Docker Desktop with the hindsight-hindsight-1 container running:

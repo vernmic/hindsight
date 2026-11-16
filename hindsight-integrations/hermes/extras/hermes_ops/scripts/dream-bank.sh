@@ -23,7 +23,11 @@ HOME_DIR=${HERMES_HOME:-$HOME/.hermes}
 WORKSPACE=${HERMES_OPS_WORKSPACE:-$HOME_DIR/workspace}
 DOCKER=${HINDSIGHT_DOCKER:-$(command -v docker 2>/dev/null || echo docker)}
 CONTAINER=${HINDSIGHT_CONTAINER:-hindsight}
-PG_BIN_DIR=${HINDSIGHT_PG_BIN_DIR:-/home/hindsight/.pg0/installation/18.1.0/bin}
+PSQL_BIN=${HINDSIGHT_PG_BIN:-}
+PG_LIB=${HINDSIGHT_PG_LIB:-}
+DB_HOST=${HINDSIGHT_DB_HOST:-127.0.0.1}
+DB_USER=${HINDSIGHT_DB_USER:-hindsight}
+DB_NAME=${HINDSIGHT_DB:-hindsight}
 API=${HINDSIGHT_URL:-http://localhost:8888}
 LOG=${HERMES_OPS_DREAM_LOG:-$WORKSPACE/dream-bank-log.jsonl}
 DEST=${HERMES_OPS_BACKUP_DIR:-$WORKSPACE/backups}
@@ -51,10 +55,25 @@ refuse_bank() {
   fi
 }
 
+psql_discover() {
+  # No portable in-image psql path; ask the container once.
+  "$DOCKER" exec "$CONTAINER" sh -c 'command -v psql || ls -d /usr/lib/postgresql/*/bin/psql /home/*/.pg0/installation/*/bin/psql 2>/dev/null | tail -n 1' 2>/dev/null | tail -n 1
+}
+
 psql_sql() {
   refuse_bank "$1"
-  "$DOCKER" exec -i -e "PGPASSWORD=$HINDSIGHT_PGPASSWORD" "$CONTAINER" \
-    sh -c "PATH=$PG_BIN_DIR:\$PATH psql -U \${HINDSIGHT_DB_USER:-hindsight} -d \${HINDSIGHT_DB:-hindsight} -v ON_ERROR_STOP=1 -q -At"
+  if [ -z "$PSQL_BIN" ]; then
+    PSQL_BIN="$(psql_discover)"
+  fi
+  if [ -z "$PSQL_BIN" ]; then
+    echo "dream-bank: aborted: psql not found in $CONTAINER; set HINDSIGHT_PG_BIN" >&2
+    return 1
+  fi
+  [ -n "$PG_LIB" ] || { case "$PSQL_BIN" in */bin/psql) PG_LIB="${PSQL_BIN%/bin/psql}/lib" ;; esac; }
+  local args=(-i -e "PGPASSWORD=$HINDSIGHT_PGPASSWORD")
+  [ -n "$PG_LIB" ] && args+=(-e "LD_LIBRARY_PATH=$PG_LIB")
+  "$DOCKER" exec "${args[@]}" "$CONTAINER" "$PSQL_BIN" \
+    -h "$DB_HOST" -U "$DB_USER" -d "$DB_NAME" -v ON_ERROR_STOP=1 -q -At
 }
 
 victim_setup() {

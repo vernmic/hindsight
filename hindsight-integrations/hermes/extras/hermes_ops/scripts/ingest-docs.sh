@@ -72,12 +72,23 @@ fi
 case "$BANK" in
   main|openclaw) echo "ingest-docs: aborted: protected bank refused" >&2; exit 1 ;;
 esac
+# Same shape hermes_ops_config.BANK_PATTERN enforces: no quotes, no shell
+# metacharacters, so a bank name can never change the SQL it is bound into.
+if ! printf '%s' "$BANK" | grep -Eq '^[A-Za-z][A-Za-z0-9_.-]{0,62}$'; then
+  echo "ingest-docs: aborted: bank name must match ^[A-Za-z][A-Za-z0-9_.-]{0,62}$" >&2
+  exit 1
+fi
 HINDSIGHT_URL="${HINDSIGHT_URL:-http://localhost:8888}"
 PY=${HERMES_OPS_INGEST_PY:-$WORKSPACE/scripts/ingest-docs.py}
 BACKUP_DIR=${HERMES_OPS_BACKUP_DIR:-$WORKSPACE/backups}
 LOG="$BACKUP_DIR/ingest-docs.log"
 DKR_WIN=${HINDSIGHT_DOCKER:-$(command -v docker 2>/dev/null || echo docker)}
-PG_VERSION_DIR=${HINDSIGHT_PG_BIN_DIR:-/home/hindsight/.pg0/installation/18.1.0/bin}
+# Database identity is an explicit deployment setting, exactly as it is for the
+# Python writer. The generic values name the Hindsight compose service and its
+# own image role; override them when your deployment renamed either.
+DB_HOST=${HINDSIGHT_DB_HOST:-127.0.0.1}
+DB_USER=${HINDSIGHT_DB_USER:-hindsight}
+DB_NAME=${HINDSIGHT_DB:-hindsight}
 
 # Verify gates (kanban t_9bfe1701 item d). ratios are percent of the parse.
 MIN_UNIT_RATIO=80      # retained raw units >= 80% of parsed chunk items
@@ -98,12 +109,29 @@ container_for_url() {
 DKR="$(docker_cli || true)"
 CT="$(container_for_url)"
 
-PSQL_BIN="PATH=$PG_VERSION_DIR:\$PATH psql -U hindsight -d hindsight -A -F\"|\" -t"
-sql() {  # sql "<one-line sql>" ; prints rows or empty on failure
+psql_discover() {
+  # No portable in-image psql path: the packaged image keeps it under its pg0
+  # installation, others put it on PATH. Best effort; an empty result aborts.
+  "$DKR" exec "$CT" sh -c 'command -v psql || ls -d /usr/lib/postgresql/*/bin/psql /home/*/.pg0/installation/*/bin/psql 2>/dev/null | tail -n 1' 2>/dev/null | tail -n 1
+}
+PSQL_BIN=${HINDSIGHT_PG_BIN:-}
+PG_LIB=${HINDSIGHT_PG_LIB:-}
+if [ -z "$PSQL_BIN" ] && [ -n "$DKR" ]; then
+  PSQL_BIN="$(psql_discover)"
+fi
+if [ -z "$PSQL_BIN" ] && [ "$MODE" != "list" ] && [ -n "${VERSION_TAG:-}" ]; then
+  echo "ingest-docs: aborted: psql not found in $CT; set HINDSIGHT_PG_BIN" >&2
+  exit 1
+fi
+[ -n "$PG_LIB" ] || { case "$PSQL_BIN" in */bin/psql) PG_LIB="${PSQL_BIN%/bin/psql}/lib" ;; esac; }
+
+sql() {  # statement arrives on stdin: argv only, no shell re-expansion
   [ -n "$DKR" ] || { echo "NO_DOCKER"; return 1; }
   : "${HINDSIGHT_PGPASSWORD:?HINDSIGHT_PGPASSWORD must be set}"
-  "$DKR" exec -i -e "PGPASSWORD=$HINDSIGHT_PGPASSWORD" -e SQL_TEXT="$1" "$CT" \
-    sh -c "$PSQL_BIN -c \"\$SQL_TEXT\"" 2>&1
+  local args=(-i -e "PGPASSWORD=$HINDSIGHT_PGPASSWORD")
+  [ -n "$PG_LIB" ] && args+=(-e "LD_LIBRARY_PATH=$PG_LIB")
+  printf '%s\n' "$1" | "$DKR" exec "${args[@]}" "$CT" "$PSQL_BIN" \
+    -h "$DB_HOST" -U "$DB_USER" -d "$DB_NAME" -v ON_ERROR_STOP=1 -A -F'|' -t -f - 2>&1
 }
 
 mkdir -p "$BACKUP_DIR"

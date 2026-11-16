@@ -21,6 +21,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -36,15 +37,14 @@ URL_ENV = "HINDSIGHT_URL"
 ALERT_ENV = "ALERT_TARGET"
 DASHBOARD_ENV = "HERMES_DASHBOARD_URL"
 
-# Hindsight's own image defaults: database name and role, the in-container
-# listener and the embedded pg0 installation. These describe the server image,
-# not one deployment.
+# Generic server defaults. database/role/container name the Hindsight compose
+# service and its image's own role, and are overridable so a deployment that
+# renamed them still works; the psql location is discovered rather than pinned.
+# Nothing here names a host, a path outside the image or a bank.
 DEFAULT_DB = "hindsight"
 DEFAULT_DB_USER = "hindsight"
 DEFAULT_DB_HOST = "127.0.0.1"
 DEFAULT_CONTAINER = "hindsight"
-DEFAULT_PG_BIN = "/home/hindsight/.pg0/installation/18.1.0/bin/psql"
-DEFAULT_PG_LIB = "/home/hindsight/.pg0/installation/18.1.0/lib"
 DEFAULT_API = "http://localhost:8888"
 DEFAULT_DASHBOARD = "http://127.0.0.1:9119"
 
@@ -128,7 +128,17 @@ def reports_dir(workspace_root=None, explicit=None):
 
 
 def policy_path():
-    return Path(__file__).resolve().parent / "extraction-policy.json"
+    """The maintained policy file.
+
+    A synced install puts the scripts under <workspace>/scripts and the data
+    files beside them at <workspace>/, so both locations are part of the
+    declared contract; the package root wins when both exist.
+    """
+    scripts = Path(__file__).resolve().parent
+    for candidate in (scripts.parent / "extraction-policy.json", scripts / "extraction-policy.json"):
+        if candidate.is_file():
+            return candidate
+    return scripts.parent / "extraction-policy.json"
 
 
 def _policy_bank():
@@ -220,14 +230,65 @@ def database_host(explicit=None):
     return flag or DEFAULT_DB_HOST
 
 
+_PSQL_DISCOVERY = {}
+
+
+def _discover_psql(explicit=None):
+    """Ask the container where psql is, once per process.
+
+    There is no portable in-image path: the packaged image keeps psql under its
+    pg0 installation, others put it on PATH. Discovery is best-effort and cached;
+    a wrong or missing result surfaces as a failing psql call, never as a query
+    against a different server.
+    """
+    if "value" in _PSQL_DISCOVERY:
+        return _PSQL_DISCOVERY["value"]
+    found = None
+    try:
+        probe = subprocess.run(
+            [
+                docker(explicit),
+                "exec",
+                container(explicit),
+                "sh",
+                "-c",
+                "command -v psql || ls -d /usr/lib/postgresql/*/bin/psql "
+                "/home/*/.pg0/installation/*/bin/psql 2>/dev/null | tail -n 1",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        if probe.returncode == 0 and probe.stdout.strip():
+            candidate = probe.stdout.strip().splitlines()[-1].strip()
+            if candidate.startswith("/"):
+                found = candidate
+    except (OSError, subprocess.SubprocessError):
+        found = None
+    _PSQL_DISCOVERY["value"] = found
+    return found
+
+
 def psql_bin(explicit=None):
     flag = _flag(explicit, "psql_bin") or _env("HINDSIGHT_PG_BIN")
-    return flag or DEFAULT_PG_BIN
+    if flag:
+        return flag
+    return _discover_psql(explicit) or "psql"
 
 
 def psql_lib(explicit=None):
+    """The library directory for an in-image psql, when one is needed.
+
+    Explicit setting wins; otherwise a psql under <prefix>/bin/psql implies
+    <prefix>/lib. An empty result means no LD_LIBRARY_PATH is passed at all.
+    """
     flag = _flag(explicit, "psql_lib") or _env("HINDSIGHT_PG_LIB")
-    return flag or DEFAULT_PG_LIB
+    if flag:
+        return flag
+    binary = psql_bin(explicit)
+    if binary.endswith("/bin/psql"):
+        return str(Path(binary).parent.parent / "lib")
+    return ""
 
 
 def pg_password():
@@ -244,14 +305,11 @@ def psql_argv(explicit=None):
     Shared by the reader and the writer so the command is built once. Values are
     passed as argv elements; nothing is interpolated into a shell string.
     """
-    return [
-        docker(explicit),
-        "exec",
-        "-i",
-        "-e",
-        "PGPASSWORD",  # replaced by psql_command()
-        "-e",
-        "LD_LIBRARY_PATH=" + psql_lib(explicit),
+    argv = [docker(explicit), "exec", "-i", "-e", "PGPASSWORD"]  # value set by psql_command()
+    library = psql_lib(explicit)
+    if library:
+        argv += ["-e", "LD_LIBRARY_PATH=" + library]
+    return argv + [
         container(explicit),
         psql_bin(explicit),
         "-h",
