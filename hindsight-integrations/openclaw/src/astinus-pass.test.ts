@@ -217,6 +217,28 @@ describe("package 31: incarnation attribution and terminal reservations", () => 
     closeAllLedgers();
   };
 
+  it("turn_middle proposals stay inside the window, so retirement does not churn", async () => {
+    // 8 turns at seqs 3t+1..3t+3; window starts at seq 13; age 2 => turns ending at 3..18 are old.
+    const { payload, ledger } = setup(8);
+    const run = (n: number) =>
+      runPass(
+        { ...payload, providers, window_first_seq: 13, turn_middle_age_turns: 2 },
+        { fetch: ok() as never, now: () => 3_000_000 + n * 200_000 }
+      );
+    expect(await run(1)).toBe("ok");
+    expect(await run(2)).toBe("ok");
+    const db = ledger();
+    const below = db
+      .prepare("SELECT count(*) AS c FROM marks WHERE applied_at IS NULL AND seq_end < 13")
+      .get() as { c: number };
+    const inside = db
+      .prepare("SELECT seq_start FROM marks WHERE seq_end >= 13 ORDER BY seq_start")
+      .all() as Array<{ seq_start: number }>;
+    db.close();
+    expect(below.c).toBe(0);
+    expect(inside.map((m) => m.seq_start)).toEqual([13, 16]);
+  });
+
   it("R28b.1: reused coordinates classify the payload's own incarnation only", async () => {
     const { payload, dbPath, ledger } = setup(10);
     otherTurn(dbPath, 28); // same [28,30] as SID's newest turn
