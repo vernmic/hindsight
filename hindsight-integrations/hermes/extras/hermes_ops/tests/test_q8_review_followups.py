@@ -139,6 +139,84 @@ class ClaimFencingTests(unittest.TestCase):
         self.assertEqual(len(self.queue.entries(state="in_flight")), 1)
 
 
+class UnclaimedTransitionTests(ClaimFencingTests):
+    """R03 review F1: no unconditional unclaimed transition may clobber a claim."""
+
+    def test_unclaimed_transition_on_a_pending_row_is_state_conditional(self):
+        """A maintenance transition is allowed, but only against the observed state."""
+        entry = self.queue.enqueue(entry_row(), origin="test")
+        self.assertTrue(self.queue.mark(entry["key"], "done", reason="no-claim"))
+        self.assertEqual(self.queue.get(entry["key"])["state"], "done")
+        self.assertFalse(
+            self.queue.mark(entry["key"], "done", reason="again", expect_state="pending"),
+            "a stale expectation must lose even when the target state matches",
+        )
+
+    def test_unclaimed_transition_cannot_clear_an_active_claim(self):
+        entry = self.queue.enqueue(entry_row(), origin="test")
+        self.queue.acquire(run_id="run-1", pid=os.getpid())
+        for expected in (None, "in_flight", "held"):
+            with self.subTest(expect_state=expected):
+                self.assertFalse(
+                    self.queue.mark(entry["key"], "held", reason="x", expect_state=expected)
+                )
+        row = self.queue.get(entry["key"])
+        self.assertEqual(row["state"], "in_flight")
+        self.assertEqual(row["claim_run"], "run-1")
+        self.assertEqual(list(self.queue.db.execute("SELECT * FROM queue_history")), [])
+
+    def test_maintenance_cas_requires_the_expected_state(self):
+        entry = self.queue.enqueue(entry_row(), origin="test")
+        self.queue.mark(entry["key"], "held", reason="judge_unavailable_timeout", claim=None, expect_state="pending")
+        self.assertTrue(self.queue.mark(entry["key"], "pending", reason="req", expect_state="held"))
+        self.assertFalse(self.queue.mark(entry["key"], "pending", reason="req", expect_state="held"))
+
+    def test_late_maintenance_loses_after_release_and_reclaim(self):
+        entry = self.queue.enqueue(entry_row(), origin="test")
+        first = self.queue.acquire(run_id="run-1", pid=424242)[0]
+        old_at = self.stale(first)
+        self.queue._release_claim(entry["key"], first["claim_pid"], old_at)
+        second = self.queue.acquire(run_id="run-2", pid=os.getpid())[0]
+        self.assertEqual(second["claim_run"], "run-2")
+        self.assertFalse(self.queue.mark(entry["key"], "pending", reason="stale-sweep", expect_state="held"))
+        row = self.queue.get(entry["key"])
+        self.assertEqual(row["state"], "in_flight")
+        self.assertEqual(row["claim_run"], "run-2")
+        reasons = [row[0] for row in self.queue.db.execute("SELECT reason FROM queue_history")]
+        self.assertNotIn("stale-sweep", reasons)
+
+    def test_late_violation_override_cannot_clobber_a_reclaimed_row(self):
+        """The terminal override must be owned by the run that finished the row."""
+        entry = self.queue.enqueue(entry_row(), origin="test")
+        claimed = self.queue.acquire(run_id="run-1", pid=os.getpid())[0]
+        self.assertTrue(self.queue.mark(entry["key"], "done", reason="tagged", run_id="run-1", claim=claimed))
+        # a later identity cycle re-queues and another run takes the row
+        self.queue.mark(entry["key"], "pending", reason="requeued-by-class", expect_state="done")
+        self.assertEqual(self.queue.acquire(run_id="run-2", pid=os.getpid())[0]["claim_run"], "run-2")
+        self.assertFalse(
+            self.queue.mark(
+                entry["key"], "violation", reason="source-immutability", run_id="run-1",
+                expect_state="done", expect_run="run-1",
+            )
+        )
+        row = self.queue.get(entry["key"])
+        self.assertEqual(row["state"], "in_flight")
+        self.assertEqual(row["claim_run"], "run-2")
+        self.assertNotIn("violation", [r[0] for r in self.queue.db.execute("SELECT state FROM queue")])
+
+    def test_violation_override_applies_to_its_own_run(self):
+        entry = self.queue.enqueue(entry_row(), origin="test")
+        claimed = self.queue.acquire(run_id="run-1", pid=os.getpid())[0]
+        self.assertTrue(self.queue.mark(entry["key"], "done", reason="tagged", run_id="run-1", claim=claimed))
+        self.assertTrue(
+            self.queue.mark(
+                entry["key"], "violation", reason="source-immutability", run_id="run-1",
+                expect_state="done", expect_run="run-1",
+            )
+        )
+        self.assertEqual(self.queue.get(entry["key"])["state"], "violation")
+
+
 class IngestShellTests(unittest.TestCase):
     """F1/F2: configured psql argv, SQL on stdin, bank refusal."""
 
@@ -210,6 +288,57 @@ class IngestShellTests(unittest.TestCase):
             result = self.run_list(HERMES_OPS_BANK=name)
             self.assertNotEqual(result.returncode, 0, name)
             self.assertIn("protected bank refused", result.stderr)
+
+
+class IngestVersionTagTests(IngestShellTests):
+    """R03 review F2: a version tag is data, never SQL text."""
+
+    def run_mode(self, *args, **overrides):
+        env = dict(self.env)
+        env.update(overrides)
+        return subprocess.run(
+            ["/bin/bash", str(SCRIPTS / "ingest-docs.sh"), *args],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+
+    def test_supported_version_tag_is_accepted_and_bound(self):
+        result = self.run_mode("--purge", "v2026.9.24")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        argv = self.calls.read_text()
+        self.assertIn("-v tag=v2026.9.24", argv)
+        self.assertIn("-v did=hermes-agent-docs-v2026.9.24", argv)
+        self.assertIn("-v bank=" + BANK, argv)
+        stdin = self.stdin.read_text()
+        self.assertIn(":'did'", stdin)
+        self.assertIn(":'tag'", stdin)
+        self.assertNotIn("v2026.9.24", stdin, "the tag value must travel as a binding, not as SQL text")
+
+    def test_malicious_version_tags_are_refused_before_any_query(self):
+        payloads = [
+            "v1'; DROP TABLE memory_units; --",
+            "v1' OR '1'='1",
+            "v1$(id)",
+            "v1`id`",
+            "v1 2",
+            "v1; DELETE FROM documents",
+        ]
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                result = self.run_mode("--purge", payload)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("version tag must match", result.stderr)
+                self.assertFalse(
+                    self.calls.exists() and self.calls.read_text().strip(),
+                    "no query may be issued for %r" % payload,
+                )
+
+    def test_force_path_is_guarded_too(self):
+        result = self.run_mode("--force", "v1'--")
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse(self.calls.exists() and self.calls.read_text().strip())
 
 
 class PolicyResolutionTests(unittest.TestCase):

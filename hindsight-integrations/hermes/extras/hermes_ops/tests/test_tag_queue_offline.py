@@ -102,8 +102,12 @@ class ClaimTests(QueueCase):
 
     def test_mark_clears_the_claim_and_records_history(self):
         entry = self.hash()
-        self.queue.acquire(run_id="run-1", pid=1)
-        self.queue.mark(entry["key"], "held", reason="judge_unavailable_timeout", bump_attempts=True)
+        claimed = self.queue.acquire(run_id="run-1", pid=os.getpid())[0]
+        self.assertTrue(
+            self.queue.mark(
+                entry["key"], "held", reason="judge_unavailable_timeout", bump_attempts=True, claim=claimed
+            )
+        )
         row_after = self.queue.get(entry["key"])
         self.assertEqual(row_after["state"], "held")
         self.assertIsNone(row_after["claim_pid"])
@@ -113,24 +117,28 @@ class ClaimTests(QueueCase):
 
 
 class TerminalTests(QueueCase):
-    def test_terminal_entry_is_not_requeued_under_the_same_identity(self):
+    def finish(self, state="done", reason="tagged"):
+        """Complete a row the way a worker does: acquire, then mark with the claim."""
         entry = self.hash()
-        self.queue.mark(entry["key"], "done", reason="tagged")
+        claimed = self.queue.acquire(run_id="run-1", pid=os.getpid())[0]
+        self.assertTrue(self.queue.mark(entry["key"], state, reason=reason, run_id="run-1", claim=claimed))
+        return entry
+
+    def test_terminal_entry_is_not_requeued_under_the_same_identity(self):
+        entry = self.finish()
         again = self.hash()
         self.assertFalse(again["enqueued"])
         self.assertEqual(again["key"], entry["key"])
 
     def test_changed_unit_is_queued_again_after_a_terminal_state(self):
         """A rewritten fact must not be stranded just because its old identity finished."""
-        entry = self.hash()
-        self.queue.mark(entry["key"], "done", reason="tagged")
+        entry = self.finish()
         changed = self.hash(text="the fact was rewritten with new content")
         self.assertTrue(changed["enqueued"])
         self.assertNotEqual(changed["key"], entry["key"])
 
     def test_completion_requires_a_new_identity_after_terminal(self):
-        entry = self.hash()
-        self.queue.mark(entry["key"], "no_op", reason="no-label-change")
+        self.finish(state="no_op", reason="no-label-change")
         other = self.hash(unit="33333333-3333-3333-3333-333333333333")
         self.assertTrue(other["enqueued"])
 
@@ -138,9 +146,16 @@ class TerminalTests(QueueCase):
 class RequeueTests(QueueCase):
     def held(self, reason, attempts, age_hours):
         entry = self.hash(unit=str(uuid.uuid4()))
-        self.queue.mark(entry["key"], "held", reason=reason, bump_attempts=True)
-        for _ in range(max(0, attempts - 1)):
-            self.queue.mark(entry["key"], "held", reason=reason, bump_attempts=True)
+        for attempt in range(max(1, attempts)):
+            if attempt:
+                # the maintenance requeue a retry follows, then a fresh claim
+                self.queue.mark(entry["key"], "pending", reason="requeued-by-class", expect_state="held")
+            claimed = self.queue.acquire(run_id="run-1", pid=os.getpid())
+            if not claimed:
+                break
+            self.queue.mark(
+                entry["key"], "held", reason=reason, run_id="run-1", bump_attempts=True, claim=claimed[0]
+            )
         stamp = (
             datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=age_hours)
         ).isoformat()
