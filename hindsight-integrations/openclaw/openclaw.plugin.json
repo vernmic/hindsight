@@ -325,7 +325,10 @@
               "type": "string"
             },
             "apiKey": {
-              "type": "string"
+              "type": [
+                "string",
+                "object"
+              ]
             },
             "extra": {
               "type": "object"
