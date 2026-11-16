@@ -1,4 +1,4 @@
-"""Durable post-extraction fact/version tagging queue for the hermes-ops bank.
+"""Durable post-extraction fact/version tagging queue for the configured bank.
 
 Runs immediately after ACTUAL extraction completion: completed retain /
 batch_retain operations are reconciled to the stored units they produced,
@@ -33,30 +33,49 @@ import datetime
 import hashlib
 import importlib.util
 import json
+import os
 import sqlite3
 import sys
+import time
 import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import gardener_batch_v7 as worker
 import gardener_writer as writer
+import hermes_ops_config as config
+import tagger_fallback
+import tagger_ledger
 
-BANK = "hermes-ops"
-EXCLUDED_BANKS = {"main", "openclaw"}
-ROOT = Path("/mnt/i/hermes")
-QUEUE_DIR = ROOT / "reports/tag-queue-20261007"
+EXCLUDED_BANKS = config.REFUSED_BANKS
+REPORTS = config.reports_dir()
+QUEUE_DIR = Path(os.environ.get("HERMES_OPS_QUEUE_DIR") or REPORTS / "tag-queue")
 QUEUE_DB = QUEUE_DIR / "queue.sqlite"
 JOURNAL_DB = QUEUE_DIR / "judge.sqlite"
 TELEMETRY = QUEUE_DIR / "telemetry.jsonl"
-CONTROL = ROOT / "reports/tagger-control-20261007.json"
+CONTROL = Path(os.environ.get("HERMES_OPS_TAGGER_CONTROL") or REPORTS / "tagger-control.json")
+
+
+def bank():
+    """The configured garden bank; the queue never addresses another."""
+    return config.bank()
+
+
+def b():
+    """The configured bank as a bound SQL literal."""
+    return config.quote(config.bank())
+
+
 ADDITIVE = ("KEEP", "RESCUE")
 PAGE_LIMIT = 100
 WINDOW_MINUTES = 2
 
-SCHEMA = (
-    """CREATE TABLE IF NOT EXISTS queue (
- key TEXT PRIMARY KEY, bank TEXT NOT NULL CHECK(bank='hermes-ops'),
+
+def schema():
+    bound = b()
+    return (
+    f"""CREATE TABLE IF NOT EXISTS queue (
+ key TEXT PRIMARY KEY, bank TEXT NOT NULL CHECK(bank={bound}),
  unit_id TEXT NOT NULL, text_hash TEXT NOT NULL, document_id TEXT, chunk_id TEXT,
  source_signature TEXT NOT NULL, unit_version TEXT NOT NULL, policy_version TEXT NOT NULL,
  origin TEXT NOT NULL, completion_key TEXT, cursor TEXT NOT NULL,
@@ -68,7 +87,7 @@ SCHEMA = (
  completion_key TEXT PRIMARY KEY, bank TEXT NOT NULL, origin TEXT NOT NULL, document_id TEXT,
  declared INTEGER, found INTEGER, units INTEGER NOT NULL, processed_at TEXT NOT NULL)""",
     "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
-)
+    )
 
 
 def now():
@@ -100,13 +119,13 @@ def source_signature(row):
 
 
 def identity(row, version=None):
-    """The full dedup identity. Refuses any bank that is not hermes-ops."""
-    if row.get("bank_id") != BANK:
+    """The full dedup identity. Refuses any bank but the configured one."""
+    if row.get("bank_id") != bank():
         raise ValueError("Bank refused")
     unit_id = str(uuid.UUID(str(row["id"])))
     snapshot = row.get("snapshot_version", row.get("unit_version"))
     parts = {
-        "bank": BANK,
+        "bank": bank(),
         "unit_id": unit_id,
         "text_hash": text_hash(row.get("text")),
         "source_signature": source_signature(row),
@@ -132,24 +151,134 @@ def enabled(control=None):
 def set_enabled(on, control=None):
     path = Path(control or CONTROL)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"enabled": bool(on), "bank": BANK, "updated_at": now()}, indent=2))
+    path.write_text(json.dumps({"enabled": bool(on), "bank": bank(), "updated_at": now()}, indent=2))
     return enabled(path)
+
+
+REQUEUE_POLICY = {"judge_unavailable": (3, 6), "TypeError": (2, 1), "ValueError": (2, 1), "parse": (2, 2)}
+REQUEUE_ATTEMPT_CAP = int(os.environ.get("HERMES_OPS_REQUEUE_ATTEMPT_CAP") or 4)
+TERMINAL_STATES = ("done", "no_op", "dup_resolved", "pruned", "blocked", "superseded", "absent")
+TERMINAL_ROW_STATES = ("done", "no_op", "dup_resolved", "pruned", "absent")
+
+
+def pid_alive(pid):
+    """WSL-safe liveness check without psutil.
+
+    PermissionError still means the process exists under another user; only
+    ProcessLookupError (or an unusable pid) is dead.
+    """
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except PermissionError:
+        return True
+    except (ProcessLookupError, ValueError, TypeError):
+        return False
+
+
+def requeue_held(queue, now_iso=None):
+    """Return eligible held failures to pending with class-scoped backoff.
+
+    Entries past their class cap go to blocked. Returns a receipt dict.
+    """
+    now = datetime.datetime.fromisoformat(now_iso) if now_iso else datetime.datetime.now(datetime.timezone.utc)
+
+    def policy_for(reason):
+        for prefix, (cap, base_h) in REQUEUE_POLICY.items():
+            if reason and reason.startswith(prefix):
+                return (cap, base_h)
+        return (REQUEUE_ATTEMPT_CAP, 6)
+
+    held = queue.entries(state="held")
+    receipt = {"candidates": len(held), "requeued": 0, "blocked": 0, "kept": 0}
+    for entry in held:
+        reason = entry.get("reason") or ""
+        cap, base_h = policy_for(reason)
+        attempts = entry.get("attempts") or 0
+        updated = entry.get("updated_at")
+        if attempts >= cap:
+            queue.mark(entry["key"], "blocked", reason="attempts-exhausted:" + reason, bump_attempts=False)
+            receipt["blocked"] += 1
+            continue
+        age_h = 0.0
+        if updated:
+            try:
+                then = datetime.datetime.fromisoformat(updated)
+                if then.tzinfo is None:
+                    then = then.replace(tzinfo=datetime.timezone.utc)
+                age_h = (now - then).total_seconds() / 3600
+            except ValueError:
+                age_h = 0.0
+        need_h = base_h * 2 ** max(0, attempts - 1)
+        if age_h >= need_h:
+            queue.mark(entry["key"], "pending", reason="requeued-by-class", bump_attempts=False)
+            receipt["requeued"] += 1
+        else:
+            receipt["kept"] += 1
+    return receipt
 
 
 # --------------------------------------------------------------------------- queue
 
 
 class Queue:
+    """Durable queue with transactional claims, terminal states and history."""
+
+    CLAIM_STALE_SECONDS = 30 * 60
+
     def __init__(self, path=QUEUE_DB):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(str(path), timeout=30)
+        self.db_path = str(path)
+        self.db = sqlite3.connect(str(path), timeout=30, isolation_level="IMMEDIATE")
         self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA journal_mode=WAL")
+        deadline = time.monotonic() + 30.0
+        while True:
+            try:
+                self.db.execute("PRAGMA journal_mode=WAL")
+                break
+            except sqlite3.OperationalError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.05)
         self.db.execute("PRAGMA busy_timeout=30000")
-        for statement in SCHEMA:
-            self.db.execute(statement)
-        self.db.commit()
+        deadline = time.monotonic() + 30.0
+        while True:
+            try:
+                self.db.execute("BEGIN IMMEDIATE")
+                for statement in schema():
+                    self.db.execute(statement)
+                self._ensure_claim_columns()
+                self.db.commit()
+                break
+            except sqlite3.OperationalError:
+                self.db.rollback()
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.05)
+
+    def _ensure_claim_columns(self):
+        """in_flight state plus claim metadata (owner pid, claim time, run id).
+
+        Idempotent migration: an existing queue.sqlite predates claiming.
+        """
+        cols = {row["name"] for row in self.db.execute("PRAGMA table_info(queue)").fetchall()}
+        additions = []
+        if "claim_pid" not in cols:
+            additions.append("ALTER TABLE queue ADD COLUMN claim_pid INTEGER")
+        if "claim_at" not in cols:
+            additions.append("ALTER TABLE queue ADD COLUMN claim_at TEXT")
+        if "claim_run" not in cols:
+            additions.append("ALTER TABLE queue ADD COLUMN claim_run TEXT")
+        if additions:
+            with self.db:
+                for stmt in additions:
+                    self.db.execute(stmt)
+        with self.db:
+            self.db.execute(
+                "CREATE TABLE IF NOT EXISTS queue_history (key TEXT NOT NULL, from_state TEXT,"
+                " to_state TEXT NOT NULL, reason TEXT, run_id TEXT, attempts INTEGER, at TEXT NOT NULL)"
+            )
 
     def close(self):
         self.db.close()
@@ -168,6 +297,13 @@ class Queue:
         record = identity(row, version)
         if self.db.execute("SELECT 1 FROM queue WHERE key=?", (record["key"],)).fetchone():
             return dict(record, enqueued=False)
+        marks = ",".join("?" for _ in TERMINAL_ROW_STATES)
+        terminal = self.db.execute(
+            "SELECT 1 FROM queue WHERE unit_id=? AND state IN (%s) LIMIT 1" % marks,
+            (record["unit_id"], *TERMINAL_ROW_STATES),
+        ).fetchone()
+        if terminal:
+            return dict(record, enqueued=False, skipped_terminal=True)
         stamp = now()
         with self.db:
             self.db.execute(
@@ -176,7 +312,7 @@ class Queue:
                 "state,reason,attempts,enqueued_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     record["key"],
-                    BANK,
+                    bank(),
                     record["unit_id"],
                     record["text_hash"],
                     row.get("document_id"),
@@ -203,6 +339,59 @@ class Queue:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def acquire(self, cursor="new", limit=PAGE_LIMIT, run_id=None, pid=None):
+        """Transactional claim: pending rows move to in_flight stamped with the owner.
+
+        Stale claims (older than CLAIM_STALE_SECONDS with a dead or absent owner
+        pid) revert to pending first, which recovers a crashed drain without
+        losing an attempt. A row owned by a live pid is never taken.
+        """
+        pid = pid if pid is not None else os.getpid()
+        self._release_stale_claims()
+        limit = min(max(1, limit), PAGE_LIMIT)
+        with self.db:
+            rows = self.db.execute(
+                "SELECT key FROM queue WHERE state=? AND cursor=? ORDER BY enqueued_at,key LIMIT ?",
+                ("pending", cursor, limit),
+            ).fetchall()
+            keys = [row["key"] for row in rows]
+            if not keys:
+                return []
+            marks = ",".join("?" for _ in keys)
+            self.db.execute(
+                "UPDATE queue SET state='in_flight',claim_pid=?,claim_at=?,claim_run=?,"
+                "run_id=COALESCE(?,run_id),updated_at=? WHERE key IN (%s) AND state='pending'" % marks,
+                (pid, now(), run_id, run_id, now(), *keys),
+            )
+        claimed = self.db.execute(
+            "SELECT * FROM queue WHERE state='in_flight' AND claim_pid=? AND claim_run=?", (pid, run_id)
+        ).fetchall()
+        return [dict(row) for row in claimed]
+
+    def _release_stale_claims(self):
+        cutoff = (
+            datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=self.CLAIM_STALE_SECONDS)
+        ).isoformat()
+        stale = self.db.execute(
+            "SELECT key,claim_pid FROM queue WHERE state='in_flight' AND claim_at < ?", (cutoff,)
+        ).fetchall()
+        for row in stale:
+            if row["claim_pid"] and pid_alive(row["claim_pid"]):
+                continue
+            with self.db:
+                self.db.execute(
+                    "UPDATE queue SET state='pending',claim_pid=NULL,claim_at=NULL,claim_run=NULL,"
+                    "updated_at=? WHERE key=? AND state='in_flight'",
+                    (now(), row["key"]),
+                )
+                self._history(row["key"], "in_flight", "pending", "stale-claim-released")
+
+    def _history(self, key, from_state, to_state, reason=None, run_id=None, attempts=None):
+        self.db.execute(
+            "INSERT INTO queue_history VALUES (?,?,?,?,?,?,?)",
+            (key, from_state, to_state, reason, run_id, attempts, now()),
+        )
+
     def entries(self, state=None, cursor=None, limit=100000):
         sql = "SELECT * FROM queue WHERE 1=1"
         params = []
@@ -222,11 +411,15 @@ class Queue:
 
     def mark(self, key, state, reason=None, run_id=None, bump_attempts=False):
         with self.db:
+            prior = self.db.execute("SELECT state,attempts FROM queue WHERE key=?", (key,)).fetchone()
             self.db.execute(
                 "UPDATE queue SET state=?,reason=?,run_id=COALESCE(?,run_id),"
-                "attempts=attempts+(CASE WHEN ? THEN 1 ELSE 0 END),updated_at=? WHERE key=?",
+                "attempts=attempts+(CASE WHEN ? THEN 1 ELSE 0 END),updated_at=?,"
+                "claim_pid=NULL,claim_at=NULL,claim_run=NULL WHERE key=?",
                 (state, reason, run_id, 1 if bump_attempts else 0, now(), key),
             )
+            if prior and prior["state"] != state:
+                self._history(key, prior["state"], state, reason, run_id, prior["attempts"])
 
     def counts(self):
         rows = self.db.execute("SELECT state,cursor,count(*) AS n FROM queue GROUP BY state,cursor").fetchall()
@@ -237,7 +430,7 @@ class Queue:
             self.db.execute(
                 "INSERT INTO completions (completion_key,bank,origin,document_id,declared,"
                 "found,units,processed_at) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(completion_key) DO NOTHING",
-                (completion_key, BANK, origin, document_id, declared, found, units, now()),
+                (completion_key, bank(), origin, document_id, declared, found, units, now()),
             )
 
 
@@ -251,7 +444,7 @@ def existing_ids(ids):
     listing = ",".join(writer.quote(key) + "::uuid" for key in checked)
     sql = (
         "BEGIN READ ONLY;SELECT json_build_object('id',id) FROM memory_units "
-        "WHERE bank_id='hermes-ops' AND id IN (" + listing + ");ROLLBACK;"
+        "WHERE bank_id=" + b() + " AND id IN (" + listing + ");ROLLBACK;"
     )
     return [row["id"] for row in writer.query(sql)]
 
@@ -264,7 +457,7 @@ def unit_identities(ids):
     sql = (
         "BEGIN READ ONLY;SELECT json_build_object('id',id,'bank_id',bank_id,'text',text,"
         "'document_id',document_id,'chunk_id',chunk_id,'source_memory_ids',source_memory_ids,"
-        "'snapshot_version',xmin::text) FROM memory_units WHERE bank_id='hermes-ops' AND id IN ("
+        "'snapshot_version',xmin::text) FROM memory_units WHERE bank_id=" + b() + " AND id IN ("
         + listing
         + ");ROLLBACK;"
     )
@@ -276,7 +469,7 @@ def completed_retains(since):
         "BEGIN READ ONLY;SELECT json_build_object('operation_id',operation_id,"
         "'operation_type',operation_type,'document_id',result_metadata->>'document_id',"
         "'declared',(result_metadata->>'unit_ids_count')::int,'created_at',created_at,"
-        "'completed_at',completed_at) FROM async_operations WHERE bank_id='hermes-ops' "
+        "'completed_at',completed_at) FROM async_operations WHERE bank_id=" + b() + " "
         "AND status='completed' AND operation_type IN ('retain','batch_retain') "
         "AND result_metadata ? 'document_id' AND completed_at > "
         + writer.quote(since)
@@ -291,7 +484,7 @@ def units_for_document(document_id, created_at, completed_at):
         "'context',context,'fact_type',fact_type,'tags',tags,'metadata',metadata,'document_id',document_id,"
         "'chunk_id',chunk_id,'created_at',created_at,'proof_count',proof_count,"
         "'source_memory_ids',source_memory_ids,'snapshot_version',xmin::text) FROM memory_units "
-        "WHERE bank_id='hermes-ops' AND document_id="
+        "WHERE bank_id=" + b() + " AND document_id="
         + writer.quote(document_id)
         + " AND created_at BETWEEN "
         + writer.quote(created_at)
@@ -309,7 +502,7 @@ def units_for_document(document_id, created_at, completed_at):
 def consolidation_changes(since):
     sql = (
         "BEGIN READ ONLY;SELECT json_build_object('observation_id',observation_id,"
-        "'changed_at',changed_at) FROM observation_history WHERE bank_id='hermes-ops' AND changed_at > "
+        "'changed_at',changed_at) FROM observation_history WHERE bank_id=" + b() + " AND changed_at > "
         + writer.quote(since)
         + "::timestamptz ORDER BY changed_at,id;ROLLBACK;"
     )
@@ -320,7 +513,7 @@ def backfill_page(cursor, limit):
     sql = (
         "BEGIN READ ONLY;SELECT json_build_object('id',id,'bank_id',bank_id,'text',text,"
         "'document_id',document_id,'chunk_id',chunk_id,'source_memory_ids',source_memory_ids,"
-        "'snapshot_version',xmin::text,'created_at',created_at) FROM memory_units m WHERE bank_id='hermes-ops' "
+        "'snapshot_version',xmin::text,'created_at',created_at) FROM memory_units m WHERE bank_id=" + b() + " "
         "AND NOT EXISTS (SELECT 1 FROM unnest(m.tags) AS tag WHERE tag LIKE 'task:%' OR tag LIKE 'target:%' "
         "OR tag LIKE 'value:%')"
     )
@@ -448,7 +641,7 @@ def enqueue_manual(queue, unit_ids=(), document_id=None, version=None):
     if document_id:
         sql = (
             "BEGIN READ ONLY;SELECT json_build_object('id',id) FROM memory_units "
-            "WHERE bank_id='hermes-ops' AND document_id=" + writer.quote(document_id) + ";ROLLBACK;"
+            "WHERE bank_id=" + b() + " AND document_id=" + writer.quote(document_id) + ";ROLLBACK;"
         )
         ids.extend(row["id"] for row in writer.query(sql))
     present = existing_ids(sorted(set(ids)))
@@ -530,8 +723,15 @@ def _outcomes(queue, entries, result, run_id):
             receipt["stale" if state == "stale" else "held"] += 1
             continue
         reason = (held.get(unit_id) or {}).get("reason") or (action or {}).get("reason") or "no-outcome"
-        queue.mark(entry["key"], "held", reason=reason, run_id=run_id, bump_attempts=True)
-        receipt["held"] += 1
+        if reason == "no-label-change":
+            queue.mark(entry["key"], "no_op", reason="no-label-change", run_id=run_id, bump_attempts=True)
+            receipt["no_op"] = receipt.get("no_op", 0) + 1
+        elif reason and reason.startswith("confirmed-duplicate:"):
+            queue.mark(entry["key"], "dup_resolved", reason=reason, run_id=run_id, bump_attempts=True)
+            receipt["dup_resolved"] = receipt.get("dup_resolved", 0) + 1
+        else:
+            queue.mark(entry["key"], "held", reason=reason, run_id=run_id, bump_attempts=True)
+            receipt["held"] += 1
     return receipt
 
 
@@ -553,6 +753,9 @@ async def drain(
     max_bytes=100000,
     concurrency=2,
     control=None,
+    ledger=None,
+    budget=None,
+    fallback_chat=None,
 ):
     """Classify and additively tag pending facts, one bounded page at a time."""
     if not enabled(control):
@@ -581,10 +784,13 @@ async def drain(
         "runs": [],
         "held_cases": [],
     }
-    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    stamp = (
+        datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        + "-%d-%s" % (os.getpid(), uuid.uuid4().hex[:6])
+    )
     try:
         for page in range(max(1, max_pages)):
-            entries = queue.pending(cursor, page_size)
+            entries = queue.acquire(cursor, page_size, run_id="tag-" + stamp + "-p%04d" % (page + 1))
             if not entries:
                 break
             run = run_id or ("tag-" + stamp + "-p%04d" % (page + 1))
@@ -597,6 +803,12 @@ async def drain(
             if not live:
                 receipt["pages"] += 1
                 continue
+            seen_ids, live_dedup = set(), []
+            for entry in live:
+                if entry["unit_id"] not in seen_ids:
+                    seen_ids.add(entry["unit_id"])
+                    live_dedup.append(entry)
+            live = live_dedup
             rows = fetch(ids=[entry["unit_id"] for entry in live])
             by_id = {row["id"]: row for row in rows}
             eligible, refreshed = [], []
@@ -618,8 +830,86 @@ async def drain(
                 receipt["pages"] += 1
                 continue
             records = [row for entry, row in eligible]
-            report = await classify(records, decide, model, journal, max_bytes=max_bytes, concurrency=concurrency)
+            request_id = run + "-cls"
+            if ledger is not None:
+                for entry, row in eligible:
+                    tagger_ledger.attempt_start(
+                        ledger,
+                        run_id=run,
+                        request_id=request_id,
+                        stage="classify",
+                        queue_key=entry["key"],
+                        unit_id=entry["unit_id"],
+                        unit_version=entry["unit_version"],
+                        judge="jev",
+                        model=model,
+                        policy_version=entry.get("policy_version"),
+                    )
+                if budget is not None:
+                    ok, _amount = budget.reserve(len(eligible))
+                    if not ok:
+                        for entry, row in eligible:
+                            queue.mark(entry["key"], "pending", reason="budget-deferred", run_id=run)
+                            tagger_ledger.attempt_outcome(
+                                ledger,
+                                run_id=run,
+                                request_id=request_id,
+                                stage="classify",
+                                queue_key=entry["key"],
+                                unit_id=entry["unit_id"],
+                                unit_version=entry["unit_version"],
+                                judge="jev",
+                                model=model,
+                                outcome="BLOCKED",
+                                reason="budget-deferred",
+                            )
+                        receipt["pages"] += 1
+                        receipt["budget_deferred"] = receipt.get("budget_deferred", 0) + len(eligible)
+                        break
+            try:
+                report = await classify(records, decide, model, journal, max_bytes=max_bytes, concurrency=concurrency)
+            except Exception as exc:
+                if ledger is not None:
+                    for entry, row in eligible:
+                        tagger_ledger.attempt_fail(
+                            ledger,
+                            run_id=run,
+                            request_id=request_id,
+                            stage="classify",
+                            queue_key=entry["key"],
+                            unit_id=entry["unit_id"],
+                            unit_version=entry["unit_version"],
+                            judge="jev",
+                            model=model,
+                            error=exc,
+                        )
+                raise
             included_records, filtered, held_cases = additive_page(records, report)
+            oversized_cases = [case for case in held_cases if case.get("reason") == "oversized-record"]
+            if oversized_cases and fallback_chat is not None:
+                oversize_ids = {case["id"] for case in oversized_cases} & {row["id"] for row in records}
+                fallback_records = [
+                    row for row in records if row["id"] in oversize_ids
+                ][: tagger_fallback.FALLBACK_MAX_UNITS_PER_PASS]
+                if fallback_records:
+                    try:
+                        fb_report = await tagger_fallback.classify_fallback(fallback_records, fallback_chat)
+                    except Exception:
+                        fb_report = {"results": []}
+                    fb_by_id = {result["id"]: result for result in fb_report.get("results", [])}
+                    promoted = []
+                    for case in list(held_cases):
+                        fb = fb_by_id.get(case["id"])
+                        if fb and fb.get("disposition") in ("KEEP", "RESCUE"):
+                            held_cases.remove(case)
+                            promoted.append(fb)
+                    if promoted:
+                        promoted_ids = {result["id"] for result in promoted}
+                        report = dict(report)
+                        report["results"] = [
+                            result for result in report.get("results", []) if result["id"] not in promoted_ids
+                        ] + promoted
+                        included_records, filtered, held_cases = additive_page(records, report)
             for case in held_cases:
                 entry = next(entry for entry, row in eligible if row["id"] == case["id"])
                 queue.mark(
@@ -627,14 +917,55 @@ async def drain(
                 )
                 receipt["held"] += 1
                 receipt["held_cases"].append(case)
+                if ledger is not None:
+                    tagger_ledger.attempt_outcome(
+                        ledger,
+                        run_id=run,
+                        request_id=request_id,
+                        stage="classify",
+                        queue_key=entry["key"],
+                        unit_id=entry["unit_id"],
+                        unit_version=entry["unit_version"],
+                        judge="jev",
+                        model=model,
+                        outcome="HELD",
+                        disposition=case.get("disposition"),
+                        reason=case.get("reason"),
+                    )
             if included_records:
-                result = apply(included_records, filtered, run)
+                try:
+                    result = apply(included_records, filtered, run)
+                except ValueError as exc:
+                    if "version mismatch" in str(exc).lower():
+                        for entry, row in eligible:
+                            queue.mark(entry["key"], "stale", reason="writer-version-conflict", run_id=run)
+                        receipt["stale"] += len(eligible)
+                        receipt["pages"] += 1
+                        continue
+                    raise
                 prunes = [item for item in result.get("actions", []) if item.get("action") == "PRUNE"]
                 if prunes:
                     raise RuntimeError("Refusing prune action from an additive tag queue")
                 included_ids = {row["id"] for row in included_records}
                 entries_by_id = {row["id"]: entry for entry, row in eligible if row["id"] in included_ids}
                 outcomes = _outcomes(queue, list(entries_by_id.values()), result, run)
+                if ledger is not None:
+                    for row in included_records:
+                        ledger_entry = entries_by_id.get(row["id"])
+                        if ledger_entry:
+                            tagger_ledger.attempt_outcome(
+                                ledger,
+                                run_id=run,
+                                request_id=request_id,
+                                stage="classify",
+                                queue_key=ledger_entry["key"],
+                                unit_id=ledger_entry["unit_id"],
+                                unit_version=ledger_entry["unit_version"],
+                                judge="jev",
+                                model=model,
+                                outcome="TAGGED",
+                                writer_result=str(outcomes.get("tagged", "?")) + " tagged",
+                            )
                 receipt["tagged"] += outcomes["tagged"]
                 receipt["held"] += outcomes["held"]
                 receipt["stale"] += outcomes["stale"]
@@ -677,15 +1008,8 @@ def drain_sync(queue, **kwargs):
 
 
 def build_decide():
-    """Judge wiring copied from gardener_run.py; caller owns the secret scope."""
-    sys.path.insert(0, "/home/vern/.hermes/hermes-agent")
-    plugin = Path("/home/vern/.hermes/plugins/jev_gate")
-    spec = importlib.util.spec_from_file_location(
-        "gardener_jev", plugin / "__init__.py", submodule_search_locations=[str(plugin)]
-    )
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["gardener_jev"] = module
-    spec.loader.exec_module(module)
+    """Judge wiring through the one shared loader; caller owns the secret scope."""
+    worker.load_judge()
     from gardener_jev import client, constants
 
     cfg = dict(constants.DEFAULTS)
@@ -732,66 +1056,102 @@ def run_once(
     telemetry=TELEMETRY,
     control=None,
     decide_factory=None,
+    budget_usd=None,
+    explicit_model=None,
 ):
     """One polling pass: enqueue completions, then drain when the switch is on."""
-    receipt = {"at": now(), "enabled": enabled(control)}
-    receipt["retain"] = enqueue_new(queue, since=since)
-    receipt["consolidation"] = enqueue_consolidation(queue, since=consolidation_since)
-    if manual_unit_ids or manual_document:
-        receipt["manual"] = enqueue_manual(queue, unit_ids=manual_unit_ids, document_id=manual_document)
-    if include_backfill:
-        receipt["backfill"] = enqueue_backfill(queue, page_size=page_size)
-    if not receipt["enabled"]:
-        receipt["drain"] = {"skipped": "disabled"}
-        return receipt
-    if decide is None:
-        factory = decide_factory or build_decide
-        sys.path.insert(0, "/home/vern/.hermes/hermes-agent")
-        from agent.secret_scope import build_profile_secret_scope, reset_secret_scope, set_secret_scope
+    from tagger_lock import runner_lock
 
-        home = Path("/home/vern/.hermes")
-        token = set_secret_scope(build_profile_secret_scope(home), profile_home=str(home))
-        try:
-            decide, cfg = factory()
-            receipt["drain"] = asyncio.run(
-                drain(
-                    queue,
-                    cursor="new",
-                    page_size=page_size,
-                    max_pages=max_pages,
-                    decide=decide,
-                    model=cfg["model"],
-                    control=control,
-                    telemetry=telemetry,
+    receipt = {"at": now(), "enabled": enabled(control)}
+    with runner_lock(queue.db_path) as acquired:
+        if not acquired:
+            receipt["busy"] = True
+            receipt["drain"] = {"skipped": "runner-lock-held"}
+            return receipt
+        from tagger_ledger import Budget, ledger_path
+
+        ledger_file = ledger_path(queue.db_path)
+        budget = Budget(queue, budget_usd if budget_usd is not None else tagger_ledger.DEFAULT_BUDGET_USD)
+        fallback_chat = _fallback_chat
+        receipt["retain"] = enqueue_new(queue, since=since)
+        receipt["consolidation"] = enqueue_consolidation(queue, since=consolidation_since)
+        if manual_unit_ids or manual_document:
+            receipt["manual"] = enqueue_manual(queue, unit_ids=manual_unit_ids, document_id=manual_document)
+        if include_backfill:
+            receipt["backfill"] = enqueue_backfill(queue, page_size=page_size)
+        if not receipt["enabled"]:
+            receipt["drain"] = {"skipped": "disabled"}
+            return receipt
+        drains = [("new", receipt)]
+        if include_backfill:
+            drains.append(("backfill", receipt))
+        if decide is None:
+            factory = decide_factory or build_decide
+            token, reset_secret_scope = worker.open_secret_scope()
+            try:
+                decide, cfg = factory()
+                for cursor, target in drains:
+                    key = "drain" if cursor == "new" else "drain_backfill"
+                    target[key] = asyncio.run(
+                        drain(
+                            queue,
+                            cursor=cursor,
+                            page_size=page_size,
+                            max_pages=max_pages,
+                            decide=decide,
+                            model=cfg["model"],
+                            control=control,
+                            telemetry=telemetry,
+                            ledger=ledger_file,
+                            budget=budget,
+                            fallback_chat=fallback_chat,
+                        )
+                    )
+            finally:
+                reset_secret_scope(token)
+        else:
+            model = explicit_model or "explicit-judge"
+            for cursor, target in drains:
+                key = "drain" if cursor == "new" else "drain_backfill"
+                target[key] = asyncio.run(
+                    drain(
+                        queue,
+                        cursor=cursor,
+                        page_size=page_size,
+                        max_pages=max_pages,
+                        decide=decide,
+                        model=model,
+                        control=control,
+                        telemetry=telemetry,
+                        ledger=ledger_file,
+                        budget=budget,
+                    )
                 )
-            )
-        finally:
-            reset_secret_scope(token)
-    else:
-        receipt["drain"] = asyncio.run(
-            drain(
-                queue,
-                cursor="new",
-                page_size=page_size,
-                max_pages=max_pages,
-                decide=decide,
-                control=control,
-                telemetry=telemetry,
-            )
+        return receipt
+
+
+async def _fallback_chat(prompt):
+    """One chat completion for the fallback classifier; key from the secret scope."""
+    import httpx
+    from agent.secret_scope import get_secret
+
+    key = get_secret(tagger_fallback.FALLBACK_KEY_NAME)
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.post(
+            tagger_fallback.FALLBACK_ENDPOINT,
+            headers={"Authorization": "Bearer " + str(key)},
+            json={
+                "model": tagger_fallback.FALLBACK_MODEL,
+                "messages": [
+                    {"role": "system", "content": tagger_fallback.SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                "max_tokens": 300,
+                "temperature": 0.1,
+            },
         )
-    if include_backfill:
-        receipt["drain_backfill"] = asyncio.run(
-            drain(
-                queue,
-                cursor="backfill",
-                page_size=page_size,
-                max_pages=max_pages,
-                decide=decide,
-                control=control,
-                telemetry=telemetry,
-            )
-        )
-    return receipt
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
 
 
 # --------------------------------------------------------------------------- CLI
@@ -820,6 +1180,8 @@ def main():
     run.add_argument("--since")
     backfill = sub.add_parser("backfill", help="enqueue historical facts on the backfill cursor")
     backfill.add_argument("--page-size", type=int, default=PAGE_LIMIT)
+    requeue = sub.add_parser("requeue-held", help="class-scoped requeue of held failures with backoff")
+    requeue.add_argument("--dry-run", action="store_true", help="report only, no state changes")
     sub.add_parser("status", help="queue state and switch")
     sub.add_parser("reconcile", help="re-queue stale/superseded entries")
     linkage = sub.add_parser("linkage", help="verify completion/document/unit linkage")
@@ -862,11 +1224,11 @@ def main():
         elif args.command == "drain":
             print(
                 json.dumps(
-                    drain_sync(
+                    run_once(
                         queue,
-                        cursor=args.cursor,
-                        page_size=args.page_size,
                         max_pages=args.max_pages,
+                        page_size=args.page_size,
+                        include_backfill=args.cursor == "backfill",
                         control=args.control,
                         telemetry=args.telemetry,
                     ),
@@ -888,6 +1250,15 @@ def main():
                     indent=2,
                 )
             )
+        elif args.command == "requeue-held":
+            if args.dry_run:
+                from collections import Counter
+
+                entries = queue.entries(state="held")
+                reasons = Counter((entry.get("reason") or "")[:30] for entry in entries)
+                print(json.dumps({"held": len(entries), "by_reason": dict(reasons)}, indent=2))
+            else:
+                print(json.dumps(requeue_held(queue), indent=2))
         elif args.command == "status":
             print(
                 json.dumps(
