@@ -503,6 +503,11 @@ export function createContextEngine(log: Logger, options: ContextEngineOptions =
               // Review answer 1 (e8cb): the admission knobs ride the apply context from plugin config.
               policy: options.getPolicy?.(),
               pressureScale: scale,
+              // Identity-index cache (2026-11-17): a cold build over a 35k-event session cost
+              // 15-48 s on the main thread; the cache makes every later process start cheap.
+              indexCacheDir: options.hostStateRoot
+                ? join(options.hostStateRoot, "workspace", "state", "astinus", "seq-index")
+                : undefined,
               // e8cb M1: the debounce counts TURNS off the ledger; the durable seq counter
               // (state.lastCommittedSeq) is only the cold-handle fallback.
               turnCounter: side.readMaxTurnId(key) ?? state.lastCommittedSeq,
@@ -560,6 +565,11 @@ export function createContextEngine(log: Logger, options: ContextEngineOptions =
                     tokenBudget: params.tokenBudget ?? 0,
                     policy: { ...(options.getPolicy?.() ?? {}), pruneAtPressure: Number.POSITIVE_INFINITY },
                     pressureScale: scale,
+              // Identity-index cache (2026-11-17): a cold build over a 35k-event session cost
+              // 15-48 s on the main thread; the cache makes every later process start cheap.
+              indexCacheDir: options.hostStateRoot
+                ? join(options.hostStateRoot, "workspace", "state", "astinus", "seq-index")
+                : undefined,
                     turnCounter: side.readMaxTurnId(key) ?? state.lastCommittedSeq,
                   });
                 }
