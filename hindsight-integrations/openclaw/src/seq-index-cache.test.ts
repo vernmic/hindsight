@@ -55,6 +55,27 @@ function setGeneration(dbPath: string, sessionId: string, generation: string): v
   db.close();
 }
 
+function hostDbKeyless(events: number): string {
+  const dir = mkdtempSync(join(tmpdir(), "astinus-seq-"));
+  dirs.push(dir);
+  const dbPath = join(dir, "host.sqlite");
+  const db = new DatabaseSync(dbPath);
+  db.exec("CREATE TABLE transcript_events (session_id TEXT, seq INTEGER, event_json TEXT, event_zstd BLOB)");
+  db.exec(
+    "CREATE TABLE transcript_event_identities (session_id TEXT, event_id TEXT, seq INTEGER, event_type TEXT, parent_id TEXT, message_idempotency_key TEXT, created_at INTEGER)"
+  );
+  const insEvent = db.prepare("INSERT INTO transcript_events (session_id, seq, event_json) VALUES (?,?,?)");
+  const insId = db.prepare(
+    "INSERT INTO transcript_event_identities (session_id, event_id, seq, event_type, message_idempotency_key) VALUES (?,?,?,?,?)"
+  );
+  for (let i = 1; i <= events; i++) {
+    insEvent.run("s1", i, JSON.stringify({ id: "ev" + i, type: "custom", customType: "openclaw.cache-ttl" }));
+    insId.run("s1", "ev" + i, i, "custom", null);
+  }
+  db.close();
+  return dbPath;
+}
+
 function cacheFiles(dir: string): string[] {
   try {
     return readdirSync(dir).filter((f) => f.endsWith(".json"));
@@ -187,5 +208,34 @@ describe("identity-index cache", () => {
     const loaded = seqIndexDebug(dbPath, "s1", cacheDir);
     expect(loaded.fromCache).toBe(true);
     expect(statSync(file).mtimeMs).toBe(before);
+  });
+
+  it("hashes the same cache for different spellings of the same path", () => {
+    const dbPath = hostDb(9);
+    const cacheDir = join(dbPath, "..", "seq-cache");
+    const built = seqIndexDebug(dbPath, "s1", cacheDir);
+    const file = cacheFiles(cacheDir)[0];
+
+    const variant = "\\\\?\\" + dbPath.toUpperCase().replace(/\\/g, "/");
+    clearSeqIndexes();
+    const viaVariant = seqIndexDebug(variant, "s1", cacheDir);
+    expect(viaVariant.fromCache).toBe(true);
+    expect(viaVariant.size).toBe(built.size);
+    expect(cacheFiles(cacheDir)).toEqual([file]);
+  });
+
+  it("persists the cursor when rows carry no key", () => {
+    const dbPath = hostDbKeyless(25);
+    const cacheDir = join(dbPath, "..", "seq-cache");
+    seqIndexDebug(dbPath, "s1", cacheDir);
+    const file = join(cacheDir, cacheFiles(cacheDir)[0]);
+    const body = JSON.parse(readFileSync(file, "utf-8")) as { lastSeq?: number; entries?: unknown[] };
+    expect(body.lastSeq).toBe(25);
+    expect(body.entries).toHaveLength(0);
+
+    clearSeqIndexes();
+    const loaded = seqIndexDebug(dbPath, "s1", cacheDir);
+    expect(loaded.fromCache).toBe(true);
+    expect(loaded.lastSeq).toBe(25);
   });
 });

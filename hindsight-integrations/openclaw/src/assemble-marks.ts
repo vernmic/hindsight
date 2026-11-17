@@ -7,7 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 import * as zlib from "node:zlib";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { usageFromEvent, type ProviderUsage } from "./prompt-accounting.js";
 
 export type LedgerMark = {
@@ -215,6 +215,28 @@ function slimBlocks(msg: unknown, keptResults?: Set<string>): unknown {
   return changed ? { ...m, content } : msg;
 }
 
+/** Canonical form of the host DB path for cache keying (review round 2).
+ *
+ *  The live assemble passes the path the host hands the engine; the ledger meta records what the
+ *  plugin was given at commit time. They can differ in prefix (Win32 long-path), separators or
+ *  case, and a hash of the raw strings would then miss the cache built by the other. Normalise
+ *  before hashing: strip the long-path prefix, unify separators, resolve, fold case on win32. */
+export function canonicalTranscriptDbPath(dbPath: string): string {
+  let out = String(dbPath ?? "");
+  try {
+    if (out.startsWith("\\\\?\\")) out = out.slice(4);
+    if (process.platform === "win32") {
+      out = out.replace(/\//g, "\\");
+      out = resolve(out).toLowerCase();
+    } else {
+      out = resolve(out);
+    }
+  } catch {
+    /* keep the raw string when resolution fails */
+  }
+  return out;
+}
+
 export class SeqIndex {
   private db: DatabaseSync | null = null;
   private lastSeq = 0;
@@ -240,7 +262,12 @@ export class SeqIndex {
   constructor(readonly dbPath: string, readonly sessionId: string, cacheDir?: string | null) {
     const dir = typeof cacheDir === "string" && cacheDir ? cacheDir : null;
     this.cachePath = dir
-      ? join(dir, createHash("sha1").update(dbPath + "|" + sessionId).digest("hex") + ".json")
+      ? join(
+          dir,
+          createHash("sha1")
+            .update(canonicalTranscriptDbPath(dbPath) + "|" + sessionId)
+            .digest("hex") + ".json"
+        )
       : null;
   }
 
@@ -422,6 +449,9 @@ export class SeqIndex {
             this.lastSeq = Number(r.seq);
             this.lastSeqId =
               ev !== null && typeof ev.id === "string" && ev.id ? (ev.id as string) : null;
+            // Persist the cursor even when the row carries no key: otherwise a session of
+            // keyless rows would re-read the same tail on every process start.
+            this.dirty = true;
           }
           if (!key) continue;
           this.map.set(key, Number(r.seq));
@@ -535,7 +565,7 @@ const seqIndexes = new Map<string, SeqIndex>();
 function seqIndexFor(dbPath: string, sessionId: string, cacheDir?: string | null): SeqIndex {
   // M4: key by (dbPath, sessionId), not session key; the cache dir joins the key so two callers
   // with different cache roots never share an instance.
-  const cacheKey = `${dbPath}|${sessionId}|${cacheDir ?? ""}`;
+  const cacheKey = `${canonicalTranscriptDbPath(dbPath)}|${sessionId}|${cacheDir ?? ""}`;
   let ix = seqIndexes.get(cacheKey);
   if (!ix) {
     ix = new SeqIndex(dbPath, sessionId, cacheDir);
