@@ -5,7 +5,9 @@
 // one refresh per pass (M5). Any failure degrades to "less pruned", never an error.
 import { DatabaseSync } from "node:sqlite";
 import * as zlib from "node:zlib";
-import { existsSync } from "fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "fs";
+import { join } from "node:path";
 import { usageFromEvent, type ProviderUsage } from "./prompt-accounting.js";
 
 export type LedgerMark = {
@@ -224,7 +226,74 @@ export class SeqIndex {
   private zstdCols: boolean | null = null;
   failed = false;
 
-  constructor(readonly dbPath: string, readonly sessionId: string) {}
+  /** On-disk cache of the identity map (2026-11-17): a cold build walks every event of the
+   *  session - decompressing and parsing each row - which froze the gateway for 15-48 s on a
+   *  35k-event session. The map is a pure function of (dbPath, sessionId, transcript rows), so it
+   *  can be persisted and reloaded; the tail watermark still validates it on every open. */
+  private readonly cachePath: string | null;
+  private loadedFromCache = false;
+
+  constructor(readonly dbPath: string, readonly sessionId: string, cacheDir?: string | null) {
+    const dir = typeof cacheDir === "string" && cacheDir ? cacheDir : null;
+    this.cachePath = dir
+      ? join(dir, createHash("sha1").update(dbPath + "|" + sessionId).digest("hex") + ".json")
+      : null;
+  }
+
+  /** Size of the identity map (tests and diagnostics). */
+  get size(): number {
+    return this.map.size;
+  }
+
+  /** Whether this instance restored its map from the on-disk cache. */
+  get fromCache(): boolean {
+    return this.loadedFromCache;
+  }
+
+  /** Highest seq this index has processed (tests and diagnostics). */
+  get lastSeqSeen(): number {
+    return this.lastSeq;
+  }
+
+  private loadCache(): void {
+    if (!this.cachePath || !existsSync(this.cachePath)) return;
+    try {
+      const parsed = JSON.parse(readFileSync(this.cachePath, "utf-8")) as {
+        v?: number;
+        lastSeq?: number;
+        lastSeqId?: string | null;
+        entries?: Array<[string, number]>;
+      };
+      if (parsed.v !== 1 || !Array.isArray(parsed.entries)) return;
+      for (const pair of parsed.entries) {
+        if (Array.isArray(pair) && typeof pair[0] === "string" && Number.isFinite(pair[1])) {
+          this.map.set(pair[0], Number(pair[1]));
+        }
+      }
+      this.lastSeq = Number.isFinite(parsed.lastSeq) ? Number(parsed.lastSeq) : -1;
+      this.lastSeqId = typeof parsed.lastSeqId === "string" ? parsed.lastSeqId : null;
+      this.loadedOnce = true;
+      this.loadedFromCache = true;
+    } catch {
+      this.map.clear();
+      this.loadedOnce = false;
+    }
+  }
+
+  private saveCache(): void {
+    if (!this.cachePath) return;
+    try {
+      mkdirSync(join(this.cachePath, ".."), { recursive: true });
+      const entries: Array<[string, number]> = [];
+      for (const [k, v] of this.map) entries.push([k, v]);
+      const body = JSON.stringify({ v: 1, lastSeq: this.lastSeq, lastSeqId: this.lastSeqId, entries });
+      const tmp = this.cachePath + ".tmp";
+      writeFileSync(tmp, body, "utf-8");
+      renameSync(tmp, this.cachePath);
+    } catch {
+      /* cache is an optimisation; never fail the assemble over it */
+    }
+  }
 
   /** Payload columns to select: compressed rows carry event_json NULL and the event in event_zstd. */
   private payloadCols(): string {
@@ -247,6 +316,7 @@ export class SeqIndex {
     }
     try {
       this.db = new DatabaseSync(this.dbPath, { readOnly: true });
+      this.loadCache();
       return true;
     } catch {
       this.failed = true;
@@ -292,25 +362,42 @@ export class SeqIndex {
           // A compressed row (event_json NULL) decodes from event_zstd; an undecodable row only
           // advances the cursor, as an identity-less row always did.
           const json = r.event_json ?? decodeZstd(r.event_zstd ?? null);
-          const key = json === null ? null : eventIdentity(json);
+          // One parse per row (2026-11-17): eventIdentity and eventIdOf used to parse the same
+          // string twice, which was ~7 s of the 15 s cold build on topic 2549's 35k events.
+          let ev: Record<string, unknown> | null = null;
+          if (json !== null) {
+            try {
+              ev = JSON.parse(json) as Record<string, unknown>;
+            } catch {
+              ev = null;
+            }
+          }
+          const msg = ev === null ? null : ((ev.message ?? ev) as Record<string, unknown>);
+          const key =
+            msg !== null && typeof msg.role === "string" && msg.role ? identityKeyOf(msg) : null;
           if (Number(r.seq) > this.lastSeq) {
             this.lastSeq = Number(r.seq);
-            this.lastSeqId = json === null ? null : eventIdOf(json);
+            this.lastSeqId =
+              ev !== null && typeof ev.id === "string" && ev.id ? (ev.id as string) : null;
           }
-          if (!key || json === null) continue;
+          if (!key) continue;
           this.map.set(key, Number(r.seq));
-          try {
-            const ev = JSON.parse(json) as Record<string, unknown>;
-            const tcKey = toolCallKeyOf((ev.message ?? ev) as Record<string, unknown>);
-            if (tcKey) {
-              const prev = this.map.get(tcKey);
-              if (prev === undefined) this.map.set(tcKey, Number(r.seq));
-              else if (prev !== Number(r.seq)) this.map.set(tcKey, -1); // ambiguous: refuse
+          if (msg !== null) {
+            try {
+              const tcKey = toolCallKeyOf(msg);
+              if (tcKey) {
+                const prev = this.map.get(tcKey);
+                if (prev === undefined) this.map.set(tcKey, Number(r.seq));
+                else if (prev !== Number(r.seq)) this.map.set(tcKey, -1); // ambiguous: refuse
+              }
+            } catch {
+              /* bonus key only */
             }
-          } catch { /* bonus key only */ }
+          }
         }
       } while (rows.length === LOAD_CHUNK);
       this.loadedOnce = true;
+      this.saveCache();
     } catch {
       /* degrade: whatever is indexed still resolves */
     }
@@ -396,11 +483,13 @@ function decodeZstd(blob: Uint8Array | null): string | null {
 }
 
 const seqIndexes = new Map<string, SeqIndex>();
-function seqIndexFor(dbPath: string, sessionId: string): SeqIndex {
-  const cacheKey = `${dbPath}|${sessionId}`; // M4: key by (dbPath, sessionId), not session key
+function seqIndexFor(dbPath: string, sessionId: string, cacheDir?: string | null): SeqIndex {
+  // M4: key by (dbPath, sessionId), not session key; the cache dir joins the key so two callers
+  // with different cache roots never share an instance.
+  const cacheKey = `${dbPath}|${sessionId}|${cacheDir ?? ""}`;
   let ix = seqIndexes.get(cacheKey);
   if (!ix) {
-    ix = new SeqIndex(dbPath, sessionId);
+    ix = new SeqIndex(dbPath, sessionId, cacheDir);
     if (seqIndexes.size >= 200) {
       const oldest = seqIndexes.keys().next().value;
       if (oldest !== undefined) {
@@ -411,6 +500,23 @@ function seqIndexFor(dbPath: string, sessionId: string): SeqIndex {
     seqIndexes.set(cacheKey, ix);
   }
   return ix;
+}
+
+/** Test/diagnostic hook: instance state without exposing the class. */
+export function seqIndexDebug(
+  dbPath: string,
+  sessionId: string,
+  cacheDir?: string | null
+): { size: number; fromCache: boolean; lastSeq: number } {
+  const ix = seqIndexFor(dbPath, sessionId, cacheDir);
+  ix.refresh();
+  return { size: ix.size, fromCache: ix.fromCache, lastSeq: ix.lastSeqSeen };
+}
+
+/** Drop every cached instance (tests; also a way to release handles). */
+export function clearSeqIndexes(): void {
+  for (const ix of seqIndexes.values()) ix.close();
+  seqIndexes.clear();
 }
 
 /** Provider usage of the first model call after `afterSeq` in this host session (count anchor). */
@@ -429,6 +535,8 @@ export type ApplyContext = {
   pruneEpoch?: number;
   /** Provider/host-estimate ratio for this session (count anchor); pressure uses tokensBefore x scale. */
   pressureScale?: number;
+  /** Where the identity-index cache lives (host state); omitted = build in memory every process. */
+  indexCacheDir?: string | null;
 };
 
 export type PruneOutcome = {
@@ -632,7 +740,7 @@ export function applyMarks(
   // marks while the in-window content sat unmarked. Computed before the early returns so
   // every session reports it, marks or not. Same cached SeqIndex the loop below uses.
   try {
-    const wix = seqIndexFor(ctx.hostDbPath, ctx.sessionId);
+    const wix = seqIndexFor(ctx.hostDbPath, ctx.sessionId, ctx.indexCacheDir);
     wix.refresh();
     let wfs: number | null = null;
     let wls: number | null = null;
@@ -652,7 +760,7 @@ export function applyMarks(
   // Astinus stamp. Fail-soft; never affects the view. Logged at info by the caller. Runs BEFORE
   // the early returns so every assemble reports it, marks or not.
   try {
-    const dix = seqIndexFor(ctx.hostDbPath, ctx.sessionId);
+    const dix = seqIndexFor(ctx.hostDbPath, ctx.sessionId, ctx.indexCacheDir);
     dix.refresh();
     let dn = 0, dres = 0, dtsNum = 0, dtsStr = 0, dtsUndef = 0, dstamped = 0;
     for (const m of messages) {
@@ -739,7 +847,7 @@ export function applyMarks(
   // drops its range. Then all pending marks are admitted at once - the pass picked them for being
   // off-topic or incidental, so they go first - and only then the oldest-turns fallback.
   const next = epoch + 1;
-  const ix = seqIndexFor(ctx.hostDbPath, ctx.sessionId);
+  const ix = seqIndexFor(ctx.hostDbPath, ctx.sessionId, ctx.indexCacheDir);
   ix.refresh();
   const base = messages.filter((m) => !(isAstinusMessage(m) && ix.seqOf(m) === null));
   const pruned = applySet(base, [...applied.map(asDrop), ...pending], ctx);
@@ -798,7 +906,7 @@ type SetResult = { list: unknown[]; changed: boolean; skipped: string[]; applied
 function applySet(messages: unknown[], marks: LedgerMark[], ctx: ApplyContext): SetResult {
   const res: SetResult = { list: messages, changed: false, skipped: [], applied: [] };
   if (marks.length === 0) return res;
-  const ix = seqIndexFor(ctx.hostDbPath, ctx.sessionId);
+  const ix = seqIndexFor(ctx.hostDbPath, ctx.sessionId, ctx.indexCacheDir);
   ix.refresh();
   const list = messages.slice();
   const seqs: (number | null)[] = list.map((m) => ix.seqOf(m));
