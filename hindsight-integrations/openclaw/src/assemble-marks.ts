@@ -232,6 +232,10 @@ export class SeqIndex {
    *  can be persisted and reloaded; the tail watermark still validates it on every open. */
   private readonly cachePath: string | null;
   private loadedFromCache = false;
+  /** Set when a row entered the map or the map was rebuilt; only then is the cache rewritten. */
+  private dirty = false;
+  /** The session's transcript generation (host rewrite watermark), when the host exposes it. */
+  private generation: string | null = null;
 
   constructor(readonly dbPath: string, readonly sessionId: string, cacheDir?: string | null) {
     const dir = typeof cacheDir === "string" && cacheDir ? cacheDir : null;
@@ -255,6 +259,18 @@ export class SeqIndex {
     return this.lastSeq;
   }
 
+  /** The host's transcript generation for this session, or null when the table/row is absent. */
+  private readGeneration(): string | null {
+    try {
+      const row = this.db!
+        .prepare("SELECT generation FROM transcript_rewrite_watermarks WHERE session_id = ?")
+        .get(this.sessionId) as { generation?: unknown } | undefined;
+      return typeof row?.generation === "string" && row.generation ? row.generation : null;
+    } catch {
+      return null;
+    }
+  }
+
   private loadCache(): void {
     if (!this.cachePath || !existsSync(this.cachePath)) return;
     try {
@@ -262,18 +278,26 @@ export class SeqIndex {
         v?: number;
         lastSeq?: number;
         lastSeqId?: string | null;
+        generation?: string | null;
         entries?: Array<[string, number]>;
       };
       if (parsed.v !== 1 || !Array.isArray(parsed.entries)) return;
+      // A null tail id cannot prove the tail still holds the row this map was built from; in
+      // memory that lived one process, a persisted one would be trusted across the offline-trim
+      // window. Rebuild instead.
+      if (typeof parsed.lastSeqId !== "string" || !parsed.lastSeqId) return;
+      // Our trim bumps the session generation. A mismatch means rows moved; rebuild.
+      if (this.generation !== null && parsed.generation !== this.generation) return;
       for (const pair of parsed.entries) {
         if (Array.isArray(pair) && typeof pair[0] === "string" && Number.isFinite(pair[1])) {
           this.map.set(pair[0], Number(pair[1]));
         }
       }
       this.lastSeq = Number.isFinite(parsed.lastSeq) ? Number(parsed.lastSeq) : -1;
-      this.lastSeqId = typeof parsed.lastSeqId === "string" ? parsed.lastSeqId : null;
+      this.lastSeqId = parsed.lastSeqId;
       this.loadedOnce = true;
       this.loadedFromCache = true;
+      this.dirty = false;
     } catch {
       this.map.clear();
       this.loadedOnce = false;
@@ -281,15 +305,24 @@ export class SeqIndex {
   }
 
   private saveCache(): void {
-    if (!this.cachePath) return;
+    if (!this.cachePath || !this.dirty) return;
     try {
       mkdirSync(join(this.cachePath, ".."), { recursive: true });
       const entries: Array<[string, number]> = [];
       for (const [k, v] of this.map) entries.push([k, v]);
-      const body = JSON.stringify({ v: 1, lastSeq: this.lastSeq, lastSeqId: this.lastSeqId, entries });
+      const generation = this.readGeneration() ?? this.generation;
+      this.generation = generation;
+      const body = JSON.stringify({
+        v: 1,
+        lastSeq: this.lastSeq,
+        lastSeqId: this.lastSeqId,
+        generation,
+        entries,
+      });
       const tmp = this.cachePath + ".tmp";
       writeFileSync(tmp, body, "utf-8");
       renameSync(tmp, this.cachePath);
+      this.dirty = false;
     } catch {
       /* cache is an optimisation; never fail the assemble over it */
     }
@@ -316,6 +349,7 @@ export class SeqIndex {
     }
     try {
       this.db = new DatabaseSync(this.dbPath, { readOnly: true });
+      this.generation = this.readGeneration();
       this.loadCache();
       return true;
     } catch {
@@ -350,6 +384,7 @@ export class SeqIndex {
         this.map.clear();
         this.lastSeq = -1;
         this.lastSeqId = null;
+        this.dirty = true;
       }
       let rows: Array<{ seq: number; event_json: string | null; event_zstd?: Uint8Array | null }> = [];
       do {
@@ -373,8 +408,16 @@ export class SeqIndex {
             }
           }
           const msg = ev === null ? null : ((ev.message ?? ev) as Record<string, unknown>);
-          const key =
-            msg !== null && typeof msg.role === "string" && msg.role ? identityKeyOf(msg) : null;
+          let key: string | null = null;
+          if (msg !== null && typeof msg.role === "string" && msg.role) {
+            // Per-row guard (review nit): the old eventIdentity swallowed a throw from
+            // identityKeyOf; keep that so one odd row cannot abandon the whole load.
+            try {
+              key = identityKeyOf(msg);
+            } catch {
+              key = null;
+            }
+          }
           if (Number(r.seq) > this.lastSeq) {
             this.lastSeq = Number(r.seq);
             this.lastSeqId =
@@ -382,13 +425,19 @@ export class SeqIndex {
           }
           if (!key) continue;
           this.map.set(key, Number(r.seq));
+          this.dirty = true;
           if (msg !== null) {
             try {
               const tcKey = toolCallKeyOf(msg);
               if (tcKey) {
                 const prev = this.map.get(tcKey);
-                if (prev === undefined) this.map.set(tcKey, Number(r.seq));
-                else if (prev !== Number(r.seq)) this.map.set(tcKey, -1); // ambiguous: refuse
+                if (prev === undefined) {
+                  this.map.set(tcKey, Number(r.seq));
+                  this.dirty = true;
+                } else if (prev !== Number(r.seq)) {
+                  this.map.set(tcKey, -1); // ambiguous: refuse
+                  this.dirty = true;
+                }
               }
             } catch {
               /* bonus key only */
