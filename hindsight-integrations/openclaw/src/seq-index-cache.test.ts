@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -41,6 +41,18 @@ function hostDb(events: number): string {
   }
   db.close();
   return dbPath;
+}
+
+function setGeneration(dbPath: string, sessionId: string, generation: string): void {
+  const db = new DatabaseSync(dbPath);
+  db.exec(
+    "CREATE TABLE IF NOT EXISTS transcript_rewrite_watermarks (session_id TEXT, generation TEXT, updated_at INTEGER)"
+  );
+  db.prepare("DELETE FROM transcript_rewrite_watermarks WHERE session_id = ?").run(sessionId);
+  db.prepare(
+    "INSERT INTO transcript_rewrite_watermarks (session_id, generation, updated_at) VALUES (?,?,?)"
+  ).run(sessionId, generation, Date.now());
+  db.close();
 }
 
 function cacheFiles(dir: string): string[] {
@@ -130,5 +142,50 @@ describe("identity-index cache", () => {
     const uncached = seqIndexDebug(dbPath, "s1", undefined);
     expect(uncached.size).toBe(cached.size);
     expect(uncached.lastSeq).toBe(cached.lastSeq);
+  });
+
+  it("rejects a cache whose tail id is null", () => {
+    const dbPath = hostDb(15);
+    const cacheDir = join(dbPath, "..", "seq-cache");
+    seqIndexDebug(dbPath, "s1", cacheDir);
+    const files = cacheFiles(cacheDir);
+    expect(files).toHaveLength(1);
+    const file = join(cacheDir, files[0]);
+    const body = JSON.parse(readFileSync(file, "utf-8")) as Record<string, unknown>;
+    body.lastSeqId = null;
+    writeFileSync(file, JSON.stringify(body), "utf-8");
+
+    clearSeqIndexes();
+    const rebuilt = seqIndexDebug(dbPath, "s1", cacheDir);
+    expect(rebuilt.fromCache).toBe(false);
+    expect(rebuilt.size).toBeGreaterThanOrEqual(15);
+  });
+
+  it("rebuilds when the transcript generation moved", () => {
+    const dbPath = hostDb(12);
+    const cacheDir = join(dbPath, "..", "seq-cache");
+    setGeneration(dbPath, "s1", "gen-1");
+    seqIndexDebug(dbPath, "s1", cacheDir);
+    expect(cacheFiles(cacheDir)).toHaveLength(1);
+
+    setGeneration(dbPath, "s1", "gen-2");
+    clearSeqIndexes();
+    const rebuilt = seqIndexDebug(dbPath, "s1", cacheDir);
+    expect(rebuilt.fromCache).toBe(false);
+    expect(rebuilt.size).toBeGreaterThanOrEqual(12);
+  });
+
+  it("does not rewrite the cache when nothing changed", async () => {
+    const dbPath = hostDb(10);
+    const cacheDir = join(dbPath, "..", "seq-cache");
+    seqIndexDebug(dbPath, "s1", cacheDir);
+    const file = join(cacheDir, cacheFiles(cacheDir)[0]);
+    const before = statSync(file).mtimeMs;
+    await new Promise((r) => setTimeout(r, 60));
+
+    clearSeqIndexes();
+    const loaded = seqIndexDebug(dbPath, "s1", cacheDir);
+    expect(loaded.fromCache).toBe(true);
+    expect(statSync(file).mtimeMs).toBe(before);
   });
 });
