@@ -94,7 +94,7 @@ def _make_config(**overrides) -> HindsightConfig:
             "typesafe",
             {"reranker_typesafe_api_key": "k"},
             "reranker_typesafe_timeout",
-            ("timeout",),
+            ("_client", "timeout"),
         ),
         (
             "litellm",

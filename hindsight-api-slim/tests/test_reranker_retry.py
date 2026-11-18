@@ -211,7 +211,6 @@ class TestEveryRemoteRerankerRetries:
                     "reranker_nvidia_base_url": "https://example.invalid",
                 },
             ),
-            ("typesafe", {"reranker_typesafe_api_key": "k"}),
             ("hindsight", {"reranker_hindsight_api_key": "k"}),
             ("alibaba", {"reranker_alibaba_api_key": "k"}),
             ("google", {"reranker_google_project_id": "p"}),
@@ -225,18 +224,27 @@ class TestEveryRemoteRerankerRetries:
         assert encoder.retry_policy.max_retries == 7
         assert encoder.retry_policy.budget_seconds == 42.5
 
+    @pytest.mark.parametrize("per_candidate", [False, True])
+    def test_typesafe_retries_each_decision_request_with_the_reranker_policy(self, per_candidate):
+        """Its decision engine retries per request, so predict() gets no second layer."""
+        encoder = self._build(
+            "typesafe", {"reranker_typesafe_api_key": "k", "reranker_typesafe_per_candidate": per_candidate}
+        )
+        policy = encoder._client.retry_policy  # type: ignore[attr-defined]
+        assert policy.max_retries == 7
+        assert policy.budget_seconds == 42.5
+
     @pytest.mark.parametrize("provider", sorted(_RERANKER_PROVIDERS_WITHOUT_RETRY))
     def test_exempt_providers_are_left_alone(self, provider):
-        """In-process backends and TEI (own retry loop) must not gain a second layer."""
-        extra = (
-            {
+        """In-process backends, TEI (own retry loop) and the decision engine must not gain a second layer."""
+        extra = {
+            "tei": {
                 "reranker_tei_url": "https://example.invalid",
                 "reranker_tei_batch_size": 32,
                 "reranker_tei_max_concurrent": 4,
-            }
-            if provider == "tei"
-            else {}
-        )
+            },
+            "typesafe": {"reranker_typesafe_api_key": "k"},
+        }.get(provider, {})
         encoder = self._build(provider, extra)
         assert encoder.retry_policy is None
 

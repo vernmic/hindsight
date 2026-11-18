@@ -24,6 +24,8 @@ from pydantic import BaseModel
 from .._cross_loop import CrossLoopSemaphore
 from .._thread_limits import bound_onnx_session, onnx_intra_op_threads
 from ..config import (
+    DECISION_MODEL_PROVIDER_DEFAULTS,
+    DEFAULT_DECISION_MODEL_MAX_REQUEST_TOKENS,
     DEFAULT_LITELLM_API_BASE,
     DEFAULT_RERANKER_ALIBABA_MODEL,
     DEFAULT_RERANKER_COHERE_MAX_CONCURRENT,
@@ -61,11 +63,12 @@ from ..config import (
     DEFAULT_RERANKER_ZEROENTROPY_MODEL,
     DEFAULT_ZEROENTROPY_BASE_URL,
     HINDSIGHT_INFERENCE_URL,
+    DecisionModelConfig,
     RerankerMemberConfig,
 )
 from .aiohttp_session import LoopLocal, LoopLocalSession, UpstreamHTTPError, per_phase_timeout, raise_for_status
 from .bank_attribution import reranker_bank_attribution_headers
-from .decision_model import overflowed_window, record_decision_call
+from .decision_model import DecisionModel, overflowed_window, record_decision_call
 from .llm_trace import RERANK_SCOPE, trace_model_call
 from .local_device import (
     LOCAL_MODEL_BUILD_LOCK,
@@ -2686,6 +2689,8 @@ _RERANKER_PROVIDERS_WITHOUT_RETRY = {
     # Already retries internally, including TEI's 429-as-backpressure handling.
     # A second layer would multiply its attempts by ours.
     "tei": "own _async_request_with_retry (see tei_retry.py)",
+    # The decision engine retries each of its requests with the reranker's retry policy.
+    "typesafe": "its decision engine retries each request (see DecisionModel.ask)",
 }
 
 
@@ -2890,14 +2895,29 @@ def _create_cross_encoder_backend(member: RerankerMemberConfig) -> CrossEncoderM
             raise ValueError(
                 f"{member.env_name('TYPESAFE_API_KEY')} is required when {member.env_name('PROVIDER')} is 'typesafe'"
             )
-        return TypeSafeCrossEncoder(
-            api_key=api_key,
-            model=member.typesafe_model,
-            base_url=member.typesafe_base_url,
-            timeout=member.typesafe_timeout,
-            max_concurrent=member.typesafe_max_concurrent,
-            prune_candidates=member.typesafe_prune_candidates,
+        # Imported here: the decision rerankers subclass CrossEncoderModel from this module.
+        from .search.decision_reranker import DecisionModelReranker, ListwiseDecisionReranker
+
+        # The shared decision engine, built from this member's settings. Its own, not the cached
+        # one: it retries each request with the reranker's retry policy (so the predict() layer
+        # is left off, see _RERANKER_PROVIDERS_WITHOUT_RETRY), which no other operation shares.
+        engine = DecisionModel.from_config(
+            DecisionModelConfig(
+                provider="typesafe",
+                api_key=api_key,
+                # Tolerate an unset-but-present value ("VAR=" in a compose file) by falling back.
+                model=member.typesafe_model or DEFAULT_RERANKER_TYPESAFE_MODEL,
+                base_url=member.typesafe_base_url or DEFAULT_RERANKER_TYPESAFE_BASE_URL,
+                timeout=member.typesafe_timeout,
+                max_concurrent=member.typesafe_max_concurrent or DEFAULT_RERANKER_TYPESAFE_MAX_CONCURRENT,
+                max_request_tokens=DEFAULT_DECISION_MODEL_MAX_REQUEST_TOKENS,
+                tokenizer=DECISION_MODEL_PROVIDER_DEFAULTS["typesafe"].tokenizer,
+            ),
+            retry_policy=_reranker_retry_policy(),
         )
+        if member.typesafe_per_candidate:
+            return DecisionModelReranker(engine, prune=member.typesafe_prune_candidates)
+        return ListwiseDecisionReranker(engine, prune=member.typesafe_prune_candidates)
     elif provider == "hindsight":
         # Imported here: cloud_auth pulls in aiohttp's server, which only this provider needs.
         from .providers.cloud_auth import saved_api_key

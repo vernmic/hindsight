@@ -324,6 +324,7 @@ class DecisionModel:
         self.retry_policy = retry_policy or RetryPolicy()
         self.model = model
         self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
         # CrossLoopSemaphore, not asyncio.Semaphore: one client is built at startup and
         # reached from every loop in the process (worker threads run their own via
         # asyncio.run), and an asyncio.Semaphore binds to the first loop that waits on it.
@@ -334,7 +335,7 @@ class DecisionModel:
         )
 
     @classmethod
-    def from_config(cls, config: DecisionModelConfig) -> DecisionModel:
+    def from_config(cls, config: DecisionModelConfig, *, retry_policy: RetryPolicy | None = None) -> DecisionModel:
         return cls(
             provider=config.provider,
             api_key=config.api_key,
@@ -343,6 +344,7 @@ class DecisionModel:
             timeout=config.timeout,
             max_concurrent=config.max_concurrent,
             max_request_tokens=config.max_request_tokens,
+            retry_policy=retry_policy,
             tokenizer=config.tokenizer,
             vision=config.vision,
         )
