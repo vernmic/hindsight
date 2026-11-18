@@ -813,6 +813,8 @@ ENV_DECISION_MODEL_TOKENIZER = "HINDSIGHT_API_DECISION_MODEL_TOKENIZER"
 ENV_RECALL_DECISION_MODEL_PRUNE = "HINDSIGHT_API_RECALL_DECISION_MODEL_PRUNE"
 ENV_RECALL_DECISION_MODEL_DEDUP = "HINDSIGHT_API_RECALL_DECISION_MODEL_DEDUP"
 ENV_RECALL_DECISION_MODEL_FALLBACK = "HINDSIGHT_API_RECALL_DECISION_MODEL_FALLBACK"
+ENV_RECALL_DECISION_MODEL_HEAD = "HINDSIGHT_API_RECALL_DECISION_MODEL_HEAD"
+ENV_RECALL_DECISION_MODEL_CONTEXT_MAX_CHARS = "HINDSIGHT_API_RECALL_DECISION_MODEL_CONTEXT_MAX_CHARS"
 
 ENV_VECTOR_EXTENSION = "HINDSIGHT_API_VECTOR_EXTENSION"
 ENV_ANN_ITERATIVE_SCAN = "HINDSIGHT_API_ANN_ITERATIVE_SCAN"
@@ -1822,6 +1824,30 @@ DEFAULT_RECALL_DECISION_MODEL_DEDUP = False
 # Off by default: a recall ranked by the cross-encoder instead is a quieter, worse answer, so a
 # failing decision model fails the recall unless the operator chose the fallback.
 DEFAULT_RECALL_DECISION_MODEL_FALLBACK = False
+# Off by default (0): it costs one more decision-model request per recall. When set to N >= 2,
+# the N best candidates are compared pairwise, each pair asked both ways round, and reordered
+# by wins: the per-candidate answers place each memory on its own, so two that both answer the
+# question are not told apart by them.
+DEFAULT_RECALL_DECISION_MODEL_HEAD = 0
+# The most head candidates compared: the pairs grow with its square (12 -> 132 questions).
+MAX_RECALL_DECISION_MODEL_HEAD = 12
+# Unset by default: each candidate keeps its whole context prefix, as before. A memory's context
+# can be far longer than its text (retain metadata, a turn's instructions), and the decision model
+# reads every character of it per candidate. 0 sends the memory text alone.
+DEFAULT_RECALL_DECISION_MODEL_CONTEXT_MAX_CHARS: int | None = None
+
+
+def _parse_recall_decision_model_head(value: str | None) -> int:
+    """The head size: unset or 0 is off, 1 is off too (one candidate has no pair), above
+    MAX_RECALL_DECISION_MODEL_HEAD is refused rather than silently asking hundreds of pairs."""
+    if not value:
+        return DEFAULT_RECALL_DECISION_MODEL_HEAD
+    head = int(value)
+    if head < 0 or head > MAX_RECALL_DECISION_MODEL_HEAD:
+        raise ValueError(
+            f"{ENV_RECALL_DECISION_MODEL_HEAD} must be between 0 and {MAX_RECALL_DECISION_MODEL_HEAD}, not {head}"
+        )
+    return head
 
 
 def _decision_model_env(operation: str, setting: str) -> str:
@@ -4477,6 +4503,10 @@ class HindsightConfig:
     # Server-wide (one reranker serves every bank): when the decision model fails a recall's
     # ranking, rank it with the configured HINDSIGHT_API_RERANKER_* chain instead.
     recall_decision_model_fallback: bool = DEFAULT_RECALL_DECISION_MODEL_FALLBACK
+    # Server-wide: how many of the best candidates get a pairwise head round (0 = none), and the
+    # most characters of a candidate's context sent to the decision model (None = all of it).
+    recall_decision_model_head: int = DEFAULT_RECALL_DECISION_MODEL_HEAD
+    recall_decision_model_context_max_chars: int | None = DEFAULT_RECALL_DECISION_MODEL_CONTEXT_MAX_CHARS
     reflect_decision_model_provider: str | None = None
     reflect_decision_model_api_key: str | None = None
     reflect_decision_model_model: str | None = None
@@ -5806,6 +5836,10 @@ class HindsightConfig:
             recall_decision_model_fallback=_parse_boolean_env(
                 ENV_RECALL_DECISION_MODEL_FALLBACK, DEFAULT_RECALL_DECISION_MODEL_FALLBACK
             ),
+            recall_decision_model_head=_parse_recall_decision_model_head(os.getenv(ENV_RECALL_DECISION_MODEL_HEAD)),
+            recall_decision_model_context_max_chars=int(v)
+            if (v := os.getenv(ENV_RECALL_DECISION_MODEL_CONTEXT_MAX_CHARS))
+            else DEFAULT_RECALL_DECISION_MODEL_CONTEXT_MAX_CHARS,
             # Server
             host=os.getenv(ENV_HOST) or None,
             port=int(os.getenv(ENV_PORT, DEFAULT_PORT)),

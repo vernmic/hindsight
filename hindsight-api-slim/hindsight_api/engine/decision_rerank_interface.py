@@ -213,6 +213,45 @@ class RepeatQuestion:
         }
 
 
+# Head round, opt-in (the caller sets the head size; 0 or 1 asks nothing). The per-candidate
+# question places each memory on its own, so two memories that both answer the question come back
+# close together and are not told apart. The head round compares the best few pairwise: "which of
+# these two answers the question better". A pair is asked both ways round, because a choice leans
+# toward the option it is shown first; one comparative choice over the whole head picked a
+# different winner in 4 of 10 real 60-candidate recalls when its options were reversed, while
+# pairs asked both ways agreed with themselves in 222 of 280 (jev-1.13, 2026-11-18). The head is
+# reordered by summed win probability; the per-candidate order breaks ties. Every pair goes in one
+# request batch under the ranking state, as dedup's do.
+HEAD_INSTRUCTIONS = (
+    "Both memories may bear on the question. Which one answers it better: more directly, completely and specifically?"
+)
+HEAD_OPTIONS: dict[str, str | None] = {
+    "a": "Memory A answers the question better.",
+    "b": "Memory B answers the question better.",
+}
+
+
+@dataclass(frozen=True)
+class HeadQuestion:
+    """The head round's question: does the candidate at ``first`` (Memory A) answer the
+    question better than the one at ``second`` (Memory B)? Each pair is asked twice, once each
+    way round, under keys ``h{first}_{second}`` and ``h{second}_{first}``."""
+
+    key: str
+    first: int
+    second: int
+    memory_a: str
+    memory_b: str
+
+    def system_one(self) -> dict[str, object]:
+        """The question as System One takes it: a Choice between the two memories."""
+        return {
+            "type": "choice",
+            "instructions": {"task": HEAD_INSTRUCTIONS, "memory_a": self.memory_a, "memory_b": self.memory_b},
+            "criteria": dict(HEAD_OPTIONS),
+        }
+
+
 @dataclass(frozen=True)
 class DecisionRerank:
     """Builds one rerank's System One requests and turns the answers into scores.
@@ -431,6 +470,61 @@ class DecisionRerank:
             else:
                 kept.append(slot)
         return [0.0 if slot in dropped else score for slot, score in enumerate(scores)]
+
+    def head_questions(self, docs: Sequence[str], scores: Sequence[float], head: int) -> list[HeadQuestion]:
+        """The head round's questions: every pair among the ``head`` best candidates still in the
+        pool, each asked both ways round. None when fewer than two remain or ``head`` < 2.
+
+        ``scores`` are :meth:`scores`, :meth:`pruned` or :meth:`deduped`; a candidate at 0.0 is out.
+        ``docs`` are the uncapped texts, capped here as in the ranking questions.
+        """
+        if head < 2:
+            return []
+        top = DecisionRerank._ranked(scores)[:head]
+        capped = {slot: self.capped(docs[slot], MAX_MEMORY_TOKENS) for slot in top}
+        questions: list[HeadQuestion] = []
+        for position, first in enumerate(top):
+            for second in top[position + 1 :]:
+                for a, b in ((first, second), (second, first)):
+                    questions.append(
+                        HeadQuestion(key=f"h{a}_{b}", first=a, second=b, memory_a=capped[a], memory_b=capped[b])
+                    )
+        return questions
+
+    @staticmethod
+    def headed(
+        scores: Sequence[float],
+        questions: Sequence[HeadQuestion],
+        answers: Mapping[str, Mapping[str, float] | None],
+    ) -> list[float]:
+        """``scores`` with the head reordered by pairwise wins; ``answers`` maps each question's
+        key to its choice probabilities.
+
+        A candidate's wins are the probability it was judged better, summed over every question
+        it was in, either way round. An unanswered question counts as a draw (0.5 each). The head
+        keeps the score values it had, handed out again in the new order, so everything below the
+        head and every candidate already at 0.0 is untouched; equal wins keep the earlier order.
+        """
+        if not questions:
+            return list(scores)
+        wins: dict[int, float] = {}
+        for question in questions:
+            probabilities = answers.get(question.key) or {}
+            p_a = probabilities.get("a")
+            p_b = probabilities.get("b")
+            if p_a is None or p_b is None:
+                p_a = p_b = 0.5
+            wins[question.first] = wins.get(question.first, 0.0) + float(p_a)
+            wins[question.second] = wins.get(question.second, 0.0) + float(p_b)
+        before = [slot for slot in DecisionRerank._ranked(scores) if slot in wins]
+        # Rounded: equal wins summed in a different order can differ in the last bit, and a
+        # tie must keep the earlier order (the sort is stable).
+        after = sorted(before, key=lambda slot: -round(wins[slot], 9))
+        values = [scores[slot] for slot in before]
+        result = list(scores)
+        for slot, value in zip(after, values):
+            result[slot] = value
+        return result
 
     @staticmethod
     def _ranked(scores: Sequence[float]) -> list[int]:

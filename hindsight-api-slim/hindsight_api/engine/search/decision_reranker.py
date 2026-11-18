@@ -51,6 +51,8 @@ class DecisionRerankOptions:
 
     prune: bool = False
     dedup: bool = False
+    #: How many of the best candidates get the pairwise head round; 0 (or 1) asks none.
+    head: int = 0
     fact_types: list[str] | None = None
     ids: list[str] | None = None
     embeddings: asyncio.Task[dict[str, np.ndarray] | None] | None = None
@@ -125,6 +127,17 @@ class DecisionModelReranker(CrossEncoderModel):
                     scope="decision_recall_dedup",
                 )
                 ranked = rerank.deduped(ranked, repeats, {key: answer.noul for key, answer in found.items()})
+        if options.head >= 2:
+            # After dedup, so a repeat never takes a head place. Its pairs depend on the
+            # ranking (and dedup) answers above, so it is one more request.
+            pairs = rerank.head_questions(subset, ranked, options.head)
+            if pairs:
+                judged = await self._client.ask_all(
+                    state,
+                    {q.key: DecisionQuestion.model_validate(q.system_one()) for q in pairs},
+                    scope="decision_recall_head",
+                )
+                ranked = rerank.headed(ranked, pairs, {key: answer.probabilities for key, answer in judged.items()})
         for slot, score in enumerate(ranked):
             scores[indices[slot]] = score
 
