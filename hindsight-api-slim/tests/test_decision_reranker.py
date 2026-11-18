@@ -28,9 +28,11 @@ class _Client:
     """Answers each candidate's question from ``keep``, by memory text; a dedup question
     is a repeat when its (Memory A, Memory B) texts are in ``repeats``."""
 
-    def __init__(self, keep=None, repeats=()):
+    def __init__(self, keep=None, repeats=(), better=()):
         self.keep = keep or {}
         self.repeats = set(repeats)
+        # Head round: (winner, loser) memory texts; any other pair is a draw.
+        self.better = set(better)
         self.asked: list[tuple[str, dict]] = []
         self.scopes: list[str] = []
         self.max_request_tokens = 26_000
@@ -41,7 +43,17 @@ class _Client:
     async def ask_all(self, state, questions, *, scope, assets=None):
         self.asked.append((state, questions))
         self.scopes.append(scope)
-        return {key: DecisionAnswer(noul=self._answer(question.instructions)) for key, question in questions.items()}
+        return {
+            key: self._choice(question.instructions)
+            if question.type == "choice"
+            else DecisionAnswer(noul=self._answer(question.instructions))
+            for key, question in questions.items()
+        }
+
+    def _choice(self, instructions) -> DecisionAnswer:
+        a, b = instructions["memory_a"], instructions["memory_b"]
+        p_a = 0.9 if (a, b) in self.better else 0.1 if (b, a) in self.better else 0.5
+        return DecisionAnswer(choice="a" if p_a >= 0.5 else "b", probabilities={"a": p_a, "b": 1.0 - p_a})
 
     def _answer(self, instructions) -> float:
         if "memory_a" in instructions:
@@ -339,6 +351,96 @@ class TestDedup:
         reranker = CrossEncoderReranker(cross_encoder=_reranker(client))
         result = await reranker.rerank("q", [_candidate(TEA_AGAIN), _candidate(TEA)], dedup=True)
         assert [r.candidate.retrieval.text for r in result.results] == [TEA]
+
+
+DIRECT = "Pushing code branches to origin is allowed without asking; never push main"
+GUIDE = "The fork guide says main is the docs branch on every fork"
+TANGENT = "Origin is the vernmic fork"
+
+
+class TestHead:
+    """Two memories that both answer the question come back close on the per-candidate
+    question; the head round compares them pairwise and puts the better one first."""
+
+    async def test_off_by_default_no_head_request(self):
+        client = _Client({GUIDE: 0.9, DIRECT: 0.85}, better={(DIRECT, GUIDE)})
+        scores = await _predict(client, [GUIDE, DIRECT])
+        assert scores == [1.0, 0.5]
+        assert client.scopes == ["decision_recall_rerank"]
+
+    async def test_the_better_answer_moves_up_in_one_more_request(self):
+        client = _Client({GUIDE: 0.9, DIRECT: 0.85, TANGENT: 0.2}, better={(DIRECT, GUIDE)})
+        scores = await _predict(client, [GUIDE, DIRECT, TANGENT], head=2)
+        assert scores[1] == 1.0 and scores[0] < 1.0
+        # Below the head nothing moves.
+        assert scores[2] == pytest.approx(1 / 3)
+        assert client.scopes == ["decision_recall_rerank", "decision_recall_head"]
+
+    async def test_each_pair_is_asked_both_ways_round(self):
+        client = _Client({GUIDE: 0.9, DIRECT: 0.85, TANGENT: 0.8})
+        await _predict(client, [GUIDE, DIRECT, TANGENT], head=3)
+        _, head = client.asked[-1]
+        asked = sorted((q.instructions["memory_a"], q.instructions["memory_b"]) for q in head.values())
+        expected = sorted((a, b) for a in (GUIDE, DIRECT, TANGENT) for b in (GUIDE, DIRECT, TANGENT) if a != b)
+        assert asked == expected
+        assert all(q.type == "choice" for q in head.values())
+
+    async def test_draws_keep_the_per_candidate_order(self):
+        client = _Client({GUIDE: 0.9, DIRECT: 0.85})
+        assert await _predict(client, [GUIDE, DIRECT], head=2) == [1.0, 0.5]
+
+    async def test_a_dropped_candidate_never_takes_a_head_place(self):
+        client = _Client({GUIDE: 0.9, DIRECT: 0.85, TANGENT: 0.05}, better={(TANGENT, GUIDE), (TANGENT, DIRECT)})
+        scores = await _predict(client, [GUIDE, DIRECT, TANGENT], prune=True, head=3)
+        assert scores[2] == 0.0
+        _, head = client.asked[-1]
+        assert all(TANGENT not in (q.instructions["memory_a"], q.instructions["memory_b"]) for q in head.values())
+
+    async def test_recall_reads_the_head_size_from_the_server_config(self, monkeypatch):
+        from hindsight_api import config as config_module
+
+        monkeypatch.setenv("HINDSIGHT_API_RECALL_DECISION_MODEL_HEAD", "2")
+        monkeypatch.setattr(config_module, "get_config", config_module.HindsightConfig.from_env)
+        client = _Client({GUIDE: 0.9, DIRECT: 0.85}, better={(DIRECT, GUIDE)})
+        reranker = CrossEncoderReranker(cross_encoder=_reranker(client))
+        result = await reranker.rerank("q", [_candidate(GUIDE), _candidate(DIRECT)])
+        assert [r.candidate.retrieval.text for r in result.results] == [DIRECT, GUIDE]
+
+    def test_a_head_past_the_cap_is_refused(self, monkeypatch):
+        from hindsight_api import config as config_module
+
+        monkeypatch.setenv("HINDSIGHT_API_RECALL_DECISION_MODEL_HEAD", "50")
+        with pytest.raises(ValueError, match="RECALL_DECISION_MODEL_HEAD"):
+            config_module.HindsightConfig.from_env()
+
+
+class TestContextCap:
+    """A memory's context can dwarf its text; the cap bounds what the decision model reads."""
+
+    # Long next to the memory, still under the per-memory token cap so the cap is what's tested.
+    BOILERPLATE = "This content is an AI-assistant conversation transcript. " * 50
+
+    async def _memories(self, monkeypatch, cap: str | None) -> list[str]:
+        from hindsight_api import config as config_module
+
+        if cap is not None:
+            monkeypatch.setenv("HINDSIGHT_API_RECALL_DECISION_MODEL_CONTEXT_MAX_CHARS", cap)
+        monkeypatch.setattr(config_module, "get_config", config_module.HindsightConfig.from_env)
+        client = _Client()
+        reranker = CrossEncoderReranker(cross_encoder=_reranker(client))
+        await reranker.rerank("q", [_candidate("a", self.BOILERPLATE), _candidate("b", "short ctx")])
+        return [q.instructions["memory"] for q in client.asked[0][1].values()]
+
+    async def test_unset_keeps_the_whole_context(self, monkeypatch):
+        memories = await self._memories(monkeypatch, None)
+        assert memories[0] == f"{self.BOILERPLATE}: a"
+
+    async def test_zero_sends_the_memory_text_alone(self, monkeypatch):
+        assert await self._memories(monkeypatch, "0") == ["a", "b"]
+
+    async def test_a_cap_truncates_each_context(self, monkeypatch):
+        memories = await self._memories(monkeypatch, "20")
+        assert memories == [f"{self.BOILERPLATE[:20]}: a", "short ctx: b"]
 
 
 # Stored embeddings: the two tea memories point the same way, sencha elsewhere.
