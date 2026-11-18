@@ -33,9 +33,9 @@ import io
 import json
 import logging
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from functools import lru_cache
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 
 from pydantic import BaseModel, Field
 
@@ -44,7 +44,8 @@ from .._cross_loop import CrossLoopSemaphore
 from ..config import SYSTEM_ONE_DECISION_MODEL_PROVIDERS, DecisionModelConfig, DecisionModelOperation
 from ..tracing import get_span_recorder
 from .aiohttp_session import LoopLocalSession, UpstreamHTTPError, per_phase_timeout, raise_for_status
-from .decision_rerank_interface import MAX_REQUEST_TOKENS, DecisionRerank, EvidenceImage
+from .bank_attribution import reranker_bank_attribution_headers
+from .decision_rerank_interface import MAX_QUERY_TOKENS, MAX_REQUEST_TOKENS, DecisionRerank, EvidenceImage
 from .remote_retry import RetryPolicy, acall_with_retry
 from .token_encoding import count_tokens, truncate_to_tokens
 
@@ -220,6 +221,46 @@ def record_decision_call(
 # Hindsight Inference refuses a body over 2 MB; this leaves room for the per-question counting
 # being approximate. aiohttp sends json.dumps' ASCII output, so characters are bytes.
 MAX_REQUEST_BYTES = 1_800_000
+
+# The listwise questions: reflect's evidence pruning (rank, then cut), its "is this enough?"
+# verdict, the page-impact gate of a delta page refresh, and the deprecated typesafe reranker's
+# listwise order. Each is one question per request, so it goes to any provider.
+_RANK_INSTRUCTIONS_PREFIX = "Which candidate answers the question: "
+_CUT_INSTRUCTIONS = (
+    "How far down this ranked list does genuine relevance to the question extend? "
+    "Count a candidate as relevant only if it helps answer the question."
+)
+_SUFFICIENCY_INSTRUCTIONS = (
+    "Does the evidence above answer the question? Judge only what the evidence states, "
+    "not what could be guessed from it."
+)
+
+# The page-impact gate answers with the single most likely option, and anything but
+# "no" keeps the memory. With only yes/no, a memory that bears on the topic by
+# implication lost to "no": "the payment SDK vendor ends support on 1 September"
+# against a page of risks to a 15 September launch got p(yes) 0.10-0.22, so a new
+# launch risk never reached the page. Several ways to say "it may matter" split the
+# doubt across options that all keep the memory, so "no" wins only when it is the
+# model's clear answer: on replayed eval pages, 54/54 memories that should change a
+# page kept (48/54 before), unrelated memories let through 13/80 (12/80 before).
+_PAGE_IMPACT_INSTRUCTIONS = (
+    "Is the new memory about the page's topic, or about anything the topic depends on (a "
+    "dependency, vendor, date, person or system the topic relies on)? A memory that could "
+    "threaten, block, delay or change what the topic is about counts, even when it never names "
+    "the topic. Answer no only when it concerns a different subject altogether."
+)
+_PAGE_IMPACT_OPTIONS: dict[str, str | None] = {
+    "yes": "Yes, it concerns the page's topic or something it depends on",
+    "maybe": "Possibly, it might affect the topic or something it relies on",
+    "unsure": "Unclear whether it bears on the topic",
+    "depends": "It concerns something the topic relies on (a vendor, dependency, date, person or system)",
+    "no": "No, a different subject altogether: nothing this page covers or relies on",
+}
+
+OPTION_KEY_OVERHEAD = 7  # JSON envelope overhead per choice option: '"c249": "' + comma/newline
+_LISTING_ITEM_OVERHEAD = 10  # Formatting overhead per item in cut listing: "[1] ...\n\n"
+_T = TypeVar("_T")
+
 
 #: What System One takes as an image asset (docs.typesafe.ai/images): PNG or baseline JPEG, each side
 #: 280-1568 px, never resized for you. One image it refuses fails the whole request, so the rest are
@@ -412,6 +453,314 @@ class DecisionModel:
             # on the query, shared context and each memory, which keep the default's.
             max_request_tokens=self.max_request_tokens or MAX_REQUEST_TOKENS,
         )
+
+    # --- The listwise questions (see _RANK_INSTRUCTIONS_PREFIX). Counted in the default
+    # tokenizer against MAX_QUESTION_TOKENS, as they were when reflect had its own client.
+
+    # A Choice accepts at most 255 options; stay clear of the edge. A pool larger than this or
+    # over the question budget is ranked in chunks whose winners are then ranked against each
+    # other, because probabilities are normalised within a call and so cannot be compared across two.
+    MAX_OPTIONS = 250
+
+    # How many of the ranked candidates the cut question is shown, and how many of each chunk's
+    # best reach the finals. The cut only ever keeps a handful, so a longer list costs tokens to
+    # no purpose; reflect raises it (see rank()).
+    SHORTLIST = 12
+
+    # Context window safety limit for one question. A defensive margin (26k vs Jev's 32k) absorbs
+    # JSON framing and most cross-tokenizer divergence, but not all of it: on mixed-script text Jev
+    # counts twice what we do (#5715). A request the endpoint still finds too long is rebuilt at
+    # half the budget (see _within_window), down to MIN_QUESTION_TOKENS.
+    MAX_QUESTION_TOKENS = 26_000
+    # Three halvings: 26k -> 3.25k covers an 8x divergence, well past the 2x measured.
+    # A request still refused there will never fit, so it fails rather than retrying on.
+    MIN_QUESTION_TOKENS = 3_000
+
+    # Ordered depths for the cut. The model picks the level; these are the granularity offered,
+    # a design choice and not a tuned threshold. There is deliberately no "nothing is relevant"
+    # level, so at least one candidate always survives: one weak memory the caller can dismiss
+    # beats silence; adding that level cost 7% of queries returning nothing and dropped gold
+    # retention from 0.81 to 0.65.
+    CUT_LEVELS = [
+        "Only the first candidate is relevant",
+        "The first two are relevant",
+        "The first three are relevant",
+        "The first five are relevant",
+        "The first ten are relevant",
+        "All of the listed candidates are relevant",
+    ]
+    CUT_DEPTHS = [1, 2, 3, 5, 10, None]  # None keeps the whole shortlist
+
+    # Ordered verdicts for reflect's sufficiency question; only the last one ends retrieval.
+    # "Partly" is its own level so a half-answer keeps searching.
+    SUFFICIENCY_LEVELS = [
+        "The evidence does not answer the question",
+        "The evidence answers part of the question; something it asks is missing",
+        "The evidence fully answers the question",
+    ]
+
+    async def rank(
+        self,
+        query: str,
+        docs: Sequence[str],
+        *,
+        prune: bool = False,
+        shortlist: int | None = None,
+        min_keep: int = 0,
+    ) -> list[float]:
+        """Scores for ``docs`` against ``query`` from one listwise Choice, and with ``prune`` a cut.
+
+        **Rank: one Choice whose options are the candidates.** Judged together the model only has
+        to say which candidate beats which; on a 200-question LoCoMo set this scored recall@1 0.94
+        against 0.87 for one question per candidate (recall's DecisionModelReranker), at a
+        thirtieth of the calls, though it ranks the tail worse. Pools over MAX_OPTIONS or the
+        question budget are ranked in rounds (see _rank).
+
+        **Cut: one Score over the ranked shortlist**, asking how far down relevance extends. A
+        Score's levels are ordered, which a cut point needs; a "none of these" option on the
+        Choice instead wins outright on hard queries (35 of 200 came back empty).
+
+        The scores are positions, not confidences: descending from 1.0 in rank order, and 0.0
+        past the cut. ``shortlist`` (default SHORTLIST) sizes the cut's list and each round's
+        finalists; ``min_keep`` is the fewest candidates a cut keeps, by rank.
+        """
+        if not docs:
+            return []
+        shortlist = shortlist or self.SHORTLIST
+        # Query appears in both state and instructions across rank and cut. Bounded once so both
+        # share the identical query, preventing overflow in the cut and drift between the two.
+        query_cap = min(MAX_QUERY_TOKENS, max(50, (self.MAX_QUESTION_TOKENS - 200) // 2))
+        if count_tokens(query) > query_cap:
+            query = truncate_to_tokens(query, query_cap).text
+        texts = list(docs)
+        indices = list(range(len(texts)))
+        order = await self._within_window(lambda budget: self._rank(query, texts, indices, budget, shortlist))
+        keep = (
+            await self._within_window(lambda budget: self._cut(query, texts, order, budget, shortlist))
+            if prune
+            else len(order)
+        )
+        keep = max(keep, min(min_keep, len(order)))
+        scores = [0.0] * len(texts)
+        for position, index in enumerate(order):
+            scores[index] = (len(order) - position) / len(order) if position < keep else 0.0
+        return scores
+
+    async def evidence_is_sufficient(
+        self, query: str, evidence: str, *, pictures: Sequence[EvidenceImage] = ()
+    ) -> bool:
+        """Whether ``evidence`` already answers ``query``: one Score question.
+
+        Used by a decision-orchestrated reflect to skip the LLM turns that would otherwise decide
+        to keep searching. A Score, not a yes/no Choice, for the reason the cut uses one: the
+        levels are ordered, and "partly" must not be rounded up to "yes".
+
+        ``pictures`` (the knowledge-bank pictures the evidence names by label) are shown too
+        where :meth:`shown` allows, as image assets each referenced after its label.
+        """
+        assets = self.shown(pictures)
+        pictures_text = "".join(f"\n{picture.label}: {ref}" for ref, picture in assets.items())
+        overhead = (
+            count_tokens(_SUFFICIENCY_INSTRUCTIONS) + sum(count_tokens(level) for level in self.SUFFICIENCY_LEVELS) + 50
+        )
+        prefix = f"Question: {query}\n\nEvidence:\n"
+        question = DecisionQuestion(
+            type="score", instructions=_SUFFICIENCY_INSTRUCTIONS, criteria=self.SUFFICIENCY_LEVELS
+        )
+
+        async def ask(question_budget: int) -> DecisionAnswer:
+            # The pictures' own tokens are the endpoint's to count: a request it finds too long is rebuilt smaller.
+            budget = max(100, question_budget - overhead - count_tokens(prefix) - count_tokens(pictures_text))
+            # Keeps the head of the evidence; the agent's own results come first (pages, then
+            # observations, then facts), so the tail is raw facts.
+            fitted = truncate_to_tokens(evidence, budget).text if count_tokens(evidence) > budget else evidence
+            state = f"{prefix}{fitted}" + (f"\n\nPictures:{pictures_text}" if assets else "")
+            return await self._ask_one(state, "sufficient", question, "decision_evidence_sufficiency", assets)
+
+        answer = await self._within_window(ask)
+        # The most likely level, not the rounded expected score: an expected 1.43 is "partly" when
+        # rounded, though "fully" was the likeliest verdict at 0.54 (sde-bench boltons-budget), and
+        # every such rounding cost two LLM turns. The score is the fallback for a reply without
+        # per-level probabilities.
+        probabilities = answer.probabilities
+        if probabilities:
+            level = int(max(probabilities, key=lambda key: probabilities[key]))
+        else:
+            level = round(answer.score or 0.0)
+        return level >= len(self.SUFFICIENCY_LEVELS) - 1
+
+    async def could_change_page(self, topic: str, page: str, memory: str) -> bool:
+        """Whether ``memory`` could change a page about ``topic`` that reads ``page``: one Choice.
+
+        Gates a delta page refresh: a memory answered "no" is never shown to the LLM. Worded so a
+        doubt is a "yes", because a wrong "no" is silent and permanent (the refresh moves past the
+        memory) while a wrong "yes" costs one LLM call, which is what every refresh pays without
+        the gate.
+        """
+        prefix = f"Page topic: {topic}\n\nNew memory: {memory}\n\nThe page as it reads now:\n"
+        overhead = (
+            count_tokens(_PAGE_IMPACT_INSTRUCTIONS)
+            + sum(count_tokens(option or "") for option in _PAGE_IMPACT_OPTIONS.values())
+            + count_tokens(prefix)
+            + 50
+        )
+        question = DecisionQuestion(
+            type="choice", instructions=_PAGE_IMPACT_INSTRUCTIONS, criteria=_PAGE_IMPACT_OPTIONS
+        )
+
+        async def ask(question_budget: int) -> DecisionAnswer:
+            budget = max(100, question_budget - overhead)
+            # Keeps the head of the page (its first sections); a page past ~25k tokens is already
+            # far over its own budget.
+            fitted = truncate_to_tokens(page, budget).text if count_tokens(page) > budget else page
+            return await self._ask_one(f"{prefix}{fitted}", "impact", question, "decision_page_impact")
+
+        answer = await self._within_window(ask)
+        probabilities = answer.probabilities
+        choice = answer.choice or max(probabilities, key=lambda key: probabilities[key], default="yes")
+        return choice != "no"
+
+    async def _ask_one(
+        self,
+        state: str,
+        key: str,
+        question: DecisionQuestion,
+        scope: str,
+        assets: Mapping[str, EvidenceImage] | None = None,
+    ) -> DecisionAnswer:
+        """One listwise question in its own request, carrying the bank attribution header."""
+        response = await self.ask(
+            state, {key: question}, scope=scope, assets=assets, headers=reranker_bank_attribution_headers()
+        )
+        return response.answers[key]
+
+    async def _within_window(self, build: Callable[[int], Awaitable[_T]]) -> _T:
+        """``build(budget)`` at the full question budget, halved each time the endpoint finds the
+        request longer than its window, since only the endpoint can count its own tokens."""
+        budget = self.MAX_QUESTION_TOKENS
+        while True:
+            try:
+                return await build(budget)
+            except Exception as e:
+                if not overflowed_window(e) or budget // 2 < self.MIN_QUESTION_TOKENS:
+                    raise
+            budget //= 2
+            logger.warning(f"Decision model: request overflowed the window, retrying at {budget} tokens")
+
+    async def _rank_once(self, query: str, docs: list[str], indices: list[int]) -> list[int]:
+        """Rank one group of candidates, returning their indices best first."""
+        # A Choice needs two options ("criteria must map 2 or more options"), and one candidate is
+        # already ranked. Guarded here, where every round asks, so a bank holding one memory does
+        # not fail with a 400.
+        if len(indices) < 2:
+            return list(indices)
+        question = DecisionQuestion(
+            type="choice",
+            instructions=f"{_RANK_INSTRUCTIONS_PREFIX}{query}",
+            criteria={f"c{position}": docs[index] for position, index in enumerate(indices)},
+        )
+        probabilities = (await self._ask_one(f"Question: {query}", "rank", question, "decision_rank")).probabilities
+        # Sort the option positions, not the indices themselves: the option key encodes the
+        # position, and two candidates can carry the same text.
+        by_probability = sorted(range(len(indices)), key=lambda position: -probabilities.get(f"c{position}", 0.0))
+        return [indices[position] for position in by_probability]
+
+    async def _rank(self, query: str, docs: list[str], indices: list[int], budget: int, shortlist: int) -> list[int]:
+        """Rank a whole pool best first, in rounds when it exceeds option or token limits.
+
+        Each round's probabilities are normalised within its own call, so the winners are ranked
+        against each other in a finals round. Candidates that do not make the finals keep their
+        caller input order (initial RRF rank) behind the finalists, discarding intra-group model
+        ranks since probabilities across separate rounds are not on a shared scale (#4599).
+        """
+        if not indices:
+            return []
+
+        state_tokens = count_tokens(f"Question: {query}")
+        # +30: cushion for the question's JSON framing (type, keys) around the instructions.
+        instr_tokens = count_tokens(f"{_RANK_INSTRUCTIONS_PREFIX}{query}") + 30
+        net_budget = max(50, budget - state_tokens - instr_tokens)
+
+        # Pre-truncate outlier documents that individually exceed the question budget, on a copy.
+        effective_docs = list(docs)
+        doc_tokens: dict[int, int] = {}
+        for index in indices:
+            tokens = count_tokens(effective_docs[index])
+            if tokens + OPTION_KEY_OVERHEAD > net_budget:
+                cap = max(10, net_budget - OPTION_KEY_OVERHEAD)
+                effective_docs[index] = truncate_to_tokens(effective_docs[index], cap).text
+                tokens = count_tokens(effective_docs[index])
+            doc_tokens[index] = tokens
+
+        # Pack candidates into groups bounded by MAX_OPTIONS and net_budget.
+        groups: list[list[int]] = []
+        current: list[int] = []
+        current_tokens = 0
+        for index in indices:
+            item_tokens = doc_tokens[index] + OPTION_KEY_OVERHEAD
+            if current and (len(current) >= self.MAX_OPTIONS or current_tokens + item_tokens > net_budget):
+                groups.append(current)
+                current, current_tokens = [index], item_tokens
+            else:
+                current.append(index)
+                current_tokens += item_tokens
+        if current:
+            groups.append(current)
+
+        if len(groups) == 1:
+            return await self._rank_once(query, effective_docs, groups[0])
+
+        # Single-candidate groups skip the preliminary round: a 1-option Choice is rejected and
+        # the winner is trivial.
+        multi = [i for i, group in enumerate(groups) if len(group) >= 2]
+        ranked_groups: list[list[int]] = [list(group) for group in groups]
+        if multi:
+            ranked = await asyncio.gather(*(self._rank_once(query, effective_docs, groups[i]) for i in multi))
+            for i, order in zip(multi, ranked):
+                ranked_groups[i] = order
+
+        # The top of each group advances to the finals; the rest fall back to RRF order (#4599).
+        # The finals is one Choice, so the finalists must fit MAX_OPTIONS too: long documents can
+        # split a pool into more than MAX_OPTIONS // shortlist groups, so the per-group quota
+        # shrinks, and past MAX_OPTIONS groups the lowest-input-ranked winners overflow into the rest.
+        quota = max(1, min(shortlist, self.MAX_OPTIONS // len(ranked_groups)))
+        finalists = [index for group in ranked_groups for index in group[:quota]]
+        rest = [index for group in ranked_groups for index in group[quota:]] + finalists[self.MAX_OPTIONS :]
+        finalists = finalists[: self.MAX_OPTIONS]
+        input_position = {index: position for position, index in enumerate(indices)}
+        rest.sort(key=lambda index: input_position[index])
+
+        # Finals round: if the finalists exceed the budget, cap each doc evenly.
+        if sum(doc_tokens[index] + OPTION_KEY_OVERHEAD for index in finalists) > net_budget:
+            cap = max(10, (net_budget - len(finalists) * OPTION_KEY_OVERHEAD) // len(finalists))
+            for index in finalists:
+                if doc_tokens[index] > cap:
+                    effective_docs[index] = truncate_to_tokens(effective_docs[index], cap).text
+
+        return await self._rank_once(query, effective_docs, finalists) + rest
+
+    async def _cut(self, query: str, docs: list[str], order: list[int], budget: int, shortlist: int) -> int:
+        """How many of the ranked candidates are relevant, as the model sees it."""
+        listed = order[:shortlist]
+        if not listed:
+            return 0
+        # Instructions and levels are fixed, plus a cushion for the request's JSON framing.
+        overhead = count_tokens(_CUT_INSTRUCTIONS) + sum(count_tokens(level) for level in self.CUT_LEVELS) + 50
+        prefix = f"Question: {query}\n\nCandidates, already ranked best first:\n"
+        available = max(100, budget - overhead - count_tokens(prefix))
+
+        texts = [docs[index] for index in listed]
+        tokens = [count_tokens(text) for text in texts]
+        if sum(tokens) + len(listed) * _LISTING_ITEM_OVERHEAD > available:
+            cap = max(10, (available - len(listed) * _LISTING_ITEM_OVERHEAD) // len(listed))
+            texts = [truncate_to_tokens(text, cap).text if t > cap else text for text, t in zip(texts, tokens)]
+
+        listing = "\n\n".join(f"[{position + 1}] {text}" for position, text in enumerate(texts))
+        question = DecisionQuestion(type="score", instructions=_CUT_INSTRUCTIONS, criteria=self.CUT_LEVELS)
+        answer = await self._ask_one(f"{prefix}{listing}", "depth", question, "decision_cut")
+        level = round(answer.score or 0.0)
+        depth = self.CUT_DEPTHS[min(len(self.CUT_DEPTHS) - 1, max(0, level))]
+        return len(listed) if depth is None else min(depth, len(listed))
 
     async def _ask_traced(
         self,

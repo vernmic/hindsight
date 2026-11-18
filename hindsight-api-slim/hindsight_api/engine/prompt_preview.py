@@ -515,17 +515,10 @@ def _render_reflect(
     if config.reflect_mission:
         profile["mission"] = config.reflect_mission
 
-    # The same rule the engine applies: a System One decision model the bank keeps on takes the
-    # free turn's done as the answer; otherwise the closing step writes it, and the model
+    # The same rule the engine applies: a decision model the bank keeps on takes the free
+    # turn's done as the answer; otherwise the closing step writes it, and the model
     # signals it is ready with answer_ready (#5832).
-    from ..config import SYSTEM_ONE_DECISION_MODEL_PROVIDERS
-
-    decision_setup = config.decision_model_config("reflect")
-    decision_orchestrated = (
-        config.reflect_use_decision_model
-        and decision_setup is not None
-        and decision_setup.provider in SYSTEM_ONE_DECISION_MODEL_PROVIDERS
-    )
+    decision_orchestrated = config.reflect_use_decision_model and config.decision_model_config("reflect") is not None
     system_prompt = build_system_prompt_for_tools(
         profile,
         None,

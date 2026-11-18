@@ -40,8 +40,9 @@ def engine():
 
 
 def _decision_model_set_up(engine) -> SimpleNamespace:
+    """Inject a decision engine for reflect, as the constructor's decision_engine_for would."""
     decision_model = SimpleNamespace(model="jev-test", evidence_is_sufficient=AsyncMock(return_value=True))
-    engine._reflect_decision_model_client = decision_model
+    engine._decision_engine_for = lambda operation: decision_model if operation == "reflect" else None
     return decision_model
 
 
@@ -104,10 +105,13 @@ async def test_a_refresh_follows_its_own_switch(engine, monkeypatch, label):
     assert not await _orchestrated(engine, monkeypatch, label, refresh=False)
 
 
-@pytest.mark.parametrize("provider", ["cloudflare", "openai"])
-def test_a_provider_reflect_cannot_speak_leaves_agent_turns(engine, monkeypatch, provider):
-    """Reflect's client speaks only System One: another provider would fail every first round."""
+@pytest.mark.parametrize("provider", ["typesafe", "hindsight", "cloudflare", "openai"])
+def test_every_provider_drives_reflect_through_the_shared_engine(engine, monkeypatch, provider):
+    """Reflect asks the shared engine, which speaks every provider's wire format. It used to
+    have a System One client of its own, so cloudflare and openai left reflect on agent turns."""
+    from hindsight_api import config as config_module
     from hindsight_api.config import DecisionModelConfig
+    from hindsight_api.engine.decision_model import DecisionModel, decision_engine
 
     setup = DecisionModelConfig(
         provider=provider,
@@ -118,36 +122,11 @@ def test_a_provider_reflect_cannot_speak_leaves_agent_turns(engine, monkeypatch,
         max_concurrent=1,
         max_request_tokens=8192,
     )
-    monkeypatch.setattr(
-        "hindsight_api.engine.memory_engine.get_config",
-        lambda: SimpleNamespace(decision_model_config=lambda operation: setup),
-    )
-
-    assert engine._reflect_decision_model() is None
-
-
-@pytest.mark.parametrize("provider", ["typesafe", "hindsight"])
-def test_a_system_one_provider_drives_reflect(engine, monkeypatch, provider):
-    """Hindsight Inference serves System One too, so reflect and pages run on it."""
-    from hindsight_api.config import DecisionModelConfig
-
-    setup = DecisionModelConfig(
-        provider=provider,
-        api_key="k",
-        model="m",
-        base_url="https://example.invalid",
-        timeout=5.0,
-        max_concurrent=1,
-        max_request_tokens=8192,
-    )
-    monkeypatch.setattr(
-        "hindsight_api.engine.memory_engine.get_config",
-        lambda: SimpleNamespace(decision_model_config=lambda operation: setup),
-    )
-    monkeypatch.setattr(engine, "_reflect_decision_model_client", None)
+    monkeypatch.setattr(config_module, "get_config", lambda: SimpleNamespace(decision_model_config=lambda op: setup))
 
     client = engine._reflect_decision_model()
-    assert client is not None
-    # Its cut and verdict are retried like the shared decision model's calls: a single 429 used
-    # to drop them, and that round answered like agent mode.
+    assert isinstance(client, DecisionModel) and client.provider == provider
+    assert client is decision_engine("reflect"), "the same engine every operation on this setup gets"
+    # Its cut and verdict are retried: a single 429 used to drop them, and that round answered
+    # like agent mode.
     assert client.retry_policy is not None
