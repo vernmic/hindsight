@@ -1,11 +1,14 @@
 """The decision model is set up once and each operation may override it."""
 
+import base64
+import io
 import json
 from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
 from aiohttp import web
+from PIL import Image
 
 from hindsight_api.config import DecisionModelConfig, HindsightConfig
 from hindsight_api.engine.decision_model import (
@@ -17,7 +20,7 @@ from hindsight_api.engine.decision_model import (
     DecisionResponse,
     DecisionUsage,
 )
-from hindsight_api.engine.decision_rerank_interface import MAX_QUESTIONS
+from hindsight_api.engine.decision_rerank_interface import MAX_QUESTIONS, EvidenceImage
 from hindsight_api.engine.remote_retry import RetryPolicy
 from hindsight_api.engine.token_encoding import count_tokens
 from tests.aiohttp_stub import stub_server
@@ -198,15 +201,17 @@ class _Upstream:
     paths: list[str] = field(default_factory=list)
     bodies: list[Any] = field(default_factory=list)
     auth: list[str] = field(default_factory=list)
+    headers: list[dict[str, str]] = field(default_factory=list)
 
     async def handle(self, request: web.Request) -> web.StreamResponse:
         self.paths.append(request.path)
         self.bodies.append(await request.json())
         self.auth.append(request.headers["Authorization"])
+        self.headers.append(dict(request.headers))
         return web.json_response(self.reply)
 
 
-def _client(provider: str, base_url: str, model: str) -> DecisionModel:
+def _client(provider: str, base_url: str, model: str, *, vision: bool = False) -> DecisionModel:
     return DecisionModel.from_config(
         DecisionModelConfig(
             provider=provider,
@@ -216,8 +221,54 @@ def _client(provider: str, base_url: str, model: str) -> DecisionModel:
             timeout=5.0,
             max_concurrent=2,
             max_request_tokens=26_000,
+            vision=vision,
         )
     )
+
+
+def _png(width: int = 900, height: int = 400) -> EvidenceImage:
+    out = io.BytesIO()
+    Image.new("RGB", (width, height), "white").save(out, format="PNG")
+    return EvidenceImage(label="Picture of sign.png", media_type="image/png", data=out.getvalue())
+
+
+@pytest.mark.parametrize("provider", ["typesafe", "hindsight"])
+async def test_system_one_providers_are_shown_pictures_as_assets(provider):
+    picture = _png()
+    upstream = _Upstream(reply=_SYSTEM_ONE_ANSWERS)
+    async with stub_server(upstream.handle) as base_url:
+        client = _client(provider, base_url, "m", vision=True)
+        assets = client.shown([picture, _png(64, 64)])  # under 280 px a side: System One refuses it
+        assert list(assets) == ["[[picture-1]]"]
+        await client.ask("Sign: [[picture-1]]", _QUESTIONS, scope="decision_test", assets=assets, headers={"X-A": "1"})
+
+    assert upstream.bodies[0]["assets"] == {
+        "[[picture-1]]": {"type": "image", "format": "png", "data_base64": base64.b64encode(picture.data).decode()}
+    }
+    assert upstream.headers[0]["TypeSafe-Danger-Zone-Images"] == "true"
+    assert upstream.headers[0]["X-A"] == "1"
+    assert upstream.auth == ["Bearer k"]
+
+
+@pytest.mark.parametrize("provider", ["cloudflare", "openai"])
+async def test_other_providers_are_never_shown_pictures(provider):
+    picture = _png()
+    upstream = _Upstream(reply={"result": _SYSTEM_ONE_ANSWERS} if provider == "cloudflare" else {"answers": []})
+    async with stub_server(upstream.handle) as base_url:
+        client = _client(provider, base_url, "m", vision=True)
+        assert client.shown([picture]) == {}
+        # Handed assets anyway, it sends none; extra headers still go.
+        await client.ask(
+            "x", _QUESTIONS, scope="decision_test", assets={"[[picture-1]]": picture}, headers={"X-A": "1"}
+        )
+
+    assert "assets" not in upstream.bodies[0]
+    assert "TypeSafe-Danger-Zone-Images" not in upstream.headers[0]
+    assert upstream.headers[0]["X-A"] == "1"
+
+
+def test_without_vision_no_picture_is_shown():
+    assert _client("typesafe", "https://example.invalid", "m").shown([_png()]) == {}
 
 
 async def test_typesafe_speaks_system_one():

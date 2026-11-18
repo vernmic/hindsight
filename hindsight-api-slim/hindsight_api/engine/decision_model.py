@@ -19,15 +19,21 @@ provider's wire format:
 - ``openai``: the Decisions API at ``<base_url>/v1/decisions``. Same three question kinds
   under other names (``predicate`` for noul, ``choices`` / ``levels`` for criteria), a list
   of named questions and answers instead of maps, and ``input`` instead of ``state``.
+
+Pictures (image assets) go only to the System One providers, ``typesafe`` and ``hindsight``,
+and only with ``HINDSIGHT_API_DECISION_MODEL_VISION`` on: see :meth:`DecisionModel.shown`.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import dataclasses
+import io
 import json
 import logging
 import time
+from collections.abc import Mapping, Sequence
 from functools import lru_cache
 from typing import Any, Literal
 
@@ -35,10 +41,10 @@ from pydantic import BaseModel, Field
 
 from .. import config as hindsight_config
 from .._cross_loop import CrossLoopSemaphore
-from ..config import DecisionModelConfig, DecisionModelOperation
+from ..config import SYSTEM_ONE_DECISION_MODEL_PROVIDERS, DecisionModelConfig, DecisionModelOperation
 from ..tracing import get_span_recorder
 from .aiohttp_session import LoopLocalSession, UpstreamHTTPError, per_phase_timeout, raise_for_status
-from .decision_rerank_interface import MAX_REQUEST_TOKENS, DecisionRerank
+from .decision_rerank_interface import MAX_REQUEST_TOKENS, DecisionRerank, EvidenceImage
 from .remote_retry import RetryPolicy, acall_with_retry
 from .token_encoding import count_tokens, truncate_to_tokens
 
@@ -215,6 +221,39 @@ def record_decision_call(
 # being approximate. aiohttp sends json.dumps' ASCII output, so characters are bytes.
 MAX_REQUEST_BYTES = 1_800_000
 
+#: What System One takes as an image asset (docs.typesafe.ai/images): PNG or baseline JPEG, each side
+#: 280-1568 px, never resized for you. One image it refuses fails the whole request, so the rest are
+#: left out and the evidence names them in text only.
+_IMAGE_FORMATS = {"image/png": "png", "image/jpeg": "jpg"}
+_IMAGE_SIDE = (280, 1568)
+_IMAGE_MAX_BYTES = 16 * 1024 * 1024
+#: Required on every System One request that carries an image: images are a preview there.
+IMAGES_HEADER = {"TypeSafe-Danger-Zone-Images": "true"}
+
+
+def system_one_accepts(image: EvidenceImage) -> bool:
+    """Whether System One takes ``image`` as an asset; reads the image header only."""
+    if image.media_type not in _IMAGE_FORMATS or len(image.data) > _IMAGE_MAX_BYTES:
+        return False
+    from PIL import Image
+
+    try:
+        with Image.open(io.BytesIO(image.data)) as opened:
+            width, height = opened.size
+            progressive = bool(opened.info.get("progressive"))
+    except Exception:
+        return False
+    low, high = _IMAGE_SIDE
+    return low <= width <= high and low <= height <= high and not progressive
+
+
+def system_one_asset(image: EvidenceImage) -> dict[str, str]:
+    return {
+        "type": "image",
+        "format": _IMAGE_FORMATS[image.media_type],
+        "data_base64": base64.b64encode(image.data).decode(),
+    }
+
 
 class DecisionModel:
     # A request holds at most decision_rerank_interface.MAX_QUESTIONS questions. The token
@@ -232,8 +271,11 @@ class DecisionModel:
         max_request_tokens: int | None,
         retry_policy: RetryPolicy | None = None,
         tokenizer: str | None = None,
+        vision: bool = False,
     ):
         self.provider = provider
+        # Whether it is shown pictures (HINDSIGHT_API_DECISION_MODEL_VISION); see shown().
+        self.vision = vision
         self.max_request_tokens = max_request_tokens
         # The vocabulary max_request_tokens is counted in: the model's own when known,
         # since it is the model that refuses a request past its window.
@@ -261,10 +303,30 @@ class DecisionModel:
             max_concurrent=config.max_concurrent,
             max_request_tokens=config.max_request_tokens,
             tokenizer=config.tokenizer,
+            vision=config.vision,
         )
 
+    def shown(self, pictures: Sequence[EvidenceImage]) -> dict[str, EvidenceImage]:
+        """The ``pictures`` this model is shown, each under the reference (``[[picture-1]]``, ...)
+        the state names it by; pass the result to :meth:`ask` as ``assets``.
+
+        None unless vision is on and the provider is System One itself (typesafe, hindsight):
+        the others take no images. Never one System One would refuse, since that fails the
+        whole request.
+        """
+        if not self.vision or self.provider not in SYSTEM_ONE_DECISION_MODEL_PROVIDERS:
+            return {}
+        accepted = [picture for picture in pictures if system_one_accepts(picture)]
+        return {f"[[picture-{i + 1}]]": picture for i, picture in enumerate(accepted)}
+
     async def ask(
-        self, state: str | dict[str, Any], questions: dict[str, DecisionQuestion], *, scope: str
+        self,
+        state: str | dict[str, Any],
+        questions: dict[str, DecisionQuestion],
+        *,
+        scope: str,
+        assets: Mapping[str, EvidenceImage] | None = None,
+        headers: Mapping[str, str] | None = None,
     ) -> DecisionResponse:
         """Ask ``questions`` (keyed by caller-chosen ids) about ``state`` in one request.
 
@@ -273,10 +335,16 @@ class DecisionModel:
         finds longer than its window is asked again in two halves, until one question
         alone is too long, which raises. Every attempt is traced under ``scope``, a
         ``decision_*`` name for what the caller is deciding.
+
+        ``assets`` are pictures by the reference the state names them by, as :meth:`shown`
+        returns them; a provider that takes no images is sent none. ``headers`` go on this
+        request on top of the client's own.
         """
+        if self.provider not in SYSTEM_ONE_DECISION_MODEL_PROVIDERS:
+            assets = None
         try:
             return await acall_with_retry(
-                lambda: self._ask_traced(state, questions, scope),
+                lambda: self._ask_traced(state, questions, scope, assets, headers),
                 policy=self.retry_policy,
                 budget=self.retry_policy.new_budget(),
                 provider=f"decision_model:{self.provider}",
@@ -288,7 +356,10 @@ class DecisionModel:
         half = len(items) // 2
         logger.warning(f"Decision model: {len(items)} questions overflowed the window, asking them in two halves")
         first, second = await asyncio.gather(
-            self.ask(state, dict(items[:half]), scope=scope), self.ask(state, dict(items[half:]), scope=scope)
+            *(
+                self.ask(state, dict(part), scope=scope, assets=assets, headers=headers)
+                for part in (items[:half], items[half:])
+            )
         )
         return DecisionResponse(
             answers={**first.answers, **second.answers},
@@ -343,13 +414,22 @@ class DecisionModel:
         )
 
     async def _ask_traced(
-        self, state: str | dict[str, Any], questions: dict[str, DecisionQuestion], scope: str
+        self,
+        state: str | dict[str, Any],
+        questions: dict[str, DecisionQuestion],
+        scope: str,
+        assets: Mapping[str, EvidenceImage] | None = None,
+        headers: Mapping[str, str] | None = None,
     ) -> DecisionResponse:
         started = time.monotonic()
         answer: DecisionResponse | None = None
         error: BaseException | None = None
+        request: dict[str, Any] = {"state": state, "questions": {k: q.system_one() for k, q in questions.items()}}
+        if assets:
+            # The trace keeps which pictures went, not their bytes.
+            request["assets"] = dict.fromkeys(assets, "<image>")
         try:
-            answer = await self._ask_once(state, questions)
+            answer = await self._ask_once(state, questions, assets, headers)
             return answer
         except BaseException as e:
             error = e
@@ -359,7 +439,7 @@ class DecisionModel:
                 provider=self.provider,
                 model=self.model,
                 scope=scope,
-                request={"state": state, "questions": {k: q.system_one() for k, q in questions.items()}},
+                request=request,
                 # Defaults left out: an answer only fills the fields of its question's type. A
                 # structure, not a JSON string: the row stores it as an object, like rerank scores.
                 response=answer.model_dump(mode="json", exclude_defaults=True) if answer is not None else None,
@@ -368,7 +448,13 @@ class DecisionModel:
                 error=error,
             )
 
-    async def _ask_once(self, state: str | dict[str, Any], questions: dict[str, DecisionQuestion]) -> DecisionResponse:
+    async def _ask_once(
+        self,
+        state: str | dict[str, Any],
+        questions: dict[str, DecisionQuestion],
+        assets: Mapping[str, EvidenceImage] | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> DecisionResponse:
         if self.provider == "openai":
             # The Decisions API takes text, not a structured state.
             text = state if isinstance(state, str) else json.dumps(state, ensure_ascii=False)
@@ -377,7 +463,7 @@ class DecisionModel:
                 "input": text,
                 "questions": [_openai_question(name, q).model_dump(exclude_none=True) for name, q in questions.items()],
             }
-            return _from_openai(_OpenAIResponse.model_validate(await self._post("/v1/decisions", body)))
+            return _from_openai(_OpenAIResponse.model_validate(await self._post("/v1/decisions", body, headers)))
 
         body = {
             "model": self.model,
@@ -385,14 +471,19 @@ class DecisionModel:
             "questions": {name: q.system_one() for name, q in questions.items()},
         }
         if self.provider == "cloudflare":
-            raw = await self._post(f"/@cf/cloudflare/{self.model}", body)
+            raw = await self._post(f"/@cf/cloudflare/{self.model}", body, headers)
             return _CloudflareEnvelope.model_validate(raw).result
-        return DecisionResponse.model_validate(await self._post("/v1/systemone", body))
+        if assets:
+            body["assets"] = {ref: system_one_asset(picture) for ref, picture in assets.items()}
+            headers = {**(headers or {}), **IMAGES_HEADER}
+        return DecisionResponse.model_validate(await self._post("/v1/systemone", body, headers))
 
-    async def _post(self, path: str, body: dict[str, Any]) -> Any:
+    async def _post(self, path: str, body: dict[str, Any], headers: Mapping[str, str] | None = None) -> Any:
         # The slot is held per attempt, so a request waiting out its backoff frees it.
         async with self._semaphore:
-            async with self._session.get().post(f"{self.base_url}{path}", json=body) as response:
+            async with self._session.get().post(
+                f"{self.base_url}{path}", json=body, headers=dict(headers) if headers else None
+            ) as response:
                 await raise_for_status(response)
                 return await response.json(content_type=None)
 
