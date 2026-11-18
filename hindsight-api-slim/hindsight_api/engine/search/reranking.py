@@ -449,8 +449,24 @@ class CrossEncoderReranker:
         pooled_context = None
         is_decision_model = getattr(self.cross_encoder, "provider_name", None) == DECISION_MODEL_RERANKER
         prune, dedup = prune and is_decision_model, dedup and is_decision_model
+        head = 0
+        # A decision model reads every character of each candidate's context; capped by
+        # HINDSIGHT_API_RECALL_DECISION_MODEL_CONTEXT_MAX_CHARS (0 = memory text alone).
+        context_cap: int | None = None
         if is_decision_model:
-            contexts = {c.retrieval.context for c in candidates if c.retrieval.context}
+            from hindsight_api.config import get_config
+
+            config = get_config()
+            head = config.recall_decision_model_head
+            context_cap = config.recall_decision_model_context_max_chars
+
+        def _context(raw: str | None) -> str | None:
+            if not raw or context_cap is None:
+                return raw
+            return raw[:context_cap] or None
+
+        if is_decision_model:
+            contexts = {_context(c.retrieval.context) for c in candidates if _context(c.retrieval.context)}
             pooled_context = next(iter(contexts)) if len(contexts) == 1 else None
             today = f"Current date: {(now or datetime.now(timezone.utc)).date().isoformat()}"
             shared_context = f"{today}\n\n{pooled_context}" if pooled_context else today
@@ -462,8 +478,9 @@ class CrossEncoderReranker:
 
             # Use text + context for better ranking
             doc_text = retrieval.text
-            if retrieval.context and not pooled_context:
-                doc_text = f"{retrieval.context}: {doc_text}"
+            context = _context(retrieval.context)
+            if context and not pooled_context:
+                doc_text = f"{context}: {doc_text}"
 
             # Add formatted date information for temporal awareness. A decision model also
             # gets the date a memory was stored when no event date was extracted: without
@@ -495,6 +512,7 @@ class CrossEncoderReranker:
             DecisionRerankOptions(
                 prune=prune,
                 dedup=dedup,
+                head=head,
                 fact_types=[c.retrieval.fact_type for c in candidates],
                 ids=[c.retrieval.id for c in candidates],
                 embeddings=embeddings if dedup else None,

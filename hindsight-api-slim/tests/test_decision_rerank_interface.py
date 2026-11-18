@@ -129,6 +129,32 @@ def test_dedup_without_sending_anything():
     assert words.deduped(scores, [repeat], {repeat.key: 0.1}) == scores
 
 
+def test_head_round_without_sending_anything():
+    """What an outside caller runs after the ranking: every head pair both ways, then the reorder."""
+    words = decision_rerank_interface.DecisionRerank(count=lambda t: len(t.split()), truncate=lambda t, n: t)
+    docs = ["the fork guide", "push branches to origin, never main", "origin is the fork", "unrelated"]
+    scores = words.pruned([0.9, 0.85, 0.8, 0.01])
+    questions = words.head_questions(docs, scores, head=3)
+    assert sorted((q.first, q.second) for q in questions) == [(0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1)]
+    assert questions[0].system_one()["type"] == "choice"
+    assert questions[0].system_one()["criteria"] == decision_rerank_interface.HEAD_OPTIONS
+    # Slot 1 beats both others either way round; 0 and 2 draw.
+    answers = {}
+    for q in questions:
+        if q.first == 1:
+            answers[q.key] = {"a": 0.9, "b": 0.1}
+        elif q.second == 1:
+            answers[q.key] = {"a": 0.1, "b": 0.9}
+        else:
+            answers[q.key] = {"a": 0.5, "b": 0.5}
+    headed = words.headed(scores, questions, answers)
+    assert headed[1] == scores[0] and headed[0] == scores[1] and headed[2] == scores[2]
+    assert headed[3] == 0.0
+    # Unanswered questions are draws: nothing moves.
+    assert words.headed(scores, questions, {}) == scores
+    assert words.head_questions(docs, scores, head=1) == []
+
+
 def test_dedup_asks_alike_pairs_best_ranked_first_up_to_the_cap():
     """With alike pairs given, only those; without, every pair. Best-ranked first either way,
     and never more than MAX_REPEAT_PAIRS."""
