@@ -3,7 +3,9 @@
 A decision model answers typed questions (pick one of these, how likely is this, where on
 this scale) about a state, in well under a second. Operations hand it the in-between
 judgments an LLM call would otherwise make, and keep the LLM for writing. Every operation
-reaches it through this one client, built from ``HindsightConfig.decision_model_config``.
+reaches it through this one client: :func:`decision_engine` builds it from
+``HindsightConfig.decision_model_config`` and hands the same instance to every operation that
+resolves to the same setup, which takes it as a dependency.
 
 Callers always ask in the System One shape (``noul`` / ``choice`` / ``score``, questions
 keyed by id) and always get a :class:`DecisionResponse` back; the client speaks each
@@ -26,12 +28,14 @@ import dataclasses
 import json
 import logging
 import time
+from functools import lru_cache
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from .. import config as hindsight_config
 from .._cross_loop import CrossLoopSemaphore
-from ..config import DecisionModelConfig
+from ..config import DecisionModelConfig, DecisionModelOperation
 from ..tracing import get_span_recorder
 from .aiohttp_session import LoopLocalSession, UpstreamHTTPError, per_phase_timeout, raise_for_status
 from .decision_rerank_interface import MAX_REQUEST_TOKENS, DecisionRerank
@@ -391,3 +395,22 @@ class DecisionModel:
             async with self._session.get().post(f"{self.base_url}{path}", json=body) as response:
                 await raise_for_status(response)
                 return await response.json(content_type=None)
+
+
+@lru_cache(maxsize=8)
+def _engine(setup: DecisionModelConfig) -> DecisionModel:
+    # One client per setup for the process, so operations on the same setup share its
+    # connection pool and concurrency cap.
+    return DecisionModel.from_config(setup)
+
+
+def decision_engine(operation: DecisionModelOperation) -> DecisionModel | None:
+    """The decision model ``operation`` asks, or None when it has none set up.
+
+    The one place a decision model is built: recall's reranker, consolidation triage, reflect
+    and page refresh each take what this returns as a dependency. Cached per resolved setup
+    (``HINDSIGHT_API_DECISION_MODEL_*`` with the operation's overrides), so operations that
+    resolve to the same setup get the same client.
+    """
+    setup = hindsight_config.get_config().decision_model_config(operation)
+    return _engine(setup) if setup is not None else None
