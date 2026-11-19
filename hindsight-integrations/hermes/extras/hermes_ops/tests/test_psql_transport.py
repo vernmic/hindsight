@@ -173,6 +173,26 @@ class TestPsqlCli(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("bad binding", result.stderr)
 
+    def test_config_error_is_one_line_not_a_traceback(self):
+        # Docker route with no password: the CLI must fail with one line and
+        # rc 1, not leak a ConfigError traceback into captured SQL output.
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith(("HINDSIGHT_", "HERMES_"))
+        }
+        env["HINDSIGHT_PG_BIN"] = "/bin/true"  # skip in-container discovery
+        result = subprocess.run(
+            [sys.executable, str(self.MODULE), "psql"],
+            input="SELECT 1;\n",
+            text=True,
+            capture_output=True,
+            env=env,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("psql: HINDSIGHT_PGPASSWORD must be set", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
