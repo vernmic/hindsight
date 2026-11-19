@@ -18,8 +18,10 @@ dependency `0aacb00a`. The four `scripts/jev*.ps1` wrappers are **not** identica
 under a root-approved scope exception they were parameterized to take their
 distro, interpreter, controller path and Hermes home from `HERMES_HOME`,
 `HERMES_OPS_WORKSPACE`, `HERMES_OPS_PYTHON`, `HERMES_WSL_DISTRO` and the
-`HERMES_OPS_*_CONTROL` overrides, and to call `wsl.exe -e` with argv instead of
-a quoted shell string. Plugin runtime behaviour is unchanged.
+`HERMES_OPS_*_CONTROL` overrides, and to call `wsl.exe -e env "HERMES_HOME=$HermesHome"`
+with argv instead of a quoted shell string. WSLENV is not assumed to carry
+`HERMES_HOME`, and each call checks `$LASTEXITCODE`. Plugin runtime behaviour
+is unchanged.
 
 ## Settings
 
