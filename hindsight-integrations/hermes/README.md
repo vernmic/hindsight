@@ -298,6 +298,26 @@ The lookup stops at the repository root. Only `bank_id` is read.
 > multilingual embedding model, `{"semantic": 0.5}` separated relevant from unrelated queries better than the
 > reranker did. Unset by default, so nothing changes unless you opt in.
 
+### Migration: exclusion lists (the note `monitoring_retain_excluded_prefixes` refers to)
+
+This version replaces shipped exclusion literals with empty, configurable lists. Upgrading an existing
+deployment changes behavior unless the previously effective exclusions are captured first:
+
+1. Before installing, record each installed scope's **effective** old values privately: the banks it
+   excluded from structured prefetch and the session-id prefixes it excluded from monitoring retain.
+   A legacy `exclude_monitoring_auto_retain: false` means NO monitoring exclusions (upstream behavior).
+2. After installing, write those values as `prefetch_excluded_banks` and
+   `monitoring_retain_excluded_prefixes` in that scope's deployment config (never back into this file -
+   shipped defaults stay empty).
+3. Verify before and after: a protected bank returns `bank_excluded` from prefetch, an allowed one does
+   not; a protected prefix is skipped by monitoring retain, an allowed one is retained.
+
+**Config-versus-environment precedence:** a setting set in config wins; when the config key is absent
+(`null`/missing), the `HINDSIGHT_*` environment variable applies. An explicit but EMPTY config value
+suppresses the environment fallback - blank config means "intentionally nothing", not "unset". This is
+long-standing behavior and is unchanged here; set the key to null (or remove it) to fall back to the
+environment.
+
 ### Retain
 | Key | Default | Description |
 |-----|---------|-------------|
