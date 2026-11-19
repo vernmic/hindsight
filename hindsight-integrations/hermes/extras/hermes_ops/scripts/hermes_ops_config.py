@@ -34,6 +34,7 @@ BANKS_ENV = "HERMES_OPS_BANKS"
 PYTHON_ENV = "HERMES_OPS_PYTHON"
 DOCKER_ENV = "HINDSIGHT_DOCKER"
 URL_ENV = "HINDSIGHT_URL"
+TRANSPORT_ENV = "HINDSIGHT_PSQL_TRANSPORT"
 ALERT_ENV = "ALERT_TARGET"
 DASHBOARD_ENV = "HERMES_DASHBOARD_URL"
 
@@ -299,12 +300,38 @@ def pg_password():
     return value
 
 
+def psql_transport():
+    """Optional server-side SQL transport as a JSON argv list. Default: unset.
+
+    When set, psql_argv() returns this list (with a literal "{container}"
+    element replaced by container()) instead of the docker-exec route. The
+    transport authenticates on the server side, so psql_command() neither
+    requires nor injects HINDSIGHT_PGPASSWORD, and _discover_psql() is never
+    called. Unset keeps today's behavior byte-for-byte.
+    """
+    raw = (os.environ.get(TRANSPORT_ENV) or "").strip()
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except ValueError as exc:
+        raise ConfigError(f"{TRANSPORT_ENV} must be a JSON argv list: {exc}") from exc
+    if not isinstance(value, list) or not value or not all(isinstance(item, str) for item in value):
+        raise ConfigError(f"{TRANSPORT_ENV} must be a non-empty JSON list of strings")
+    return value
+
+
 def psql_argv(explicit=None):
-    """The one docker-exec psql command builder (dependency-free).
+    """The one psql command builder (dependency-free).
 
     Shared by the reader and the writer so the command is built once. Values are
     passed as argv elements; nothing is interpolated into a shell string.
+    With HINDSIGHT_PSQL_TRANSPORT set, the configured argv list is returned
+    instead (see psql_transport()); that route authenticates server-side.
     """
+    transport = psql_transport()
+    if transport is not None:
+        return [container(explicit) if item == "{container}" else item for item in transport]
     argv = [docker(explicit), "exec", "-i", "-e", "PGPASSWORD"]  # value set by psql_command()
     library = psql_lib(explicit)
     if library:
@@ -327,6 +354,8 @@ def psql_argv(explicit=None):
 
 def psql_command(explicit=None):
     argv = psql_argv(explicit)
+    if psql_transport() is not None:
+        return argv  # server-side transport; no local password element
     return ["PGPASSWORD=" + pg_password() if arg == "PGPASSWORD" else arg for arg in argv]
 
 
@@ -355,5 +384,31 @@ def describe():
         "container": container(),
         "database": database(),
         "api_url": api_url(),
+        "psql_transport": "set" if psql_transport() else "docker-exec",
         "alert_target": "set" if alert_target() else "unset",
     }
+
+
+
+def _cli():
+    """Smallest CLI: `hermes_ops_config.py psql [name=value ...]` reads SQL on
+    stdin, inlines psql-style :'name' bindings as safely quoted literals, and
+    runs psql_command(), so shell operators have exactly one builder route."""
+    if len(sys.argv) < 2 or sys.argv[1] != "psql":
+        print("usage: hermes_ops_config.py psql [name=value ...]   (SQL on stdin)", file=sys.stderr)
+        return 2
+    statement = sys.stdin.read()
+    for pair in sys.argv[2:]:
+        name, sep, value = pair.partition("=")
+        if not sep or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            print(f"psql: bad binding {pair!r} (expected name=value)", file=sys.stderr)
+            return 2
+        statement = statement.replace(
+            ":'" + name + "'", "'" + value.replace("'", "''") + "'"
+        )
+    result = subprocess.run(psql_command(), input=statement, text=True)
+    return result.returncode
+
+
+if __name__ == "__main__":  # pragma: no cover - thin shell entry
+    raise SystemExit(_cli())

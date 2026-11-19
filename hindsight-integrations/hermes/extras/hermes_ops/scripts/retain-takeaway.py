@@ -10,8 +10,11 @@ import json
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from hermes_ops_config import api_url  # noqa: E402 - sibling module
+
 BANK = "hermes-ops"
-BASE = "http://host.docker.internal:8888"
+BASE = api_url()  # HINDSIGHT_URL / flag resolution, not a hardcoded host
 REQUIRED = ("kind:", "scope:", "domain:", "confidence:", "source:")
 
 
