@@ -23,6 +23,9 @@ def provider():
     spec.loader.exec_module(module)
     obj = module.HindsightMemoryProvider()
     obj._bank_id, obj._budget, obj._recall_max_tokens = "hermes-ops", "mid", 4000
+    # Structured recall now selects banks exactly like ordinary recall (review F1):
+    # pin the write set so the bank-qualified ids below stay deterministic.
+    obj._write_bank_ids = ["hermes-ops"]
     obj._recall_disabled = lambda: False
     return obj
 
@@ -79,7 +82,7 @@ def test_failed_filtered_recall_keeps_unfiltered_rescue(provider):
         {"query": "task", "tag_groups": [{"tags": ["task:test"], "match": "any_strict"}], "unfiltered_rescue": True}
     )
     assert result["error"] is None and result["candidates"][0]["text"] == "rescue"
-    assert result["query_errors"] == [{"path": "filtered", "error": "ValueError"}]
+    assert result["query_errors"] == [{"path": "filtered", "bank": "hermes-ops", "error": "ValueError"}]
     provider._bank_id = "openclaw"
     # Config-driven exclusion (accepted correction c184fa5fa): shipped defaults are
     # empty, so the exclusion is configured here exactly as deployments do.

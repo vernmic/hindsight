@@ -1717,6 +1717,29 @@ class HindsightMemoryProvider(MemoryProvider):
 
     structured_recall_api_version = 1
 
+    def _recall_request_kwargs(self, query: str, *, budget=None, max_tokens=None, tag_groups=None) -> dict:
+        """The ONE request builder shared by ordinary ``_recall`` and structured
+        ``prefetch_candidates``, so the configured retrieval policy cannot drift
+        between the two paths: ``recall_tags``/``tags_match``, ``recall_types`` and
+        ``recall_min_scores`` always apply. A structured feed's ``tag_groups``
+        REPLACE the configured tag constraint (a narrowing the feed itself defines);
+        with no feed groups the configured tags apply unchanged. Bank selection is
+        the caller's concern (``_build_recall_bank_ids`` + availability checks)."""
+        kwargs: dict = {
+            "query": query,
+            "budget": self._budget if budget is None else budget,
+            "max_tokens": self._recall_max_tokens if max_tokens is None else max_tokens,
+        }
+        if tag_groups:
+            kwargs["tag_groups"] = tag_groups
+        elif self._recall_tags:
+            kwargs.update(tags=self._recall_tags, tags_match=self._recall_tags_match)
+        if self._recall_types:
+            kwargs["types"] = self._recall_types
+        if self._recall_min_scores:
+            kwargs["min_scores"] = self._recall_min_scores
+        return kwargs
+
     def prefetch_candidates(self, feed: dict, *, session_id: str = "") -> dict:
         """Current-feed records; the old prefetch/cache/reflect paths remain available."""
         result = {"candidates": [], "error": None, "feed_hash": feed.get("feed_hash"), "query_provenance": []}
@@ -1731,62 +1754,90 @@ class HindsightMemoryProvider(MemoryProvider):
         requests = [(groups, "filtered" if groups else "unfiltered")]
         if groups and feed.get("unfiltered_rescue"):
             requests.append(([], "unfiltered_rescue"))
+        # Same bank selection as ordinary recall (primary first, then available
+        # additional/recall-only banks), so both paths query the same corpus.
+        bank_ids = [
+            bank_id
+            for i, bank_id in enumerate(self._build_recall_bank_ids())
+            if i == 0 or self._extra_bank_available("recall", bank_id)
+        ]
+        per_request_tokens = max(1, int(feed.get("max_tokens", self._recall_max_tokens)) // len(requests))
         seen = set()
         errors = []
         for tag_groups, path in requests:
-            kwargs = {
-                "bank_id": self._bank_id,
-                "query": query,
-                "budget": feed.get("budget", self._budget),
-                "max_tokens": max(1, int(feed.get("max_tokens", self._recall_max_tokens)) // len(requests)),
-            }
-            if tag_groups:
-                kwargs["tag_groups"] = tag_groups
-            result["query_provenance"].append({"path": path, "request": kwargs})
-            try:
-                timeout = feed.get("timeout_seconds")
-                if timeout is not None and self._mode != "local_embedded":
-                    # A private request client avoids changing the cached client's
-                    # transport timeout while retain or explicit recall is using it.
-                    async def recall_once():
-                        client = self._new_cloud_client(timeout=timeout)
-                        try:
-                            return await client.arecall(**kwargs)
-                        finally:
-                            await client.aclose()
+            path_rows: list[tuple[str, dict]] = []
+            for bank_id in bank_ids:
+                kwargs = self._recall_request_kwargs(
+                    query,
+                    budget=feed.get("budget", self._budget),
+                    max_tokens=per_request_tokens,
+                    tag_groups=tag_groups,
+                )
+                kwargs["bank_id"] = bank_id
+                result["query_provenance"].append({"path": path, "bank": bank_id, "request": kwargs})
+                try:
+                    timeout = feed.get("timeout_seconds")
+                    if timeout is not None and self._mode != "local_embedded":
+                        # A private request client avoids changing the cached client's
+                        # transport timeout while retain or explicit recall is using it.
+                        async def recall_once():
+                            client = self._new_cloud_client(timeout=timeout)
+                            try:
+                                return await client.arecall(**kwargs)
+                            finally:
+                                await client.aclose()
 
-                    response = _run_sync(recall_once(), timeout=timeout)
-                else:
-                    response = self._run_hindsight_operation(lambda client: client.arecall(**kwargs))
-                rows = list(response.results or [])
-                # Depth is a total per-feed resource budget, independent of the
-                # provider's legacy config cap. Zero requests uncapped results.
-                cap = max(0, int(feed.get("max_results", 0)))
-                if cap:
-                    remaining = max(0, cap - len(result["candidates"]))
-                    if len(requests) > 1 and path == "filtered":
-                        remaining = max(1, (remaining + 1) // 2)
-                    rows = rows[:remaining]
-                for item in rows:
-                    row = item.model_dump(mode="json") if hasattr(item, "model_dump") else vars(item)
-                    identity = self._bank_id + "/" + str(row["id"])
-                    if identity in seen or not row.get("text"):
-                        continue
-                    seen.add(identity)
-                    result["candidates"].append(
-                        {
-                            "id": identity,
-                            "bank": self._bank_id,
-                            "text": row["text"],
-                            "tags": row.get("tags") or [],
-                            "date": row.get("occurred_start") or row.get("mentioned_at"),
-                            "scores": row.get("scores"),
-                            "query_path": path,
-                            "metadata": row.get("metadata") or {},
-                        }
-                    )
-            except Exception as exc:
-                errors.append({"path": path, "error": type(exc).__name__})
+                        response = _run_sync(recall_once(), timeout=timeout)
+                    else:
+                        response = self._run_hindsight_operation(lambda client: client.arecall(**kwargs))
+                    path_rows.extend((bank_id, item) for item in (response.results or []))
+                    if bank_id != bank_ids[0]:
+                        self._mark_bank_ok("recall", bank_id)
+                except Exception as exc:
+                    if _bank_not_written_yet(exc):
+                        # A bank nothing was retained to answers 404; it has nothing
+                        # to find, exactly like an ordinary extra-bank recall.
+                        if bank_id != bank_ids[0]:
+                            self._mark_bank_ok("recall", bank_id)
+                    else:
+                        if bank_id != bank_ids[0]:
+                            self._log_bank_failure("recall", bank_id, exc)
+                        errors.append({"path": path, "bank": bank_id, "error": type(exc).__name__})
+            # Dedupe BEFORE the per-path depth slice (a rescue path full of
+            # duplicates cannot eat the cap); a row without an id is skipped,
+            # not fatal. The provider's recall_max_results ceiling applies once,
+            # after the feed's own depth budget (see the cap contract in README).
+            deduped: list[tuple[str, dict]] = []
+            for bank_id, item in path_rows:
+                row = item.model_dump(mode="json") if hasattr(item, "model_dump") else vars(item)
+                if row.get("id") is None:
+                    continue
+                identity = f"{bank_id}/{row['id']}"
+                if identity in seen or not row.get("text"):
+                    continue
+                seen.add(identity)
+                deduped.append((bank_id, row))
+            # Depth is a total per-feed resource budget. Zero requests uncapped
+            # results; a nonzero provider recall_max_results still ceilings it.
+            cap = max(0, int(feed.get("max_results", 0)))
+            if cap:
+                remaining = max(0, cap - len(result["candidates"]))
+                if len(requests) > 1 and path == "filtered":
+                    remaining = max(1, (remaining + 1) // 2)
+                deduped = deduped[:remaining]
+            for bank_id, row in deduped:
+                result["candidates"].append(
+                    {
+                        "id": f"{bank_id}/{row['id']}",
+                        "bank": bank_id,
+                        "text": row["text"],
+                        "tags": row.get("tags") or [],
+                        "date": row.get("occurred_start") or row.get("mentioned_at"),
+                        "scores": row.get("scores"),
+                        "query_path": path,
+                        "metadata": row.get("metadata") or {},
+                    }
+                )
         result["query_errors"] = errors
         if errors and not result["candidates"]:
             result["error"] = "structured_recall_failed"
@@ -1809,13 +1860,9 @@ class HindsightMemoryProvider(MemoryProvider):
             for i, bank_id in enumerate(self._build_recall_bank_ids())
             if i == 0 or self._extra_bank_available("recall", bank_id)
         ]
-        kwargs: dict = {"query": query, "budget": self._budget, "max_tokens": self._recall_max_tokens}
-        if self._recall_tags:
-            kwargs.update(tags=self._recall_tags, tags_match=self._recall_tags_match)
-        if self._recall_types:
-            kwargs["types"] = self._recall_types
-        if self._recall_min_scores:
-            kwargs["min_scores"] = self._recall_min_scores
+        # One shared builder with prefetch_candidates (review F1): the configured
+        # retrieval policy lives in exactly one place, so the two paths cannot drift.
+        kwargs = self._recall_request_kwargs(query)
 
         async def _recall_all(client):
             extra_timeout = float(self._timeout or _DEFAULT_TIMEOUT) * _EXTRA_BANK_TIMEOUT_SHARE

@@ -280,7 +280,14 @@ The lookup stops at the repository root. Only `bank_id` is read.
 >
 > Restore the broad recall with `"recall_types": "observation,world,experience"` (string or JSON list) in `~/.hermes/hindsight/config.json`. This applies to **both** auto-recall and the `hindsight_recall` tool — both read the same `recall_types` setting (the tool schema has no per-call `types` argument), so narrowing the default narrows both paths.
 
-> **Tip — `recall_min_scores` against off-topic recall.** Recall ranks, it does not judge relevance: a question
+> **Structured candidates share the configured retrieval policy.** The structured (feed) path builds its
+> requests through the same builder as ordinary recall: `recall_tags` / `recall_tags_match`, `recall_types`,
+> `recall_min_scores` and the additional / recall-only bank set all apply. A feed's `tag_groups` REPLACE the
+> configured tag constraint for that request (a narrowing the feed itself defines); with no feed groups the
+> configured tags apply unchanged. `recall_types` and `recall_min_scores` always apply on top. A partial
+> extra-bank failure is skipped with a warning, exactly like ordinary recall.
+
+> **Tip - `recall_min_scores` against off-topic recall.** Recall ranks, it does not judge relevance: a question
 > unrelated to anything stored still comes back with up to `recall_max_tokens` of the least-bad memories. The
 > `reranker` score separates the two cleanly — on a small bank relevant hits scored 0.7-0.97 and unrelated ones
 > 0.0-0.1 — so `"recall_min_scores": {"reranker": 0.25}` in `~/.hermes/hindsight/config.json` turns that noise
@@ -292,7 +299,6 @@ The lookup stops at the repository root. Only `bank_id` is read.
 > reranker did. Unset by default, so nothing changes unless you opt in.
 
 ### Retain
-
 | Key | Default | Description |
 |-----|---------|-------------|
 | `auto_retain` | `true` | Automatically retain conversation turns. Sub-agent (`delegate_task`) runs and kanban workers are never auto-retained; their parent session keeps its own turns. |
