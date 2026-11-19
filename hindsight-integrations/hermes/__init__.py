@@ -1717,6 +1717,16 @@ class HindsightMemoryProvider(MemoryProvider):
 
     # -- recall ------------------------------------------------------------------
 
+    @staticmethod
+    def _coerce_positive_int(value, default: int) -> int:
+        """A malformed or absent feed number ("", null, non-numeric) reads as its
+        default, so a remote feed cannot crash the projection (review A3)."""
+        try:
+            coerced = int(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return default
+        return coerced if coerced > 0 else 0 if coerced == 0 else default
+
     def _recall_disabled(self) -> bool:
         """Guards shared by the async and synchronous recall paths."""
         why = (
@@ -1786,7 +1796,7 @@ class HindsightMemoryProvider(MemoryProvider):
             for i, bank_id in enumerate(self._build_recall_bank_ids())
             if i == 0 or self._extra_bank_available("recall", bank_id)
         ]
-        per_request_tokens = max(1, int(feed.get("max_tokens", self._recall_max_tokens)) // len(requests))
+        per_request_tokens = max(1, self._coerce_positive_int(feed.get("max_tokens"), self._recall_max_tokens) // len(requests))
         seen = set()
         errors = []
         for tag_groups, path in requests:
@@ -1844,7 +1854,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 deduped.append((bank_id, row))
             # Depth is a total per-feed resource budget. Zero requests uncapped
             # results; a nonzero provider recall_max_results still ceilings it.
-            cap = max(0, int(feed.get("max_results", 0)))
+            cap = self._coerce_positive_int(feed.get("max_results"), 0)
             if cap:
                 remaining = max(0, cap - len(result["candidates"]))
                 if len(requests) > 1 and path == "filtered":
