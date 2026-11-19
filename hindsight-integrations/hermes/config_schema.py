@@ -74,6 +74,14 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             description="Banks excluded from structured prefetch candidates (comma-separated). Empty = no exclusions; deployment config supplies protected bank names.",
         ),
         ProviderField(
+            key="retain_provenance",
+            label="Retain provenance dimensions",
+            kind=KIND_BOOL,
+            default=False,
+            inline=True,
+            description="Provider policy, off by default: tag every retained memory with the five provenance dimensions and append the previous turn's source text to the retain context on appends.",
+        ),
+        ProviderField(
             key="monitoring_retain_excluded_prefixes",
             label="Monitoring-retain excluded prefixes",
             kind=KIND_TEXT,

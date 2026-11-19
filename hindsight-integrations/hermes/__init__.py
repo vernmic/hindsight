@@ -1586,6 +1586,10 @@ class HindsightMemoryProvider(MemoryProvider):
         # for the queue to drain AND the server-side op(s) to complete.
         self._prefetch_waits_for_retain = cfg.get("prefetch_waits_for_retain", True)
         self._prefetch_retain_drain_timeout = _parse_float_setting(cfg.get("prefetch_retain_drain_timeout"), 10.0)
+        # Provider policy, default off (review F5): the five provenance tag
+        # dimensions and the previous-turn retain context are local shaping,
+        # not upstream behavior.
+        self._retain_provenance = bool(cfg.get("retain_provenance", False))
 
     def _apply_recall_settings(self, cfg: dict) -> None:
         """Recall knobs are pure config too (``{}`` yields the defaults)."""
@@ -1838,6 +1842,12 @@ class HindsightMemoryProvider(MemoryProvider):
                         "metadata": row.get("metadata") or {},
                     }
                 )
+        # Provider ceiling (review F5): a nonzero recall_max_results caps the total
+        # structured candidates; 0 stays uncapped. The feed's max_results depth
+        # budget already bounded each path above, so feed <= provider holds.
+        provider_cap = self._recall_max_results
+        if provider_cap:
+            result["candidates"] = result["candidates"][:provider_cap]
         result["query_errors"] = errors
         if errors and not result["candidates"]:
             result["error"] = "structured_recall_failed"
@@ -2098,20 +2108,25 @@ class HindsightMemoryProvider(MemoryProvider):
         parent = self._parent_session_id if self._parent_session_id != self._session_id else ""
         lineage = (("session", self._session_id), ("parent", parent))
         tags = [f"{kind}:{sid}" for kind, sid in lineage if sid]
-        for default in (
-            "kind:fact",
-            f"scope:{self._bank_id}",
-            "domain:knowledge",
-            "confidence:provisional",
-            "source:session",
-        ):
-            dimension = default.split(":", 1)[0] + ":"
-            if not any(tag.startswith(dimension) for tag in list(self._retain_tags) + tags):
-                tags.append(default)
+        # Provider policy behind a switch, default off (review F5): these five
+        # dimensions are local shaping, not upstream retain behavior.
+        if self._retain_provenance:
+            for default in (
+                "kind:fact",
+                f"scope:{self._bank_id}",
+                "domain:knowledge",
+                "confidence:provisional",
+                "source:session",
+            ):
+                dimension = default.split(":", 1)[0] + ":"
+                if not any(tag.startswith(dimension) for tag in list(self._retain_tags) + tags):
+                    tags.append(default)
         bank_ids = list(self._write_bank_ids)
         retain_async, retain_context = self._retain_async, self._retain_context
         previous = ""
-        if update_mode == "append":
+        # Same provider-policy switch as the provenance tags (review F5): the
+        # previous-turn context is local shaping and stays off by default.
+        if self._retain_provenance and update_mode == "append":
             if len(self._session_turns) > len(turns):
                 previous = self._session_turns[len(self._session_turns) - len(turns) - 1]
             else:

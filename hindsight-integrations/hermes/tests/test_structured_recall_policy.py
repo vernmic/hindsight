@@ -116,6 +116,34 @@ def test_absent_feed_override_keeps_configured_policy(provider: Callable) -> Non
         instance.shutdown()
 
 
+def test_provider_cap_ceilings_structured_results(provider: Callable) -> None:
+    config = dict(POLICY)
+    config["recall_max_results"] = 1
+    instance, result = _structured(provider, config, {})
+    try:
+        assert [c["id"] for c in result["candidates"]] == ["primary/good"]
+    finally:
+        instance.shutdown()
+
+
+def test_feed_depth_applies_within_provider_cap(provider: Callable) -> None:
+    config = dict(POLICY)
+    config["recall_max_results"] = 3
+    instance, result = _structured(provider, config, {"max_results": 1})
+    try:
+        assert len(result["candidates"]) == 1
+    finally:
+        instance.shutdown()
+
+
+def test_uncapped_provider_cap_stays_uncapped(provider: Callable) -> None:
+    instance, result = _structured(provider, dict(POLICY), {})
+    try:
+        assert len(result["candidates"]) == 2
+    finally:
+        instance.shutdown()
+
+
 def test_partial_extra_bank_failure_keeps_primary_results(provider: Callable) -> None:
     client = PolicyClient(ROWS, fail_bank="extra")
     instance, result = _structured(provider, dict(POLICY), {}, client)
@@ -149,3 +177,48 @@ def test_row_without_id_is_skipped_not_fatal(provider: Callable) -> None:
     finally:
         instance.shutdown()
 
+
+def test_retain_provenance_is_off_by_default(provider: Callable) -> None:
+    from conftest import FakeClient
+
+    client = FakeClient()
+    instance, _ = provider({"prefetch_waits_for_retain": False}, client=client)
+    instance.sync_turn("first", "one")
+    instance.sync_turn("second", "two")
+    instance._retain_queue.join()
+    instance.shutdown()
+    tags = client.retains[0]["items"][0]["tags"]
+    assert not any(t.startswith(("kind:", "scope:", "domain:", "confidence:", "source:")) for t in tags)
+    assert "PREVIOUS TURN SOURCE DATA" not in (client.retains[0]["items"][0].get("context") or "")
+
+
+def test_retain_provenance_opt_in_restores_dimensions(provider: Callable) -> None:
+    from conftest import FakeClient
+
+    client = FakeClient()
+    instance, _ = provider(
+        {"prefetch_waits_for_retain": False, "retain_provenance": True}, client=client
+    )
+    instance.sync_turn("first", "one")
+    instance._retain_queue.join()
+    instance.shutdown()
+    tags = client.retains[0]["items"][0]["tags"]
+    assert any(t.startswith("kind:") for t in tags)
+    assert any(t.startswith("scope:") for t in tags)
+
+
+def test_retain_provenance_opt_in_appends_previous_turn(provider: Callable) -> None:
+    from conftest import FakeClient
+
+    client = FakeClient()
+    instance, _ = provider(
+        {"prefetch_waits_for_retain": False, "retain_provenance": True}, client=client
+    )
+    instance.sync_turn("first", "one")
+    instance._retain_queue.join()
+    instance.sync_turn("second", "two")
+    instance._retain_queue.join()
+    instance.shutdown()
+    context = client.retains[1]["items"][0].get("context") or ""
+    assert "PREVIOUS TURN SOURCE DATA" in context
+    assert "User: first" in context
