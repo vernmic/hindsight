@@ -216,6 +216,21 @@ class DreamBankTests(unittest.TestCase):
         self.assertIn("container-x", result.stdout)
         self.assertIn("proxy:", result.stdout)
 
+    def test_psql_argv_docker_route_uses_configured_container(self):
+        # The default docker-exec route through the shell builder, with a stub
+        # docker CLI: the configured container must still reach the argv.
+        result = self.source(
+            'psql_sql bank-a <<< "select 1"',
+            HINDSIGHT_PSQL_TRANSPORT="",
+            HINDSIGHT_DOCKER="/bin/echo",
+            HINDSIGHT_PG_BIN="/bin/echo",
+            HINDSIGHT_CONTAINER="container-x",
+            HINDSIGHT_PGPASSWORD="pw",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("container-x", result.stdout)
+        self.assertIn("exec", result.stdout)
+
     def test_missing_bank_list_aborts_execution(self):
         result = subprocess.run(
             [SHELL, str(SCRIPTS / "dream-bank.sh"), "--dry-run"],
@@ -226,6 +241,112 @@ class DreamBankTests(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("set HERMES_OPS_BANKS", result.stderr)
+
+
+class DreamBankTransportTests(unittest.TestCase):
+    """The transport route must run end to end with no database password."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.ws = self.root / "workspace"
+        self.ws.mkdir()
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        write_exec(
+            self.bin / "curl",
+            '#!/bin/bash\nprintf \'{"pending_consolidation":0}\'\n',
+        )
+        self.stub = write_exec(
+            self.root / "transport_stub.py",
+            "import sys\ndata = sys.stdin.read()\n"
+            "if 'tmp_victims' in data:\n    print('0')\n"
+            "elif 'count(*)' in data:\n    print('7')\n"
+            "else:\n    sys.stdout.write(data)\n",
+        )
+
+    def test_transport_route_runs_without_password(self):
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith(("HINDSIGHT_", "HERMES_"))
+        }
+        env.update(
+            {
+                "PATH": "%s:/usr/bin:/bin" % self.bin,
+                "HOME": str(self.root),
+                "HERMES_HOME": str(self.root / "home"),
+                "HERMES_OPS_WORKSPACE": str(self.ws),
+                "HERMES_OPS_BANKS": "bank-a",
+                "HINDSIGHT_PSQL_TRANSPORT": json.dumps(["python3", str(self.stub)]),
+            }
+        )
+        result = subprocess.run(
+            [SHELL, str(SCRIPTS / "dream-bank.sh"), "--dry-run"],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn(
+            "HINDSIGHT_PGPASSWORD must be set", result.stderr + result.stdout
+        )
+        log = self.ws / "dream-bank-log.jsonl"
+        self.assertTrue(log.exists(), result.stdout)
+        row = json.loads(log.read_text(encoding="utf-8").splitlines()[-1])
+        self.assertEqual(row["banks"]["bank-a"]["nodes_before"], 7)
+        self.assertEqual(row["banks"]["bank-a"]["safe_victims"], 0)
+
+
+class IngestDocsPreflightTests(unittest.TestCase):
+    """ingest-docs.sh must get past preflight and purge on the transport route."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.ws = self.root / "workspace"
+        self.ws.mkdir()
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        write_exec(
+            self.bin / "curl",
+            '#!/bin/bash\ncase "$*" in *health*) printf \'{"status":"healthy"}\' ;; *) printf \'{"results":[]}\' ;; esac\n',
+        )
+        self.stub = write_exec(
+            self.root / "transport_echo.py",
+            "import sys\nsys.stdout.write(sys.stdin.read())\n",
+        )
+
+    def test_purge_passes_preflight_on_transport_route(self):
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith(("HINDSIGHT_", "HERMES_"))
+        }
+        env.update(
+            {
+                "PATH": "%s:/usr/bin:/bin" % self.bin,
+                "HOME": str(self.root),
+                "HERMES_HOME": str(self.root / "home"),
+                "HERMES_OPS_WORKSPACE": str(self.ws),
+                "HERMES_OPS_BANK": "testdocs",
+                "HINDSIGHT_PSQL_TRANSPORT": json.dumps(["python3", str(self.stub)]),
+            }
+        )
+        result = subprocess.run(
+            [SHELL, str(SCRIPTS / "ingest-docs.sh"), "--purge", "v1.2.3"],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertNotIn("unbound variable", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("psql route: transport", result.stdout)
+        self.assertIn("psql purge of docset:hermes-agent-docs-v1.2.3", result.stdout)
 
 
 if __name__ == "__main__":

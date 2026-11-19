@@ -91,30 +91,12 @@ HINDSIGHT_URL="${HINDSIGHT_URL:-http://localhost:8888}"
 PY=${HERMES_OPS_INGEST_PY:-$WORKSPACE/scripts/ingest-docs.py}
 BACKUP_DIR=${HERMES_OPS_BACKUP_DIR:-$WORKSPACE/backups}
 LOG="$BACKUP_DIR/ingest-docs.log"
-DKR_WIN=${HINDSIGHT_DOCKER:-$(command -v docker 2>/dev/null || echo docker)}
-# Database identity is an explicit deployment setting, exactly as it is for the
-# Python writer. The generic values name the Hindsight compose service and its
-# own image role; override them when your deployment renamed either.
-DB_HOST=${HINDSIGHT_DB_HOST:-127.0.0.1}
-DB_USER=${HINDSIGHT_DB_USER:-hindsight}
-DB_NAME=${HINDSIGHT_DB:-hindsight}
 
 # Verify gates (kanban t_9bfe1701 item d). ratios are percent of the parse.
 MIN_UNIT_RATIO=80      # retained raw units >= 80% of parsed chunk items
 MIN_PAGE_RATIO=90      # pages represented >= 90% of parsed pages
 MIN_FULL_SET_PAGES=100 # below this the set is a --limit smoke: probe gates are skipped
 
-# Resolve the docker CLI + the container that serves this Hindsight URL.
-docker_cli() {
-  if [ -x "$DKR_WIN" ]; then echo "$DKR_WIN"; return 0; fi
-  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then echo docker; return 0; fi
-  return 1
-}
-container_for_url() {
-  # The container is an explicit deployment setting; there is no container name
-  # that is correct for every host.
-  echo "${HINDSIGHT_CONTAINER:-hindsight}"
-}
 # One builder route (Vern 11-18): hermes_ops_config.py owns the psql argv on
 # every host - the docker-exec route by default, or the server-side
 # HINDSIGHT_PSQL_TRANSPORT argv when that setting is present.
@@ -154,10 +136,11 @@ case "$HEALTH" in
   *'"status":"healthy"'*) : ;;
   *) echo "FATAL: Hindsight not healthy at $HINDSIGHT_URL" >&2; exit 3 ;;
 esac
-if [ -z "$DKR" ]; then
-  echo "WARN: no docker CLI reachable -- psql steps (purge/verify counts) unavailable"
+# Route report only; hermes_ops_config.py owns the argv and it is never printed.
+if [ -n "${HINDSIGHT_PSQL_TRANSPORT:-}" ]; then
+  echo "psql route: transport"
 else
-  echo "docker: $DKR ; container: $CT"
+  echo "psql route: docker-exec ; container: ${HINDSIGHT_CONTAINER:-hindsight}"
 fi
 echo "docs_root: $DOCS_ROOT ; docset_tag: docset:$DOC_ID ; state: $STATE"
 

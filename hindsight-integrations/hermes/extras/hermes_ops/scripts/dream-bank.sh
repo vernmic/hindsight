@@ -16,18 +16,15 @@ for arg in "$@"; do
   esac
 done
 
-: "${HINDSIGHT_PGPASSWORD:?HINDSIGHT_PGPASSWORD must be set}"
+# The docker-exec route injects the database password, so it must exist here;
+# the HINDSIGHT_PSQL_TRANSPORT route authenticates server-side and needs none.
+if [ -z "${HINDSIGHT_PSQL_TRANSPORT:-}" ]; then
+  : "${HINDSIGHT_PGPASSWORD:?HINDSIGHT_PGPASSWORD must be set}"
+fi
 # Operator settings. Nothing here names a deployment: set HERMES_HOME, the
 # workspace roots, HINDSIGHT_URL, HINDSIGHT_CONTAINER and HERMES_OPS_BANKS.
 HOME_DIR=${HERMES_HOME:-$HOME/.hermes}
 WORKSPACE=${HERMES_OPS_WORKSPACE:-$HOME_DIR/workspace}
-DOCKER=${HINDSIGHT_DOCKER:-$(command -v docker 2>/dev/null || echo docker)}
-CONTAINER=${HINDSIGHT_CONTAINER:-hindsight}
-PSQL_BIN=${HINDSIGHT_PG_BIN:-}
-PG_LIB=${HINDSIGHT_PG_LIB:-}
-DB_HOST=${HINDSIGHT_DB_HOST:-127.0.0.1}
-DB_USER=${HINDSIGHT_DB_USER:-hindsight}
-DB_NAME=${HINDSIGHT_DB:-hindsight}
 API=${HINDSIGHT_URL:-http://localhost:8888}
 LOG=${HERMES_OPS_DREAM_LOG:-$WORKSPACE/dream-bank-log.jsonl}
 DEST=${HERMES_OPS_BACKUP_DIR:-$WORKSPACE/backups}
@@ -439,7 +436,11 @@ STATS="["
 for bank in ${BANKS//,/ }; do
   aborted_json=null
   [ -n "${ABORTED[$bank]}" ] && aborted_json="\"${ABORTED[$bank]}\""
-  STATS="${STATS}{\"bank\":\"$bank\",\"nodes_before\":${NODES_BEFORE[$bank]},\"nodes_after\":${NODES_AFTER[$bank]},\"pending\":${PENDING[$bank]},\"safe_victims\":${VICTIMS[$bank]},\"batch\":${BATCH[$bank]},\"deduped\":${DEDUPED[$bank]},\"remaining\":${REMAINING[$bank]},\"flagged\":${FLAGGED[$bank]},\"flag_reason\":${FLAGREASON[$bank]:-{}},\"aborted\":${aborted_json}},"
+  # brace-safe: an inline ${var:-{}} default appends a stray '}' on bash 5.2,
+  # corrupting the JSON stats row, so resolve the default before interpolating.
+  reason="${FLAGREASON[$bank]:-}"
+  [ -z "$reason" ] && reason='{}'
+  STATS="${STATS}{\"bank\":\"$bank\",\"nodes_before\":${NODES_BEFORE[$bank]},\"nodes_after\":${NODES_AFTER[$bank]},\"pending\":${PENDING[$bank]},\"safe_victims\":${VICTIMS[$bank]},\"batch\":${BATCH[$bank]},\"deduped\":${DEDUPED[$bank]},\"remaining\":${REMAINING[$bank]},\"flagged\":${FLAGGED[$bank]},\"flag_reason\":${reason},\"aborted\":${aborted_json}},"
 done
 STATS="${STATS%,}]"
 

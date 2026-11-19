@@ -393,7 +393,11 @@ def describe():
 def _cli():
     """Smallest CLI: `hermes_ops_config.py psql [name=value ...]` reads SQL on
     stdin, inlines psql-style :'name' bindings as safely quoted literals, and
-    runs psql_command(), so shell operators have exactly one builder route."""
+    runs psql_command(), so shell operators have exactly one builder route.
+    The binding inline is a plain text replace, so a :'name' sitting inside a
+    string literal or a comment is rewritten too; that is safe for every
+    statement these scripts send today (no binding name appears in a literal
+    or a comment)."""
     if len(sys.argv) < 2 or sys.argv[1] != "psql":
         print("usage: hermes_ops_config.py psql [name=value ...]   (SQL on stdin)", file=sys.stderr)
         return 2
@@ -406,7 +410,12 @@ def _cli():
         statement = statement.replace(
             ":'" + name + "'", "'" + value.replace("'", "''") + "'"
         )
-    result = subprocess.run(psql_command(), input=statement, text=True)
+    try:
+        command = psql_command()
+    except ConfigError as exc:
+        print(f"psql: {exc}", file=sys.stderr)
+        return 1
+    result = subprocess.run(command, input=statement, text=True)
     return result.returncode
 
 
