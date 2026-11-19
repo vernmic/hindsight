@@ -203,13 +203,18 @@ class DreamBankTests(unittest.TestCase):
             self.assertIn("protected bank refused", result.stderr)
 
     def test_psql_argv_uses_configured_container(self):
+        # psql_sql now routes through hermes_ops_config.py psql; a stub
+        # HINDSIGHT_PSQL_TRANSPORT with {container} proves the instance
+        # selection still comes from HINDSIGHT_CONTAINER on the builder route.
+        transport = json.dumps(["/bin/echo", "proxy:", "{container}"])
         result = self.source(
             'psql_sql bank-a <<< "select 1" ',
-            HINDSIGHT_DOCKER="/bin/echo",
+            HINDSIGHT_PSQL_TRANSPORT=transport,
             HINDSIGHT_CONTAINER="container-x",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("container-x", result.stdout)
+        self.assertIn("proxy:", result.stdout)
 
     def test_missing_bank_list_aborts_execution(self):
         result = subprocess.run(
