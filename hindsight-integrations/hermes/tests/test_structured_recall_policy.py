@@ -1,0 +1,151 @@
+"""Structured recall shares the configured retrieval policy with ordinary recall (review F1),
+the provider cap ceilings structured results (F5), and retain provenance is opt-in (F5).
+
+The scenario is adapted from the reviewer's offline probe at
+I:/hermes/reports/hindsight-integrations-review-20261118/probe-structured-policy.py.
+"""
+
+from __future__ import annotations
+
+import types
+from collections.abc import Callable
+
+
+class Row:
+    def __init__(self, row_id: str, text: str, tags: list[str], score: float):
+        self.id = row_id
+        self.text = text
+        self.tags = tags
+        self.occurred_start = None
+        self.mentioned_at = None
+        self.scores = {"semantic": score}
+        self.metadata = {}
+
+    def model_dump(self, **_kwargs):
+        return vars(self)
+
+
+class PolicyClient:
+    """Applies the request's tags/min_scores like the real server, per bank; can fail one bank."""
+
+    def __init__(self, rows: dict[str, list[Row]], fail_bank: str | None = None):
+        self.rows = rows
+        self.fail_bank = fail_bank
+        self.recalls: list[dict] = []
+
+    async def arecall(self, **kwargs):
+        self.recalls.append(kwargs.copy())
+        if kwargs["bank_id"] == self.fail_bank:
+            raise RuntimeError("bank unavailable")
+        out = list(self.rows.get(kwargs["bank_id"], []))
+        if kwargs.get("tags"):
+            out = [r for r in out if all(t in r.tags for t in kwargs["tags"])]
+        if kwargs.get("tag_groups"):
+            wanted = {t for group in kwargs["tag_groups"] for t in group}
+            out = [r for r in out if wanted & set(r.tags)]
+        if kwargs.get("min_scores"):
+            out = [r for r in out if all(r.scores.get(k, 0) >= v for k, v in kwargs["min_scores"].items())]
+        return types.SimpleNamespace(results=out)
+
+    async def aclose(self):
+        pass
+
+
+ROWS = {
+    "primary": [
+        Row("weak", "weak", ["permitted"], 0.1),
+        Row("denied", "wrong-tag", ["other"], 0.9),
+        Row("good", "good", ["permitted"], 0.95),
+    ],
+    "extra": [Row("extra", "extra-good", ["permitted"], 0.99)],
+}
+
+POLICY = {
+    "bank_id": "primary",
+    "recall_tags": ["permitted"],
+    "recall_tags_match": "all",
+    "recall_types": ["observation"],
+    "recall_min_scores": {"semantic": 0.8},
+    "recall_additional_banks": ["extra"],
+}
+
+
+def _structured(provider: Callable, config: dict, feed: dict, client: PolicyClient | None = None):
+    instance, _ = provider(config, client=client or PolicyClient(ROWS))
+    try:
+        return instance, instance.prefetch_candidates({"query": "q", "feed_hash": "h", **feed})
+    except Exception:
+        instance.shutdown()
+        raise
+
+
+def test_structured_recall_applies_configured_policy_and_banks(provider: Callable) -> None:
+    # The probe scenario: permitted tag + 0.8 floor + observation types must filter
+    # weak and wrong-tag rows, and the additional bank must be queried too.
+    client = PolicyClient(ROWS)
+    instance, result = _structured(provider, dict(POLICY), {}, client)
+    try:
+        assert [c["id"] for c in result["candidates"]] == ["primary/good", "extra/extra"]
+        assert {call["bank_id"] for call in client.recalls} == {"primary", "extra"}
+        for call in client.recalls:
+            assert call["tags"] == ["permitted"]
+            assert call["min_scores"] == {"semantic": 0.8}
+            assert call["types"] == ["observation"]
+    finally:
+        instance.shutdown()
+
+
+def test_feed_tag_groups_replace_configured_tags_only(provider: Callable) -> None:
+    client = PolicyClient(ROWS)
+    instance, result = _structured(provider, dict(POLICY), {"tag_groups": [["other"]]}, client)
+    try:
+        # The feed narrows to its own tag constraint; deployment floors still apply.
+        assert [c["id"] for c in result["candidates"]] == ["primary/denied"]
+        assert all("tag_groups" in c and "tags" not in c for c in client.recalls)
+        assert all(c["min_scores"] == {"semantic": 0.8} for c in client.recalls)
+    finally:
+        instance.shutdown()
+
+
+def test_absent_feed_override_keeps_configured_policy(provider: Callable) -> None:
+    client = PolicyClient(ROWS)
+    instance, _result = _structured(provider, dict(POLICY), {}, client)
+    try:
+        assert all(c.get("tags") == ["permitted"] and "tag_groups" not in c for c in client.recalls)
+    finally:
+        instance.shutdown()
+
+
+def test_partial_extra_bank_failure_keeps_primary_results(provider: Callable) -> None:
+    client = PolicyClient(ROWS, fail_bank="extra")
+    instance, result = _structured(provider, dict(POLICY), {}, client)
+    try:
+        assert [c["id"] for c in result["candidates"]] == ["primary/good"]
+        assert result["error"] is None
+        assert {e["bank"] for e in result["query_errors"]} == {"extra"}
+    finally:
+        instance.shutdown()
+
+
+def test_duplicates_are_deduped_before_the_feed_cap(provider: Callable) -> None:
+    rows = {"primary": [Row("dup", "dup", ["permitted"], 0.9), Row("good", "good", ["permitted"], 0.95), Row("dup", "dup", ["permitted"], 0.9)]}
+    client = PolicyClient(rows)
+    instance, result = _structured(provider, dict(POLICY), {"max_results": 2}, client)
+    try:
+        ids = [c["id"] for c in result["candidates"]]
+        assert ids == ["primary/dup", "primary/good"]
+    finally:
+        instance.shutdown()
+
+
+def test_row_without_id_is_skipped_not_fatal(provider: Callable) -> None:
+    broken = Row(None, "broken", ["permitted"], 0.9)
+    rows = {"primary": [broken, Row("good", "good", ["permitted"], 0.95)]}
+    client = PolicyClient(rows)
+    instance, result = _structured(provider, dict(POLICY), {}, client)
+    try:
+        assert [c["id"] for c in result["candidates"]] == ["primary/good"]
+        assert result["query_errors"] == []
+    finally:
+        instance.shutdown()
+
