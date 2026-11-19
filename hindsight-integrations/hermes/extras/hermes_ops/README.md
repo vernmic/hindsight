@@ -35,7 +35,7 @@ target or host path.
 | `HERMES_OPS_BANK` | none - required | the one garden bank; `main` and `openclaw` are refused |
 | `HERMES_OPS_BANKS` | `HERMES_OPS_BANK` | comma list for the nightly pass |
 | `HINDSIGHT_URL` | `http://localhost:8888` | the API URL the toolkit talks to; on hosts without local Hindsight, point it at the forwarding tunnel or the server address |
-| `HINDSIGHT_PSQL_TRANSPORT` | unset (docker-exec route) | JSON argv list for a server-side SQL transport (SQL on stdin). A literal `{container}` element is replaced with the `HINDSIGHT_CONTAINER` value. When set, `HINDSIGHT_PGPASSWORD` is neither required nor injected and in-image psql discovery is skipped. Example: `["/path/to/python", "/path/to/Hindsight-SQL-Proxy.py", "--instance", "{container}"]` |
+| `HINDSIGHT_PSQL_TRANSPORT` | unset (docker-exec route) | JSON argv list for a server-side SQL transport (SQL on stdin). A literal `{container}` element is replaced with the `HINDSIGHT_CONTAINER` value. When set, `HINDSIGHT_PGPASSWORD` is neither required nor injected and in-image psql discovery is skipped. Example: `["/path/to/python", "/path/to/Hindsight-SQL-Proxy.py", "--instance", "{container}"]`. On the transport route the proxy picks its own database, so `HINDSIGHT_DB` / `HINDSIGHT_DB_USER` / `HINDSIGHT_DB_HOST` are ignored. |
 | `HINDSIGHT_CONTAINER` | `hindsight` (the compose service name) | set it whenever your deployment renamed the service |
 | `HINDSIGHT_DB` / `HINDSIGHT_DB_USER` / `HINDSIGHT_DB_HOST` | `hindsight` / `hindsight` / `127.0.0.1` | expected database identity |
 | `HINDSIGHT_PG_BIN` / `HINDSIGHT_PG_LIB` | discovered inside the container | set explicitly when discovery cannot find psql; an explicit `<prefix>/bin/psql` implies `<prefix>/lib` |
