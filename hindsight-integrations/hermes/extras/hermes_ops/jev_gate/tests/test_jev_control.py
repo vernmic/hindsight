@@ -13,6 +13,27 @@ def _pin_runtime_dir(monkeypatch):
     monkeypatch.setenv("HERMES_RUNTIME_DIR", str(Path(hermes_cli.__file__).resolve().parents[1]))
 
 
+def test_secondary_profile_control_cannot_touch_primary(tmp_path, monkeypatch):
+    # The wrappers' only profile channel is HERMES_HOME -> control(home); a
+    # secondary-profile switch must leave the primary profile's config alone.
+    path = Path(__file__).parents[2] / "scripts/jev-control.py"
+    _pin_runtime_dir(monkeypatch)
+    spec = importlib.util.spec_from_file_location("jev_control_test2", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    text = """jev_gate:
+  mode: enforced
+  recall_timeout_seconds: 30
+"""
+    primary, secondary = tmp_path / "primary", tmp_path / "secondary"
+    for home in (primary, secondary):
+        home.mkdir()
+        (home / "config.yaml").write_text(text)
+    module.control("off", secondary)
+    assert yaml.safe_load((secondary / "config.yaml").read_text())["jev_gate"]["mode"] == "off"
+    assert yaml.safe_load((primary / "config.yaml").read_text())["jev_gate"]["mode"] == "enforced"
+
+
 def test_off_on_preserves_other_settings_and_comments(tmp_path, monkeypatch):
     path = Path(__file__).parents[2] / "scripts/jev-control.py"
     _pin_runtime_dir(monkeypatch)
