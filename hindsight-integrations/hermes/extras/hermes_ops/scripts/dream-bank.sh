@@ -55,25 +55,15 @@ refuse_bank() {
   fi
 }
 
-psql_discover() {
-  # No portable in-image psql path; ask the container once.
-  "$DOCKER" exec "$CONTAINER" sh -c 'command -v psql || ls -d /usr/lib/postgresql/*/bin/psql /home/*/.pg0/installation/*/bin/psql 2>/dev/null | tail -n 1' 2>/dev/null | tail -n 1
-}
+# One builder route (Vern 11-18): hermes_ops_config.py owns the psql argv on
+# every host - the docker-exec route by default, or the server-side
+# HINDSIGHT_PSQL_TRANSPORT argv when that setting is present.
+OPS_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+OPS_PY=${HERMES_OPS_PYTHON:-python3}
 
 psql_sql() {
   refuse_bank "$1"
-  if [ -z "$PSQL_BIN" ]; then
-    PSQL_BIN="$(psql_discover)"
-  fi
-  if [ -z "$PSQL_BIN" ]; then
-    echo "dream-bank: aborted: psql not found in $CONTAINER; set HINDSIGHT_PG_BIN" >&2
-    return 1
-  fi
-  [ -n "$PG_LIB" ] || { case "$PSQL_BIN" in */bin/psql) PG_LIB="${PSQL_BIN%/bin/psql}/lib" ;; esac; }
-  local args=(-i -e "PGPASSWORD=$HINDSIGHT_PGPASSWORD")
-  [ -n "$PG_LIB" ] && args+=(-e "LD_LIBRARY_PATH=$PG_LIB")
-  "$DOCKER" exec "${args[@]}" "$CONTAINER" "$PSQL_BIN" \
-    -h "$DB_HOST" -U "$DB_USER" -d "$DB_NAME" -v ON_ERROR_STOP=1 -q -At
+  "$OPS_PY" "$OPS_DIR/hermes_ops_config.py" psql
 }
 
 victim_setup() {

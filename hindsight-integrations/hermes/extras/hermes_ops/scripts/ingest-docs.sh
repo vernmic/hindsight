@@ -115,35 +115,15 @@ container_for_url() {
   # that is correct for every host.
   echo "${HINDSIGHT_CONTAINER:-hindsight}"
 }
-DKR="$(docker_cli || true)"
-CT="$(container_for_url)"
+# One builder route (Vern 11-18): hermes_ops_config.py owns the psql argv on
+# every host - the docker-exec route by default, or the server-side
+# HINDSIGHT_PSQL_TRANSPORT argv when that setting is present.
+OPS_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+OPS_PY=${HERMES_OPS_PYTHON:-python3}
 
-psql_discover() {
-  # No portable in-image psql path: the packaged image keeps it under its pg0
-  # installation, others put it on PATH. Best effort; an empty result aborts.
-  "$DKR" exec "$CT" sh -c 'command -v psql || ls -d /usr/lib/postgresql/*/bin/psql /home/*/.pg0/installation/*/bin/psql 2>/dev/null | tail -n 1' 2>/dev/null | tail -n 1
-}
-PSQL_BIN=${HINDSIGHT_PG_BIN:-}
-PG_LIB=${HINDSIGHT_PG_LIB:-}
-if [ -z "$PSQL_BIN" ] && [ -n "$DKR" ]; then
-  PSQL_BIN="$(psql_discover)"
-fi
-if [ -z "$PSQL_BIN" ] && [ "$MODE" != "list" ] && [ -n "${VERSION_TAG:-}" ]; then
-  echo "ingest-docs: aborted: psql not found in $CT; set HINDSIGHT_PG_BIN" >&2
-  exit 1
-fi
-[ -n "$PG_LIB" ] || { case "$PSQL_BIN" in */bin/psql) PG_LIB="${PSQL_BIN%/bin/psql}/lib" ;; esac; }
-
-sql() {  # sql <statement> [psql -v name=value ...]; statement and bindings on argv/stdin
+sql() {  # sql <statement> [name=value ...]; binds inlined by the module entry
   local statement="$1"; shift
-  local binds=()
-  while [ $# -gt 0 ]; do binds+=(-v "$1"); shift; done
-  [ -n "$DKR" ] || { echo "NO_DOCKER"; return 1; }
-  : "${HINDSIGHT_PGPASSWORD:?HINDSIGHT_PGPASSWORD must be set}"
-  local args=(-i -e "PGPASSWORD=$HINDSIGHT_PGPASSWORD")
-  [ -n "$PG_LIB" ] && args+=(-e "LD_LIBRARY_PATH=$PG_LIB")
-  printf '%s\n' "$statement" | "$DKR" exec "${args[@]}" "$CT" "$PSQL_BIN" \
-    -h "$DB_HOST" -U "$DB_USER" -d "$DB_NAME" -v ON_ERROR_STOP=1 "${binds[@]}" -A -F'|' -t -f - 2>&1
+  printf '%s\n' "$statement" | "$OPS_PY" "$OPS_DIR/hermes_ops_config.py" psql "$@" 2>&1
 }
 
 mkdir -p "$BACKUP_DIR"
