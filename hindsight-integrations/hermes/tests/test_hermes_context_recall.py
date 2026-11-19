@@ -16,7 +16,8 @@ def test_legacy_count_cap_and_uncapped_mode(provider):
 
 
 def test_saved_bridge_is_snapshotted_and_cleared_on_session_switch(provider):
-    instance, fake = provider({"bank_id": "hermes-ops"})
+    # The previous-turn retain context is the opt-in retain_provenance policy (review F5).
+    instance, fake = provider({"bank_id": "hermes-ops", "retain_provenance": True})
     instance._previous_retained_turn = "Nimbus option: three parcel comparisons."
     instance._session_turns = [json.dumps([{"role": "user", "content": "This option remains deferred."}])]
     job = instance._make_turn_retain_job(

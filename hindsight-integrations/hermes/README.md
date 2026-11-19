@@ -257,7 +257,7 @@ The lookup stops at the repository root. Only `bank_id` is read.
 | `recall_budget` | `mid` | Recall thoroughness: `low` / `mid` / `high` |
 | `recall_prefetch_method` | `recall` | Auto-recall method: `recall` (raw facts) or `reflect` (LLM synthesis) |
 | `recall_max_tokens` | `4096` | Maximum tokens for recall results |
-| `recall_max_results` | `0` | Maximum total recall records after score filtering and cross-bank deduplication; `0` is uncapped. Applies to automatic recall and `hindsight_recall`, not reflect. |
+| `recall_max_results` | `0` | Maximum total recall records after score filtering and cross-bank deduplication; `0` is uncapped. Applies to automatic recall, `hindsight_recall` and structured candidates. For the structured feed the feed's own `max_results` (depth budget) is applied per path first; a nonzero `recall_max_results` then ceilings the total candidates, so feed depth can never exceed the provider cap. Not reflect. |
 | `prefetch_excluded_banks` | *(empty)* | Banks excluded from structured prefetch candidates (comma-separated list, or `HINDSIGHT_PREFETCH_EXCLUDED_BANKS` env). Empty default = no exclusions; protected bank names belong in deployment config, not shipped defaults. |
 | `monitoring_retain_excluded_prefixes` | *(empty)* | Session-id prefixes excluded from automatic monitoring retain (comma-separated list, or `HINDSIGHT_MONITORING_RETAIN_EXCLUDED_PREFIXES` env). Empty default = no exclusions. Replaces the removed `exclude_monitoring_auto_retain` key (see migration note). |
 | `recall_max_input_chars` | `800` | Maximum input query length for auto-recall |
@@ -312,6 +312,7 @@ The lookup stops at the repository root. Only `bank_id` is read.
 | `retain_strategy` | — | Named retain strategy sent with every stored item (`HINDSIGHT_RETAIN_STRATEGY`). The bank must define it under `retain_strategies`; an unknown name is ignored by the server. Empty lets the bank decide. |
 | `retain_indicator` | `true` | Show a `👁️ Hindsight — saving to memory…` status line when a turn is saved. Turn off for customer-facing agents. |
 | `retain_user_prefix` | `User` | Label used before user turns in auto-retained transcripts |
+| `retain_provenance` | `false` | Provider policy (off by default): add the five provenance tag dimensions (`kind:`, `scope:`, `domain:`, `confidence:`, `source:`) to every retained memory and append the previous turn's source text to the retain context on appends. Local shaping, not upstream behavior; leave off unless you want it. |
 | `retain_assistant_prefix` | `Assistant` | Label used before assistant turns in auto-retained transcripts |
 | `prefetch_waits_for_retain` | `true` | Before the background recall for the next turn, wait until the turn just saved can be found, so recall includes it. Runs off the reply path and adds no response time. |
 | `prefetch_retain_drain_timeout` | `10` | Most seconds that background recall waits for the save above before recalling anyway |
