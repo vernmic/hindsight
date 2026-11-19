@@ -132,6 +132,106 @@ def test_feed_groups_and_configured_tags_both_hold(provider: Callable) -> None:
         instance.shutdown()
 
 
+def test_malformed_feed_numbers_are_coerced_not_fatal(provider: Callable) -> None:
+    # A3: '' / null / non-numeric max_results and max_tokens read as absent
+    # (uncapped depth, provider default tokens) instead of raising.
+    client = PolicyClient(ROWS)
+    instance, result = _structured(
+        provider,
+        dict(POLICY),
+        {"max_results": "", "max_tokens": None},
+        client,
+    )
+    try:
+        assert [c["id"] for c in result["candidates"]] == ["primary/good", "extra/extra"]
+        assert all(call["max_tokens"] == instance._recall_max_tokens for call in client.recalls)
+    finally:
+        instance.shutdown()
+
+    client = PolicyClient(ROWS)
+    instance, result = _structured(
+        provider,
+        dict(POLICY),
+        {"max_results": "bogus", "max_tokens": "soon"},
+        client,
+    )
+    try:
+        assert len(result["candidates"]) == 2
+    finally:
+        instance.shutdown()
+
+
+def test_absent_feed_override_keeps_configured_policy(provider: Callable) -> None:
+    client = PolicyClient(ROWS)
+    instance, _result = _structured(provider, dict(POLICY), {}, client)
+    try:
+        assert all(c.get("tags") == ["permitted"] and "tag_groups" not in c for c in client.recalls)
+    finally:
+        instance.shutdown()
+
+
+def test_provider_cap_ceilings_structured_results(provider: Callable) -> None:
+    config = dict(POLICY)
+    config["recall_max_results"] = 1
+    instance, result = _structured(provider, config, {})
+    try:
+        assert [c["id"] for c in result["candidates"]] == ["primary/good"]
+    finally:
+        instance.shutdown()
+
+
+def test_feed_depth_applies_within_provider_cap(provider: Callable) -> None:
+    config = dict(POLICY)
+    config["recall_max_results"] = 3
+    instance, result = _structured(provider, config, {"max_results": 1})
+    try:
+        assert len(result["candidates"]) == 1
+    finally:
+        instance.shutdown()
+
+
+def test_uncapped_provider_cap_stays_uncapped(provider: Callable) -> None:
+    instance, result = _structured(provider, dict(POLICY), {})
+    try:
+        assert len(result["candidates"]) == 2
+    finally:
+        instance.shutdown()
+
+
+def test_partial_extra_bank_failure_keeps_primary_results(provider: Callable) -> None:
+    client = PolicyClient(ROWS, fail_bank="extra")
+    instance, result = _structured(provider, dict(POLICY), {}, client)
+    try:
+        assert [c["id"] for c in result["candidates"]] == ["primary/good"]
+        assert result["error"] is None
+        assert {e["bank"] for e in result["query_errors"]} == {"extra"}
+    finally:
+        instance.shutdown()
+
+
+def test_duplicates_are_deduped_before_the_feed_cap(provider: Callable) -> None:
+    rows = {"primary": [Row("dup", "dup", ["permitted"], 0.9), Row("good", "good", ["permitted"], 0.95), Row("dup", "dup", ["permitted"], 0.9)]}
+    client = PolicyClient(rows)
+    instance, result = _structured(provider, dict(POLICY), {"max_results": 2}, client)
+    try:
+        ids = [c["id"] for c in result["candidates"]]
+        assert ids == ["primary/dup", "primary/good"]
+    finally:
+        instance.shutdown()
+
+
+def test_row_without_id_is_skipped_not_fatal(provider: Callable) -> None:
+    broken = Row(None, "broken", ["permitted"], 0.9)
+    rows = {"primary": [broken, Row("good", "good", ["permitted"], 0.95)]}
+    client = PolicyClient(rows)
+    instance, result = _structured(provider, dict(POLICY), {}, client)
+    try:
+        assert [c["id"] for c in result["candidates"]] == ["primary/good"]
+        assert result["query_errors"] == []
+    finally:
+        instance.shutdown()
+
+
 def test_retain_provenance_is_off_by_default(provider: Callable) -> None:
     from conftest import FakeClient
 
