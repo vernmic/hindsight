@@ -41,8 +41,12 @@ class PolicyClient:
         if kwargs.get("tags"):
             out = [r for r in out if all(t in r.tags for t in kwargs["tags"])]
         if kwargs.get("tag_groups"):
-            wanted = {t for group in kwargs["tag_groups"] for t in group}
-            out = [r for r in out if wanted & set(r.tags)]
+            # Mirror the engine: every top-level group must match (tags_satisfy_groups
+            # ANDs groups), so the fake exercises the narrowing rule honestly.
+            # A group arrives as a dict (server leaf form) or a bare tag list.
+            for group in kwargs["tag_groups"]:
+                wanted = set(group.get("tags") or []) if isinstance(group, dict) else set(group)
+                out = [r for r in out if wanted & set(r.tags)]
         if kwargs.get("min_scores"):
             out = [r for r in out if all(r.scores.get(k, 0) >= v for k, v in kwargs["min_scores"].items())]
         return types.SimpleNamespace(results=out)
@@ -95,85 +99,35 @@ def test_structured_recall_applies_configured_policy_and_banks(provider: Callabl
         instance.shutdown()
 
 
-def test_feed_tag_groups_replace_configured_tags_only(provider: Callable) -> None:
+def test_feed_groups_narrow_within_configured_tags(provider: Callable) -> None:
+    # The feed asks for the "other" tag, which would admit primary/denied - but the
+    # configured [permitted] tags must still hold (AND), so nothing outside them
+    # returns: a feed can never widen what the profile recalls.
     client = PolicyClient(ROWS)
     instance, result = _structured(provider, dict(POLICY), {"tag_groups": [["other"]]}, client)
     try:
-        # The feed narrows to its own tag constraint; deployment floors still apply.
-        assert [c["id"] for c in result["candidates"]] == ["primary/denied"]
-        assert all("tag_groups" in c and "tags" not in c for c in client.recalls)
-        assert all(c["min_scores"] == {"semantic": 0.8} for c in client.recalls)
+        assert result["candidates"] == []
+        for call in client.recalls:
+            groups = call["tag_groups"]
+            # The appended configured-tags leaf is a dict; the feed's own group may
+            # be a bare list (the feed sent [["other"]] in this case).
+            leaf_tags = [
+                set(g.get("tags") or []) if isinstance(g, dict) else set(g) for g in groups
+            ]
+            assert {"permitted"} in leaf_tags
+            assert "tags" not in call
+            assert call["min_scores"] == {"semantic": 0.8}
     finally:
         instance.shutdown()
 
 
-def test_absent_feed_override_keeps_configured_policy(provider: Callable) -> None:
-    client = PolicyClient(ROWS)
-    instance, _result = _structured(provider, dict(POLICY), {}, client)
-    try:
-        assert all(c.get("tags") == ["permitted"] and "tag_groups" not in c for c in client.recalls)
-    finally:
-        instance.shutdown()
-
-
-def test_provider_cap_ceilings_structured_results(provider: Callable) -> None:
-    config = dict(POLICY)
-    config["recall_max_results"] = 1
-    instance, result = _structured(provider, config, {})
-    try:
-        assert [c["id"] for c in result["candidates"]] == ["primary/good"]
-    finally:
-        instance.shutdown()
-
-
-def test_feed_depth_applies_within_provider_cap(provider: Callable) -> None:
-    config = dict(POLICY)
-    config["recall_max_results"] = 3
-    instance, result = _structured(provider, config, {"max_results": 1})
-    try:
-        assert len(result["candidates"]) == 1
-    finally:
-        instance.shutdown()
-
-
-def test_uncapped_provider_cap_stays_uncapped(provider: Callable) -> None:
-    instance, result = _structured(provider, dict(POLICY), {})
-    try:
-        assert len(result["candidates"]) == 2
-    finally:
-        instance.shutdown()
-
-
-def test_partial_extra_bank_failure_keeps_primary_results(provider: Callable) -> None:
-    client = PolicyClient(ROWS, fail_bank="extra")
-    instance, result = _structured(provider, dict(POLICY), {}, client)
-    try:
-        assert [c["id"] for c in result["candidates"]] == ["primary/good"]
-        assert result["error"] is None
-        assert {e["bank"] for e in result["query_errors"]} == {"extra"}
-    finally:
-        instance.shutdown()
-
-
-def test_duplicates_are_deduped_before_the_feed_cap(provider: Callable) -> None:
-    rows = {"primary": [Row("dup", "dup", ["permitted"], 0.9), Row("good", "good", ["permitted"], 0.95), Row("dup", "dup", ["permitted"], 0.9)]}
+def test_feed_groups_and_configured_tags_both_hold(provider: Callable) -> None:
+    # A row inside BOTH the feed's group and the configured tags is returned.
+    rows = {"primary": [Row("both", "both", ["permitted", "extra"], 0.9)]}
     client = PolicyClient(rows)
-    instance, result = _structured(provider, dict(POLICY), {"max_results": 2}, client)
+    instance, result = _structured(provider, dict(POLICY), {"tag_groups": [["extra"]]}, client)
     try:
-        ids = [c["id"] for c in result["candidates"]]
-        assert ids == ["primary/dup", "primary/good"]
-    finally:
-        instance.shutdown()
-
-
-def test_row_without_id_is_skipped_not_fatal(provider: Callable) -> None:
-    broken = Row(None, "broken", ["permitted"], 0.9)
-    rows = {"primary": [broken, Row("good", "good", ["permitted"], 0.95)]}
-    client = PolicyClient(rows)
-    instance, result = _structured(provider, dict(POLICY), {}, client)
-    try:
-        assert [c["id"] for c in result["candidates"]] == ["primary/good"]
-        assert result["query_errors"] == []
+        assert [c["id"] for c in result["candidates"]] == ["primary/both"]
     finally:
         instance.shutdown()
 

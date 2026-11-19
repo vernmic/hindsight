@@ -282,10 +282,12 @@ The lookup stops at the repository root. Only `bank_id` is read.
 
 > **Structured candidates share the configured retrieval policy.** The structured (feed) path builds its
 > requests through the same builder as ordinary recall: `recall_tags` / `recall_tags_match`, `recall_types`,
-> `recall_min_scores` and the additional / recall-only bank set all apply. A feed's `tag_groups` REPLACE the
-> configured tag constraint for that request (a narrowing the feed itself defines); with no feed groups the
-> configured tags apply unchanged. `recall_types` and `recall_min_scores` always apply on top. A partial
-> extra-bank failure is skipped with a warning, exactly like ordinary recall.
+> `recall_min_scores` and the additional / recall-only bank set all apply. A feed's `tag_groups` NARROW
+> within the configured tags, never replace them: the configured tags become one more AND-combined
+> group (the engine's own compound rule), so a feed can only shrink what the profile recalls, never
+> widen it. With no feed groups the request keeps `tags`/`tags_match` exactly as before. `recall_types`
+> and `recall_min_scores` always apply on top. A partial extra-bank failure is skipped with a warning,
+> exactly like ordinary recall.
 
 > **Tip - `recall_min_scores` against off-topic recall.** Recall ranks, it does not judge relevance: a question
 > unrelated to anything stored still comes back with up to `recall_max_tokens` of the least-bad memories. The
