@@ -53,6 +53,72 @@ def recent_items(history, current_task, limit):
     return list(reversed(clipped))
 
 
+def _skill_path_index():
+    """Single-pass replica of skill_manager_tool._find_skill's resolution rule.
+
+    _find_skill walks EVERY skill directory per call and parses each non-matching
+    SKILL.md's frontmatter, so a roster of N skills costs ~N^2 YAML parses (the
+    pre_memory_recall slowness root cause). Here the same directories are walked
+    ONCE and each SKILL.md's frontmatter is parsed once, building:
+    - by_dir_name: first directory whose name equals the query (whole-scan priority),
+    - by_categorized: first directory whose local-root-relative POSIX path equals
+      a query containing a separator (local root only, like the original),
+    - display_claims: frontmatter display name -> distinct resolved SKILL.md paths,
+      where two or more distinct claimants resolve to nothing (collision refusal).
+    Directory-name matches keep priority over display names, exactly as upstream."""
+    from contextlib import suppress
+
+    from tools.skill_manager_tool import (
+        _iter_skill_dirs,
+        _read_frontmatter_name,
+        _skills_dir,
+    )
+
+    try:
+        from agent.skill_utils import get_all_skills_dirs
+    except ImportError:  # live core layout fallback
+        from tools.skill_manager_tool import get_all_skills_dirs
+
+    try:
+        local_root = _skills_dir().resolve()
+    except OSError:
+        local_root = None
+    by_dir_name: dict = {}
+    by_categorized: dict = {}
+    display_claims: dict = {}
+    for skills_dir in get_all_skills_dirs():
+        if not skills_dir.exists():
+            continue
+        for skill_dir in _iter_skill_dirs(skills_dir):
+            by_dir_name.setdefault(skill_dir.name, skill_dir)
+            if local_root is not None:
+                resolved = skill_dir.resolve()
+                if resolved.is_relative_to(local_root):
+                    by_categorized.setdefault(
+                        resolved.relative_to(local_root).as_posix(), skill_dir
+                    )
+            display = _read_frontmatter_name(skill_dir / "SKILL.md")
+            if isinstance(display, str):
+                key = skill_dir / "SKILL.md"
+                with suppress(Exception):
+                    key = key.resolve()
+                display_claims.setdefault(display, []).append((key, skill_dir))
+
+    def resolve(name):
+        if name in by_dir_name:
+            return {"path": by_dir_name[name]}
+        if local_root is not None and ("/" in name or "\\" in name) and name in by_categorized:
+            return {"path": by_categorized[name]}
+        claims = display_claims.get(name)
+        if claims:
+            distinct = {key: skill_dir for key, skill_dir in claims}
+            if len(distinct) == 1:
+                return {"path": next(iter(distinct.values()))}
+        return None
+
+    return resolve
+
+
 def skill_roster():
     from tools import skill_ledger
     from tools.skills_tool import skills_list
@@ -62,10 +128,10 @@ def skill_roster():
     from tools import skill_usage
 
     usage = skill_usage.load_usage()
-    from tools.skill_manager_tool import _find_skill
+    resolve = _skill_path_index()
 
     def features(row):
-        found = _find_skill(row["name"])
+        found = resolve(row["name"])
         path = found["path"] / "SKILL.md" if found else None
         record = usage.get(row["name"]) or {}
         return {
@@ -113,10 +179,28 @@ def prepare(
 
         turn_id = f"{session_id}:{uuid.uuid4().hex}"
     deadline = time.monotonic() + cfg["turn_budget_seconds"]
+    # Stage timings (ms) recorded in the feed ledger row, so a slow turn is
+    # attributable from the ledger alone (HOOKS-REVIEW F3).
+    turn_started = time.monotonic()
+    stage = time.monotonic()
+    recent = recent_items(conversation_history, current, cfg["max_context_chars"])
+    recent_ms = round((time.monotonic() - stage) * 1000, 1)
+    stage = time.monotonic()
+    roster_rows = roster if roster is not None else skill_roster()
+    roster_ms = round((time.monotonic() - stage) * 1000, 1)
+
+    def feed_timings(judge_started):
+        return {
+            "recent_items": recent_ms,
+            "roster": roster_ms,
+            "judge_wait": round((time.monotonic() - judge_started) * 1000, 1),
+            "total": round((time.monotonic() - turn_started) * 1000, 1),
+        }
+
     state = {
         "current_task": current,
-        "recent_items": recent_items(conversation_history, current, cfg["max_context_chars"]),
-        "skills": roster if roster is not None else skill_roster(),
+        "recent_items": recent,
+        "skills": roster_rows,
         "session_id": session_id,
         "turn_ref": turn_id,
         "turn_number": turn_number,
@@ -138,6 +222,7 @@ def prepare(
     for axis in ("task", "target", "value"):
         options = list(cfg["registry"].get(axis, []))
         questions[axis] = choice(QUESTIONS["axis"].format(axis=axis), options + ["none"])
+    judge_started = time.monotonic()
     try:
         result = client.decide(state, questions, cfg, timeout=deadline - time.monotonic())
     except client.Unavailable as exc:
@@ -147,7 +232,11 @@ def prepare(
             "feed",
             state,
             questions,
-            {"error": exc.disposition, "reason": str(exc)},
+            {
+                "error": exc.disposition,
+                "reason": str(exc),
+                "timings_ms": feed_timings(judge_started),
+            },
             mode=cfg["mode"],
             outcome={"baseline": True},
         )
@@ -207,7 +296,16 @@ def prepare(
         "proposed_for_injection": cfg["mode"] == "enforced",
         "thresholds": {k: cfg[k] for k in ("skill_threshold", "seed_threshold", "filter_threshold")},
     }
-    ledger.record(session_id, turn_id, "feed", state, questions, result, mode=cfg["mode"], outcome=outcome)
+    ledger.record(
+        session_id,
+        turn_id,
+        "feed",
+        state,
+        questions,
+        {**result, "timings_ms": feed_timings(judge_started)},
+        mode=cfg["mode"],
+        outcome=outcome,
+    )
     if answers["discovery"]["choice"] in ("recurring_multi_step", "other"):
         ledger.discovery(session_id, turn_id, current, state["recent_items"], answers["discovery"])
 
