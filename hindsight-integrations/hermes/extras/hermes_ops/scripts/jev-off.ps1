@@ -1,12 +1,13 @@
 $ErrorActionPreference = 'Stop'
 # Configuration only: no host path, user, distro or interpreter is compiled in.
 # HERMES_HOME is required because a WSL path cannot be derived from a Windows
-# profile. Everything else falls back to the documented layout below.
+# profile. WSLENV does not carry it into the distro, so every wsl.exe call
+# passes it with env. Everything else falls back to the documented layout below.
 $HermesHome = $env:HERMES_HOME
-if (-not $HermesHome) { throw 'Set HERMES_HOME to the WSL Hermes home (for example /home/<user>/.hermes).' }
+if (-not $HermesHome) { throw 'Set HERMES_HOME to the WSL Hermes home.' }
 $Workspace = if ($env:HERMES_OPS_WORKSPACE) { $env:HERMES_OPS_WORKSPACE } else { "$HermesHome/workspace" }
 $Python = if ($env:HERMES_OPS_PYTHON) { $env:HERMES_OPS_PYTHON } else { "$HermesHome/venvs/ops/bin/python" }
 $Distro = if ($env:HERMES_WSL_DISTRO) { $env:HERMES_WSL_DISTRO } else { 'Ubuntu' }
 $Controller = if ($env:HERMES_OPS_JEV_CONTROL) { $env:HERMES_OPS_JEV_CONTROL } else { "$Workspace/scripts/jev-control.py" }
-& wsl.exe -d $Distro -e $Python $Controller off
+& wsl.exe -d $Distro -e env "HERMES_HOME=$HermesHome" $Python $Controller off
 if ($LASTEXITCODE -ne 0) { throw 'Could not switch Jev selections off.' }

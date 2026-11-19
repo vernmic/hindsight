@@ -7,8 +7,11 @@ I:/hermes/reports/hindsight-integrations-review-20261118/probe-structured-policy
 
 from __future__ import annotations
 
+import asyncio
 import types
 from collections.abc import Callable
+
+import pytest
 
 
 class Row:
@@ -43,9 +46,14 @@ class PolicyClient:
         if kwargs.get("tag_groups"):
             # Mirror the engine: every top-level group must match (tags_satisfy_groups
             # ANDs groups), so the fake exercises the narrowing rule honestly.
-            # A group arrives as a dict (server leaf form) or a bare tag list.
+            # The API's TagGroup leaf is {tags, match}. A bare list is a 400, so
+            # the fake refuses it instead of treating the list as tag strings.
             for group in kwargs["tag_groups"]:
-                wanted = set(group.get("tags") or []) if isinstance(group, dict) else set(group)
+                if not isinstance(group, dict) or "tags" not in group or "match" not in group:
+                    raise TypeError(
+                        "tag group must be a {tags, match} leaf; a bare list is rejected by the API"
+                    )
+                wanted = set(group["tags"])
                 out = [r for r in out if wanted & set(r.tags)]
         if kwargs.get("min_scores"):
             out = [r for r in out if all(r.scores.get(k, 0) >= v for k, v in kwargs["min_scores"].items())]
@@ -83,6 +91,12 @@ def _structured(provider: Callable, config: dict, feed: dict, client: PolicyClie
         raise
 
 
+def test_policy_client_refuses_a_bare_list_group() -> None:
+    client = PolicyClient(ROWS)
+    with pytest.raises(TypeError, match="bare list"):
+        asyncio.run(client.arecall(bank_id="primary", query="q", tag_groups=[["other"]]))
+
+
 def test_structured_recall_applies_configured_policy_and_banks(provider: Callable) -> None:
     # The probe scenario: permitted tag + 0.8 floor + observation types must filter
     # weak and wrong-tag rows, and the additional bank must be queried too.
@@ -104,17 +118,15 @@ def test_feed_groups_narrow_within_configured_tags(provider: Callable) -> None:
     # configured [permitted] tags must still hold (AND), so nothing outside them
     # returns: a feed can never widen what the profile recalls.
     client = PolicyClient(ROWS)
-    instance, result = _structured(provider, dict(POLICY), {"tag_groups": [["other"]]}, client)
+    feed_groups = [{"tags": ["other"], "match": "any_strict"}]
+    instance, result = _structured(provider, dict(POLICY), {"tag_groups": feed_groups}, client)
     try:
         assert result["candidates"] == []
         for call in client.recalls:
-            groups = call["tag_groups"]
-            # The appended configured-tags leaf is a dict; the feed's own group may
-            # be a bare list (the feed sent [["other"]] in this case).
-            leaf_tags = [
-                set(g.get("tags") or []) if isinstance(g, dict) else set(g) for g in groups
+            assert call["tag_groups"] == [
+                {"tags": ["other"], "match": "any_strict"},
+                {"tags": ["permitted"], "match": "all"},
             ]
-            assert {"permitted"} in leaf_tags
             assert "tags" not in call
             assert call["min_scores"] == {"semantic": 0.8}
     finally:
@@ -125,7 +137,12 @@ def test_feed_groups_and_configured_tags_both_hold(provider: Callable) -> None:
     # A row inside BOTH the feed's group and the configured tags is returned.
     rows = {"primary": [Row("both", "both", ["permitted", "extra"], 0.9)]}
     client = PolicyClient(rows)
-    instance, result = _structured(provider, dict(POLICY), {"tag_groups": [["extra"]]}, client)
+    instance, result = _structured(
+        provider,
+        dict(POLICY),
+        {"tag_groups": [{"tags": ["extra"], "match": "any_strict"}]},
+        client,
+    )
     try:
         assert [c["id"] for c in result["candidates"]] == ["primary/both"]
     finally:
