@@ -1739,16 +1739,24 @@ class HindsightMemoryProvider(MemoryProvider):
         ``prefetch_candidates``, so the configured retrieval policy cannot drift
         between the two paths: ``recall_tags``/``tags_match``, ``recall_types`` and
         ``recall_min_scores`` always apply. A structured feed's ``tag_groups``
-        REPLACE the configured tag constraint (a narrowing the feed itself defines);
-        with no feed groups the configured tags apply unchanged. Bank selection is
-        the caller's concern (``_build_recall_bank_ids`` + availability checks)."""
+        NARROW within the configured tags, never replace them: the configured
+        tags become one more AND-combined group (the engine's own compound rule,
+        ``tags_satisfy_groups`` ANDs every top-level group), so a feed can only
+        shrink what the profile recalls. With no feed groups the request keeps
+        ``tags``/``tags_match`` exactly as before. Bank selection is the caller's
+        concern (``_build_recall_bank_ids`` + availability checks)."""
         kwargs: dict = {
             "query": query,
             "budget": self._budget if budget is None else budget,
             "max_tokens": self._recall_max_tokens if max_tokens is None else max_tokens,
         }
         if tag_groups:
-            kwargs["tag_groups"] = tag_groups
+            groups = list(tag_groups)
+            if self._recall_tags:
+                # AND the configured tags on as one leaf, exactly like the engine's
+                # scope rule: the feed narrows, it can never widen the profile's scope.
+                groups.append({"tags": list(self._recall_tags), "match": self._recall_tags_match})
+            kwargs["tag_groups"] = groups
         elif self._recall_tags:
             kwargs.update(tags=self._recall_tags, tags_match=self._recall_tags_match)
         if self._recall_types:
