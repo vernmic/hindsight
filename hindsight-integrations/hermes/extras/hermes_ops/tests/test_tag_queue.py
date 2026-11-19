@@ -6,10 +6,11 @@ Run cold (from any directory):
     $HERMES_OPS_PYTHON -m unittest test_tag_queue -v
 
 Prerequisites
-  * Windows Docker Desktop with the hindsight-hindsight-1 container running:
-    the component tests reach Postgres through gardener_writer.query
-    (docker exec psql) and create TEMP tables cloned from the deployed schema.
-    They never write to public rows.
+  * A running Hindsight container, named by configuration (HINDSIGHT_CONTAINER,
+    default "hindsight") via hermes_ops_config.container(): the component tests
+    reach Postgres through gardener_writer.query (docker exec psql) and create
+    TEMP tables cloned from the deployed schema. They never write to public rows.
+    No host, path or container is hardcoded here.
   * No live judge is required. Classifier and drain tests inject a deterministic
     `decide` and stub the write path, so every result is reproducible.
   * The queue implementation is resolved at run time (post_extraction_tag_queue).

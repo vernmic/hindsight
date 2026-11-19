@@ -49,8 +49,12 @@ def main():
             {
                 "bank": config.bank(),
                 "mode": data["config"]["retain_extraction_mode"],
-                "context_boundaries_enabled": "HERMES_CONTEXT_BOUNDARIES_V1"
+                "context_boundaries_configured": "HERMES_CONTEXT_BOUNDARIES_V1"
                 in (data["config"].get("retain_custom_instructions") or ""),
+                # "configured" only: marker-string presence proves the instruction text
+                # reached the retain config, not that the structural producer behind it
+                # is installed. Proving capability needs a live boundaries round-trip.
+                # (Codex review C, 2026-11-18.)
             },
             indent=2,
         )
