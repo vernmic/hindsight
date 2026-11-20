@@ -24,7 +24,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional
 
 from agent.memory_provider import MemoryProvider, RecallStatus, spawn_context_thread
 from agent.secret_scope import UnscopedSecretError, get_secret
@@ -1695,7 +1695,23 @@ class HindsightMemoryProvider(MemoryProvider):
             logger.debug("Prefetch: skipped (%s)", why)
         return why is not None
 
-    def _recall(self, query: str) -> list:
+    def _recall_request_kwargs(self, query: str, *, origin: Literal["auto", "tool"]) -> dict:
+        """The one override point for recall request arguments.
+
+        A subclass replaces this instead of copying ``_recall``. ``origin`` is
+        ``"auto"`` when prefetch calls and ``"tool"`` when ``hindsight_recall``
+        calls. Either origin gets today's arguments.
+        """
+        kwargs: dict = {"query": query, "budget": self._budget, "max_tokens": self._recall_max_tokens}
+        if self._recall_tags:
+            kwargs.update(tags=self._recall_tags, tags_match=self._recall_tags_match)
+        if self._recall_types:
+            kwargs["types"] = self._recall_types
+        if self._recall_min_scores:
+            kwargs["min_scores"] = self._recall_min_scores
+        return kwargs
+
+    def _recall(self, query: str, *, origin: Literal["auto", "tool"] = "auto") -> list:
         """Semantic recall across the write set (primary bank first, then
         mirrors/additional banks), then any recall-only banks. A result whose text an
         earlier bank already returned is dropped.
@@ -1710,13 +1726,7 @@ class HindsightMemoryProvider(MemoryProvider):
             for i, bank_id in enumerate(self._build_recall_bank_ids())
             if i == 0 or self._extra_bank_available("recall", bank_id)
         ]
-        kwargs: dict = {"query": query, "budget": self._budget, "max_tokens": self._recall_max_tokens}
-        if self._recall_tags:
-            kwargs.update(tags=self._recall_tags, tags_match=self._recall_tags_match)
-        if self._recall_types:
-            kwargs["types"] = self._recall_types
-        if self._recall_min_scores:
-            kwargs["min_scores"] = self._recall_min_scores
+        kwargs = self._recall_request_kwargs(query, origin=origin)
 
         async def _recall_all(client):
             extra_timeout = float(self._timeout or _DEFAULT_TIMEOUT) * _EXTRA_BANK_TIMEOUT_SHARE
@@ -2147,7 +2157,7 @@ class HindsightMemoryProvider(MemoryProvider):
     def _tool_recall(self, args: dict) -> str:
         query = args["query"]
         logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s", self._bank_id, len(query), self._budget)
-        results = self._recall(query)
+        results = self._recall(query, origin="tool")
         logger.debug("Tool hindsight_recall: %d results", len(results))
         return "\n".join(f"{i}. {r.text}" for i, r in enumerate(results, 1)) or "No relevant memories found."
 
