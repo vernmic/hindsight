@@ -445,15 +445,12 @@ class GenericSourceTests(unittest.TestCase):
         self.assertEqual(len(wrappers), 5, [w.name for w in wrappers])
         for path in wrappers:
             body = path.read_text(encoding="utf-8")
-            if path.name.startswith("jev-"):
-                # WSLENV is empty, so the home has to be on the argv, not inherited.
-                self.assertIn(
-                    'wsl.exe -d $Distro -e env "HERMES_HOME=$HermesHome" $Python',
-                    body,
-                    path.name,
-                )
-            else:
-                self.assertIn("wsl.exe -d $Distro -e $Python", body, path.name)
+            # WSLENV is empty, so the home has to be on the argv, not inherited.
+            self.assertIn(
+                'wsl.exe -d $Distro -e env "HERMES_HOME=$HermesHome" $Python',
+                body,
+                path.name,
+            )
             self.assertIn("HERMES_HOME", body, path.name)
             self.assertNotIn("-u vern", body, path.name)
             self.assertNotIn("sh -c", body, path.name)

@@ -1,4 +1,4 @@
-"""Static checks for the four jev control wrappers.
+"""Static checks for the jev control wrappers and memory quality control.
 
 The wrappers are never executed. WSLENV is empty on the operator machine, so
 HERMES_HOME reaches the controller only when each wsl.exe argv passes it.
@@ -17,6 +17,7 @@ WRAPPERS = (
     "jev-off.ps1",
     "jev-write-on.ps1",
     "jev-write-off.ps1",
+    "memory-quality-control.ps1",
 )
 
 # Actions pinned to the wsl.exe lines, in call order.
@@ -25,6 +26,7 @@ ACTIONS = {
     "jev-off.ps1": ("off",),
     "jev-write-on.ps1": ("write on", "review on", "status"),
     "jev-write-off.ps1": ("status", "write off", "review off"),
+    "memory-quality-control.ps1": ("$Component $Mode",),
 }
 
 
