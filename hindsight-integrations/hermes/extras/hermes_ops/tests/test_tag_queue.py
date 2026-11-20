@@ -8,7 +8,8 @@ Run cold (from any directory):
 Prerequisites
   * A running Hindsight container, named by configuration (HINDSIGHT_CONTAINER,
     default "hindsight") via hermes_ops_config.container(): the component tests
-    reach Postgres through gardener_writer.query (docker exec psql) and create
+    reach Postgres through gardener_writer.query (the configured psql route:
+    docker-exec, or the HINDSIGHT_PSQL_TRANSPORT proxy when set) and create
     TEMP tables cloned from the deployed schema. They never write to public rows.
     No host, path or container is hardcoded here.
   * No live judge is required. Classifier and drain tests inject a deterministic
