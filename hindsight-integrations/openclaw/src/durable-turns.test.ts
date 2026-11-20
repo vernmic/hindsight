@@ -571,6 +571,150 @@ describe("faked host: owned-work retain", () => {
   }, 15000);
 });
 
+// 2026-11-20 defect: agent_end skipped its capture whenever the host named this engine as the
+// durable-advancement CANDIDATE, but the outer runner can still decline that candidate (error,
+// timeout, yielded result, exhausted fallback). Nothing then commits the turn, so nothing ever
+// retains it. An owned turn is captured under its logicalTurnId and reconciled by commitTurn.
+describe("engine-turn capture reconcile", () => {
+  const ownedCtx = (logicalTurnId: string, extra: Record<string, unknown> = {}) => ({
+    agentId: "main",
+    sessionKey: KEY,
+    messageProvider: "telegram",
+    sessionId: "sid-1",
+    contextEngineTurn: { enginePluginId: "hindsight-openclaw", logicalTurnId },
+    ...extra,
+  });
+
+  it("a committed candidate is retained exactly once, from its range", async () => {
+    const h = await plugin({ durableTurns: true });
+    try {
+      expect(await h.engine.commitTurn(commit(1, { advancementKey: "t-committed" }))).toEqual({
+        status: "committed",
+      });
+      h.setStatus("pending");
+      await h.handlers.get("agent_end")!(turn, ownedCtx("t-committed"));
+      await h.settle();
+      expect(h.send).toHaveBeenCalledTimes(1);
+      expect(h.authority.queue!.peek()[0].completion?.marker?.ranges).toEqual([
+        { start: 11, end: 12, key: "t-committed" },
+      ]);
+      // No capture for a turn whose committed range already carries it.
+      expect(loadSessionState(root, KEY).pendingLegacy).toEqual([]);
+      await h.handlers.get("agent_end")!(turn, ownedCtx("t-committed"));
+      await h.settle();
+      expect(h.send).toHaveBeenCalledTimes(1);
+    } finally {
+      await h.service.stop();
+    }
+  }, 15000);
+
+  it("a declined candidate keeps its capture for the next delivery point, never its own run", async () => {
+    const h = await plugin({ durableTurns: true });
+    try {
+      h.setStatus("pending");
+      await h.handlers.get("agent_end")!(turn, ownedCtx("t-declined"));
+      await h.settle();
+      // Held: the host may still commit this turn, so it never delivers at its own run's end.
+      expect(h.send).not.toHaveBeenCalled();
+      expect(loadSessionState(root, KEY).pendingLegacy.map((i) => i.id)).toEqual(["t-declined"]);
+      h.setStatus("completed");
+      await h.handlers.get("session_end")!(
+        { sessionId: "sid-1" },
+        { agentId: "main", sessionKey: KEY, messageProvider: "telegram" }
+      );
+      await h.settle();
+      expect(h.send).toHaveBeenCalledTimes(1);
+      const s = loadSessionState(root, KEY);
+      expect(s.pendingLegacy).toEqual([]);
+      expect(s.deliveredCaptureIds).toEqual(["t-declined"]);
+    } finally {
+      await h.service.stop();
+    }
+  }, 15000);
+
+  it("a commit arriving after delivery records the position and does not retain again", async () => {
+    const h = await plugin({ durableTurns: true });
+    try {
+      h.setStatus("completed");
+      await h.handlers.get("agent_end")!(turn, ownedCtx("t-late"));
+      await h.settle();
+      expect(h.send).not.toHaveBeenCalled();
+      await h.handlers.get("session_end")!(
+        { sessionId: "sid-1" },
+        { agentId: "main", sessionKey: KEY, messageProvider: "telegram" }
+      );
+      await h.settle();
+      expect(h.send).toHaveBeenCalledTimes(1);
+      expect(loadSessionState(root, KEY).deliveredCaptureIds).toEqual(["t-late"]);
+      expect(await h.engine.commitTurn(commit(1, { advancementKey: "t-late" }))).toEqual({
+        status: "committed",
+      });
+      await h.settle();
+      expect(h.send).toHaveBeenCalledTimes(1);
+      const s = loadSessionState(root, KEY);
+      expect(s.pendingRetain).toEqual([]);
+      expect(s.committedKeys).toContain("t-late");
+      // The retained seqs are recorded as covered instead of queued a second time.
+      expect(s.lastRetainedSeq).toBe(12);
+    } finally {
+      await h.service.stop();
+    }
+  }, 15000);
+
+  it("a commit for an in-flight capture records the position without re-queueing it", async () => {
+    const h = await plugin({ durableTurns: true });
+    try {
+      h.setStatus("pending");
+      await h.handlers.get("agent_end")!(turn, ownedCtx("t-flight"));
+      await h.settle();
+      expect(h.send).not.toHaveBeenCalled();
+      // The next delivery point drains it into a queued retain, where it now sits in flight.
+      await h.handlers.get("agent_end")!(turn, {
+        agentId: "main",
+        sessionKey: KEY,
+        messageProvider: "telegram",
+        sessionId: "sid-2",
+        runId: "run-next",
+      });
+      await h.settle();
+      expect(h.send).toHaveBeenCalledTimes(1);
+      expect(h.authority.queue!.peek()[0].completion?.marker?.legacyIds).toEqual([
+        "t-flight",
+        "run-next",
+      ]);
+      expect(await h.engine.commitTurn(commit(1, { advancementKey: "t-flight" }))).toEqual({
+        status: "committed",
+      });
+      await h.settle();
+      expect(h.send).toHaveBeenCalledTimes(1);
+      const s = loadSessionState(root, KEY);
+      expect(s.pendingRetain).toEqual([]);
+      expect(s.lastRetainedSeq).toBe(12);
+    } finally {
+      await h.service.stop();
+    }
+  }, 15000);
+
+  it("no contextEngineTurn: the ordinary capture path is unchanged", async () => {
+    const h = await plugin({ durableTurns: true });
+    try {
+      h.setStatus("completed");
+      await h.handlers.get("agent_end")!(turn, {
+        agentId: "main",
+        sessionKey: KEY,
+        messageProvider: "telegram",
+        sessionId: "sid-1",
+        runId: "run-plain",
+      });
+      await h.settle();
+      expect(h.send).toHaveBeenCalledTimes(1);
+      expect(loadSessionState(root, KEY).deliveredCaptureIds).toEqual(["run-plain"]);
+    } finally {
+      await h.service.stop();
+    }
+  }, 15000);
+});
+
 describe("classification pass spawn (package 28)", () => {
   it("spawns once per newly committed turn; not for a duplicate, a heartbeat or a failed ledger row", async () => {
     const engine = createContextEngine(quiet, {

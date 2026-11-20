@@ -2462,6 +2462,12 @@ export default function (api: MoltbotPluginAPI) {
         passProviders: pluginConfig.passProviders,
         retainScope: pluginConfig.retainScope,
         getPromptCapture: () => lifecycle.config?.promptCapture === true,
+        // Capture ids already drained into a queued retain: a commit for one of them records
+        // the durable position without queueing the same turn a second time.
+        heldLegacyIds: (sessionKey: string) =>
+          (lifecycle.queue?.pendingForSession(sessionKey) ?? []).flatMap(
+            (item) => item.completion?.marker?.legacyIds ?? []
+          ),
       }
     );
 
@@ -3411,16 +3417,34 @@ ${memoriesFormatted}
           const heldLegacy = new Set(
             held.flatMap((item) => item.completion?.marker?.legacyIds ?? [])
           );
-          if (!force && !ownedByEngine) {
-            // Keyed by the host runId, so a repeated delivery finds it (pending, queued or
-            // delivered); nothing counts as captured until the durable append succeeds.
-            const runId = typeof ctx?.runId === "string" ? ctx.runId : undefined;
-            const itemId = runId ?? randomUUID();
+          // A capture is a fallback for a turn the engine may never commit, so it is keyed by
+          // what the host will name in commitTurn. An engine-owned turn is captured under its
+          // logicalTurnId (the same id commitTurn receives as advancementKey) instead of being
+          // dropped: the host sets contextEngineTurn for the durable-advancement CANDIDATE, and
+          // the outer runner can still decline it afterwards (error, timeout, yielded result,
+          // exhausted fallback), after which no commit ever arrives for that turn.
+          let capturedOwnedTurnId: string | undefined;
+          if (!force) {
+            const engineTurnId = ownedByEngine
+              ? (ctx as { contextEngineTurn?: { logicalTurnId?: unknown } }).contextEngineTurn
+                  ?.logicalTurnId
+              : undefined;
+            const itemId =
+              typeof engineTurnId === "string"
+                ? engineTurnId
+                : typeof ctx?.runId === "string"
+                  ? ctx.runId
+                  : randomUUID();
+            // Keyed by the host runId (or the engine's logicalTurnId), so a repeated delivery
+            // finds it (pending, queued or delivered); nothing counts as captured until the
+            // durable append succeeds.
             const turnMessages = sliceLastTurnsByUserBoundary(allMessages, 1)
               .filter((m: any) => m?.role === "user" || m?.role === "assistant")
               .map((m: any) => ({ role: m.role, content: messageText(m) }));
+            // A turn the engine already committed needs no capture: its range is the work item.
             const alreadyCaptured =
               state.deliveredCaptureIds.includes(itemId) ||
+              state.committedKeys.includes(itemId) ||
               heldLegacy.has(itemId) ||
               state.pendingLegacy.some((item) => item.id === itemId);
             if (!alreadyCaptured && turnMessages.length > 0) {
@@ -3437,6 +3461,11 @@ ${memoriesFormatted}
                   (m) => log.warn(m)
                 ),
               }));
+              if (typeof engineTurnId === "string") {
+                // Delivered at the NEXT delivery point, never at the end of this run: the host
+                // may still commit this turn, and commitTurn reconciles the capture.
+                capturedOwnedTurnId = engineTurnId;
+              }
             }
           }
           const ownedByCaller = (owner: string | undefined) =>
@@ -3468,7 +3497,11 @@ ${memoriesFormatted}
           const isStuck = (at: number | undefined) =>
             typeof at !== "number" || Date.now() - at > DURABLE_STUCK_MS;
           const pendingLegacy = state.pendingLegacy.filter(
-            (item) => ownedByCaller(item.sessionId) && !heldLegacy.has(item.id)
+            (item) =>
+              ownedByCaller(item.sessionId) &&
+              !heldLegacy.has(item.id) &&
+              // Captured in this very invocation: wait for the next delivery point.
+              item.id !== capturedOwnedTurnId
           );
           if (pendingRanges.length === 0 && pendingLegacy.length === 0) {
             debug(`[Hindsight Hook] owned work: nothing deliverable for ${markerSessionKey}`);

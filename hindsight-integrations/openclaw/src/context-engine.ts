@@ -335,6 +335,11 @@ export type ContextEngineOptions = {
   spawnPass?: (payload: PassPayload) => void;
   /** Ledger writer override (tests); default the lazily loaded session-ledger module. */
   loadLedger?: () => Promise<LedgerWriter>;
+  /**
+   * Capture ids already drained into a queued (in-flight) retain for this session. A commit for
+   * one of them must not queue the same turn again: the queue row already carries the content.
+   */
+  heldLegacyIds?: (sessionKey: string) => string[];
 };
 
 export type LedgerWriter = {
@@ -793,12 +798,30 @@ async function commitTurn(
   // R27.1: the duplicate decision and the append are one synchronous read-modify-write. A retry
   // that overlapped this one across the awaited ledger load (in any engine copy in this process)
   // finds the key here and records nothing. A failed write records no key, so a retry still works.
+  // Capture ids already drained into a queued retain: their content is in flight, so this
+  // commit must record the durable position without queueing the same turn again.
+  const heldCaptureIds =
+    typeof options.heldLegacyIds === "function" ? options.heldLegacyIds(key) : [];
   let duplicate = false;
   updateSessionState(root, key, (s) => {
     if (s.committedKeys.includes(advancementKey)) {
       duplicate = true;
       return s;
     }
+    // Reconciling an agent_end capture (see index.ts agent_end): the host may decline the
+    // durable-advancement candidate after setting contextEngineTurn, and may also commit an
+    // accepted turn only after the capture was already recorded or delivered. A commit for the
+    // same logicalTurnId therefore either supersedes the pending capture or finds it settled.
+    const capturePending = s.pendingLegacy.some((item) => item.id === advancementKey);
+    const captureInFlight = capturePending && heldCaptureIds.includes(advancementKey);
+    const captureSettled =
+      s.deliveredCaptureIds.includes(advancementKey) || captureInFlight;
+    const queueRange =
+      !captureSettled &&
+      !heartbeat &&
+      startSeq !== null &&
+      endSeq !== null &&
+      shouldQueueRetain(key, options.retainScope);
     return {
       ...s,
       committedKeys: [...s.committedKeys, advancementKey],
@@ -810,22 +833,34 @@ async function commitTurn(
       lastGenerationSeen: generation ?? s.lastGenerationSeen,
       lastCommittedAt: now,
       lastLedgerFailed: !ledgerOk,
+      // Superseded by the durable range below: drop it and remember the id, so a replayed
+      // agent_end does not capture the turn a second time. In-flight captures are left for
+      // their queue row to complete.
+      ...(capturePending && !captureInFlight
+        ? {
+            pendingLegacy: s.pendingLegacy.filter((item) => item.id !== advancementKey),
+            deliveredCaptureIds: [...s.deliveredCaptureIds, advancementKey],
+          }
+        : {}),
+      // Content already retained (or being retained) through its capture covers this range.
+      ...(captureSettled && endSeq !== null
+        ? { lastRetainedSeq: Math.max(s.lastRetainedSeq, endSeq) }
+        : {}),
       // Recorded for the retain loop to drain; cleared by the completion writer.
-      pendingRetain:
-        heartbeat || startSeq === null || endSeq === null || !shouldQueueRetain(key, options.retainScope)
-          ? s.pendingRetain
-          : appendPendingRange(
-              s.pendingRetain,
-              {
-                start: startSeq,
-                end: endSeq,
-                messages: conversational,
-                key: advancementKey,
-                // Owner tag: a detached predecessor close may deliver only its own work.
-                ...(typeof params.sessionId === "string" ? { sessionId: params.sessionId } : {}),
-              },
-              (m) => log.warn(m)
-            ),
+      pendingRetain: queueRange
+        ? appendPendingRange(
+            s.pendingRetain,
+            {
+              start: startSeq,
+              end: endSeq,
+              messages: conversational,
+              key: advancementKey,
+              // Owner tag: a detached predecessor close may deliver only its own work.
+              ...(typeof params.sessionId === "string" ? { sessionId: params.sessionId } : {}),
+            },
+            (m) => log.warn(m)
+          )
+        : s.pendingRetain,
     };
   });
   if (!duplicate && ledgerOk && !heartbeat && startSeq !== null && endSeq !== null) {
@@ -884,7 +919,7 @@ export function registerHindsightContextEngine(
   pass: Pick<
     ContextEngineOptions,
     "turnMiddleAgeTurns" | "passProviders" | "retainScope" | "getPromptCapture" |
-    "deriveHeartbeatFromSessionKey"
+    "deriveHeartbeatFromSessionKey" | "heldLegacyIds"
   > = {}
 ): boolean {
   const register = api.registerContextEngine;
