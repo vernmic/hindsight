@@ -6,7 +6,6 @@ import json
 from collections.abc import Callable
 
 import pytest
-
 from conftest import FakeClient, FakeRecallResponse
 
 
